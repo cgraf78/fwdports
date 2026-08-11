@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Named adapters for GNU/Linux and stock macOS command differences.
+# Named cases and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/drivers.sh
+source "$ROOT/lib/fwdports/drivers.sh"
+# shellcheck source=../lib/fwdports/tmux.sh
+source "$ROOT/lib/fwdports/tmux.sh"
+
+bsd_stat_case() {
+  local tmp fake_bin log output
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  log=$tmp/stat.log
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_STAT_LOG"' \
+    'if [[ ${1:-} == -c ]]; then exit 1; fi' \
+    '[[ ${1:-} == -f && ${3:-} != -- ]] || exit 2' \
+    'printf "1000 755 1 2 3 4\n"' >"$fake_bin/stat"
+  chmod 0700 "$fake_bin/stat"
+  output=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_STAT_LOG=$log \
+    _fwdports_stat_identity /tmp/example) || true
+  _assert_eq "portability: BSD stat identity is parsed" \
+    "1000 755 1 2 3 4" "$output"
+  _assert_not_contains "portability: BSD stat receives no GNU terminator" \
+    "-f %u %Lp %d %i %z %m --" "$(<"$log")"
+}
+
+canonicalization_case() {
+  local tmp real link result
+  tmp=$(_tmpdir) || return 1
+  real=$tmp/real
+  link=$tmp/link
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$real"
+  chmod 0700 "$real"
+  ln -s real "$link"
+  result=$(_fwdports_canonical_executable "$link") || true
+  _assert_eq "portability: canonicalization needs no readlink -f" \
+    "$real" "$result"
+}
+
+stock_macos_bash_ci_case() {
+  local workflow
+  workflow=$ROOT/.github/workflows/ci.yml
+
+  # The shared matrix installs a current Homebrew Bash before running tests.
+  # Keep a repository-owned gate for Apple's stock Bash so the documented
+  # 3.2 compatibility promise cannot silently turn into a modern-Bash-only
+  # claim when the shared workflow evolves.
+  _assert_contains "portability CI: has a stock macOS Bash job" \
+    "macos-bash32:" "$(<"$workflow")"
+  _assert_contains "portability CI: invokes stock /bin/bash" \
+    'shell: /bin/bash {0}' "$(<"$workflow")"
+  _assert_contains "portability CI: checks the Bash 3.2 version" \
+    'BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2' \
+    "$(<"$workflow")"
+  _assert_contains "portability CI: exercises the installed entrypoint" \
+    '"$install_prefix/bin/fwdports" --version' "$(<"$workflow")"
+  _assert_contains "portability CI: required gate includes Bash 3.2" \
+    'needs: [shell, macos-bash32]' "$(<"$workflow")"
+}
+
+bsd_ps_session_keyword_case() {
+  local tmp fake_bin log snapshot members
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  log=$tmp/ps.log
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_PS_LOG"' \
+    '[[ " $* " != *" sid= "* ]] || exit 2' \
+    'if [[ " $* " == *" -e "* ]]; then' \
+    '  printf "123 456 789 ?? S\n"' \
+    'else' \
+    '  printf "123 12 456 789 ?? S\n"' \
+    'fi' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  snapshot=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PS_LOG=$log \
+    _fwdports_process_snapshot 123) || true
+  members=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PS_LOG=$log \
+    _fwdports_process_group_records 456) || true
+
+  _assert_eq "portability: BSD ps snapshot records session identity" \
+    $'12\t456\t789\t??\tS' "$snapshot"
+  _assert_eq "portability: BSD ps group records session identity" \
+    $'123\t789\t??\tS' "$members"
+  _assert_contains "portability: ps requests the shared sess keyword" \
+    'sess=' "$(<"$log")"
+  _assert_not_contains "portability: ps avoids Darwin-unsupported sid keyword" \
+    'sid=' "$(<"$log")"
+}
+
+run_case bsd-stat bsd_stat_case
+run_case canonicalization canonicalization_case
+run_case stock-macos-bash-ci stock_macos_bash_ci_case
+run_case bsd-ps-session-keyword bsd_ps_session_keyword_case
+_test_summary

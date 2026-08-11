@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Case callbacks are passed by name to the shared harness.
 # shellcheck disable=SC2329
+# Single-quoted fixture lines are expanded only by the child process.
+# shellcheck disable=SC2016
 # Exercise the shared harness through the same case-filter interface used by
 # every behavior suite. A misspelled case must fail instead of silently running
 # nothing, because filtered cases are the unit of the repository's TDD loop.
@@ -23,8 +25,86 @@ unselected_case() {
   _pass "case filter: second case runs without a filter"
 }
 
+canonical_tmpdir_case() {
+  local tmp physical logical output
+  tmp=$(_tmpdir) || return 1
+  physical=$tmp/physical
+  logical=$tmp/logical
+  mkdir -p "$physical"
+  ln -s "$physical" "$logical"
+
+  output=$(TMPDIR="$logical/" FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash -c 'source "$FWDPORTS_TEST_HARNESS"; printf "%s\n" "$_FWDPORTS_TEST_TMP_BASE"')
+
+  _assert_eq "temporary base: resolves symlinks and trailing separators" \
+    "$physical" "$output"
+}
+
+private_umask_case() {
+  local output
+  output=$(FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" bash -c \
+    'umask 002; source "$FWDPORTS_TEST_HARNESS"; umask')
+
+  _assert_eq "test harness: protects all fixture creation by default" \
+    "0077" "$output"
+}
+
+nonzero_callback_case() {
+  local tmp child output status marker
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/nonzero-callback
+  output=$tmp/output
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'setup_fails() { return 1; }' \
+    'run_case setup-fails setup_fails' \
+    '_test_summary' \
+    >"$child"
+  chmod 0700 "$child"
+
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "case callback: an unasserted failure fails the suite" \
+    1 "$status"
+  _assert_contains "case callback: failure identifies the case" \
+    "case callback failed: setup-fails" "$(<"$output")"
+
+  marker=$tmp/continued-after-failure
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'setup_fails_early() {' \
+    '  set -e' \
+    '  false' \
+    '  : >"$FWDPORTS_TEST_CONTINUED_MARKER"' \
+    '}' \
+    'run_case setup-fails-early setup_fails_early' \
+    '_test_summary' \
+    >"$child"
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    FWDPORTS_TEST_CONTINUED_MARKER=$marker \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+  _assert_exit "case callback: errexit setup failure fails immediately" \
+    1 "$status"
+  _assert_not_exists "case callback: does not continue after setup failure" \
+    "$marker"
+}
+
 run_case case-filter case_filter_case
 run_case unselected unselected_case
+run_case canonical-tmpdir canonical_tmpdir_case
+run_case private-umask private_umask_case
+run_case nonzero-callback nonzero_callback_case
 if [[ "$TEST_CASE" == case-filter ]]; then
   _assert_eq "case filter: other cases are skipped" 0 "$UNSELECTED_RAN"
 fi

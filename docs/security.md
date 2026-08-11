@@ -4,6 +4,10 @@
 chooses to install. User SSH configuration and external driver executables are
 trusted same-user inputs. Profile data is non-executable but can intentionally
 expose network ports, so it still receives strict syntax and path validation.
+The private runtime protocol prevents stale cooperating instances from
+claiming one another's state; it does not defend against malicious same-UID
+code racing filesystem operations, because that code already has authority to
+replace the user's configuration, drivers, and state.
 
 ## Filesystem trust
 
@@ -26,7 +30,9 @@ is used only after a bounded condition wait and a second ownership check. A
 missing leader, foreign member, or incomplete record fails closed.
 
 Local-listener discovery is diagnostic only. `lsof` or `ss` can explain a
-conflict, but their output never grants authority to stop the owner.
+conflict; when Android hides another process from `lsof`, a bounded loopback
+netcat probe can still identify the occupied endpoint. None of those results
+grants authority to stop the owner.
 
 ## SSH consistency
 

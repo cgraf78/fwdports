@@ -269,6 +269,16 @@
     fi
   }
 
+  create_identity_marker() {
+    local identity=$1 marker=$2
+
+    if ln "$identity" "$marker" 2>/dev/null; then
+      return 0
+    fi
+    [[ ! -e "$marker" && ! -L "$marker" ]] || return 1
+    ln -s "$identity" "$marker"
+  }
+
   validate_managed_checkout() {
     local candidate=$1 top branch origin status
 
@@ -325,7 +335,7 @@
     local marker=$1
 
     [[ -f "$update_identity" && ! -L "$update_identity" &&
-      -f "$marker" && ! -L "$marker" &&
+      -f "$marker" &&
       "$update_identity" -ef "$marker" ]]
   }
 
@@ -357,9 +367,11 @@
     [[ "$actual" == "$expected" ]]
   }
 
-  # Finish or roll back an update transaction using only hard-link identity
-  # proofs. This also handles a transaction left after SIGKILL once the user
-  # has confirmed no installer is active and removed the stale directory lock.
+  # Finish or roll back an update transaction using inode identity markers.
+  # Hard links are preferred, with symbolic links as a fallback on filesystems
+  # that reject hard links. This also handles a transaction left after SIGKILL
+  # once the user has confirmed no installer is active and removed the stale
+  # directory lock.
   recover_update_transaction() {
     local current_next current_previous nested_next nested_previous
     local previous_next previous_previous
@@ -389,8 +401,8 @@
     previous_previous="$update_previous/$update_previous_marker"
 
     # Portable mv nests a source when a same-UID race creates the target
-    # directory. Reclaim only a child carrying this transaction's hard-link
-    # identity, and leave the foreign target itself untouched.
+    # directory. Reclaim only a child carrying this transaction's identity,
+    # and leave the foreign target itself untouched.
     if [[ ! -e "$update_next" && ! -L "$update_next" &&
       -d "$nested_next" && ! -L "$nested_next" ]] &&
       update_identity_matches "$nested_next/$update_next_marker"; then
@@ -496,28 +508,63 @@
   }
 
   # shellcheck disable=SC2329 # Reached by the signal-trap call chain below.
+  wait_for_pid_exit() {
+    local pid=$1
+
+    for _ in {1..100}; do
+      kill -0 "$pid" 2>/dev/null || return 0
+      command sleep 0.01
+    done
+    return 1
+  }
+
+  # shellcheck disable=SC2329 # Reached by the signal-trap call chain below.
+  terminate_snapshot_child() {
+    local child=$1 parent=$2 signal=$3
+
+    # Keep the parent alive long enough to reap the child. Killing a whole tree
+    # in one fire-and-forget pass can orphan a still-exiting descendant, which
+    # remains observable as a zombie under minimal container init processes.
+    kill -s "$signal" "$child" 2>/dev/null || true
+    wait_for_pid_exit "$child" && return 0
+    kill -s KILL "$child" 2>/dev/null || true
+    wait_for_pid_exit "$child" && return 0
+    printf 'install.sh: child process %s was not reaped by parent %s after %s and KILL\n' \
+      "$child" "$parent" "$signal" >&2
+    return 1
+  }
+
+  # shellcheck disable=SC2329 # Reached by the signal-trap call chain below.
   signal_snapshot_children() {
-    local parent=$1 signal=$2 snapshot=$3 child children live_parent
+    local parent=$1 signal=$2 snapshot=$3 child children live_parent failed=0
 
     children=$(printf '%s\n' "$snapshot" |
       command awk -v parent="$parent" '$2 == parent { print $1 }')
     for child in $children; do
-      signal_snapshot_children "$child" "$signal" "$snapshot"
+      signal_snapshot_children "$child" "$signal" "$snapshot" || failed=1
       live_parent=$(command ps -o ppid= -p "$child" 2>/dev/null || true)
       live_parent=${live_parent//[[:space:]]/}
       if [[ "$live_parent" == "$parent" ]]; then
-        kill -s "$signal" "$child" 2>/dev/null || true
+        terminate_snapshot_child "$child" "$parent" "$signal" || failed=1
       fi
     done
+    return "$failed"
   }
 
   # shellcheck disable=SC2329 # Reached by the signal-trap call chain below.
   signal_process_tree() {
     local root=$1 signal=$2 snapshot
 
+    local failed=0
+
     snapshot=$(command ps -eo pid=,ppid= 2>/dev/null || true)
-    signal_snapshot_children "$root" "$signal" "$snapshot"
+    signal_snapshot_children "$root" "$signal" "$snapshot" || failed=1
+    # Cancellation must not leave the active delegate running. If an
+    # uncooperative parent failed to reap a descendant even after escalation,
+    # the caller above reports that limitation before this final best-effort
+    # root termination.
     kill -s "$signal" "$root" 2>/dev/null || true
+    return "$failed"
   }
 
   # shellcheck disable=SC2329 # Installed as the signal traps below.
@@ -530,7 +577,10 @@
       # Use a catchable termination signal for those owned children while the
       # bootstrap still reports the conventional interrupt status to callers.
       [[ "$signal" == INT ]] && child_signal=TERM
-      signal_process_tree "$active_child_pid" "$child_signal"
+      if ! signal_process_tree "$active_child_pid" "$child_signal"; then
+        printf 'install.sh: process-tree cleanup was incomplete after %s\n' \
+          "$signal" >&2
+      fi
       wait "$active_child_pid" 2>/dev/null || true
       active_child_pid=
     fi
@@ -585,9 +635,11 @@
         die "cannot record staged managed checkout revision: $candidate_head"
       printf '%s\n' "$current_head" >"$update_previous_head" ||
         die "cannot record previous managed checkout revision: $current_head"
-      ln "$update_identity" "$update_next/$update_next_marker" ||
+      create_identity_marker \
+        "$update_identity" "$update_next/$update_next_marker" ||
         die 'cannot prepare staged update identity'
-      ln "$update_identity" "$checkout_dir/$update_previous_marker" ||
+      create_identity_marker \
+        "$update_identity" "$checkout_dir/$update_previous_marker" ||
         die 'cannot prepare managed checkout rollback identity'
       mv -n "$checkout_dir" "$update_previous" ||
         die "cannot stage previous managed checkout: $checkout_dir"
@@ -617,7 +669,8 @@
       die "managed checkout destination appeared during clone: $checkout_dir"
     publish_identity=$(mktemp "$checkout_parent/.${checkout_slug}.publish.XXXXXX") ||
       die "cannot create checkout publication identity under $checkout_parent"
-    ln "$publish_identity" "$staging/.git/cgraf78-publish-identity" ||
+    create_identity_marker \
+      "$publish_identity" "$staging/.git/cgraf78-publish-identity" ||
       die 'cannot prepare checkout publication identity'
     mv -n "$staging" "$checkout_dir" ||
       die "cannot publish managed checkout: $checkout_dir"

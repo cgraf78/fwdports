@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Built-in foreground wrapper retry and signal behavior.
+# Named cases and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+RUNNER=$ROOT/lib/fwdports/builtin-runner.sh
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+
+wait_for_lines() {
+  local file=$1 expected=$2 index=0 count=0
+  while [[ $index -lt 500 ]]; do
+    [[ ! -f $file ]] || count=$(wc -l <"$file" | tr -d ' ')
+    [[ $count -ge $expected ]] && return 0
+    sleep 0.01
+    index=$((index + 1))
+  done
+  return 1
+}
+
+setup_runtime() {
+  local tmp=$1
+  RUNTIME=$tmp/runtime
+  CALLS=$tmp/calls
+  mkdir -p "$RUNTIME"
+  chmod 0700 "$RUNTIME"
+  printf '%s\n' ssh >"$RUNTIME/driver-kind"
+  printf '%s\n' shell.example.com >"$RUNTIME/ssh-target"
+  printf '%s\n' -N >"$RUNTIME/ssh-argv"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "call\n" >>"$FWDPORTS_TEST_CALLS"' \
+    'calls=$(wc -l <"$FWDPORTS_TEST_CALLS")' \
+    '[[ $calls -gt 1 ]] || exit "${FWDPORTS_TEST_FIRST_STATUS:-1}"' \
+    'trap "exit 0" TERM INT HUP' \
+    'while :; do sleep 1; done' >"$RUNTIME/ssh-gate"
+  chmod 0700 "$RUNTIME/ssh-gate"
+}
+
+retry_case() {
+  local tmp pid index=0 alive=1
+  tmp=$(_tmpdir) || return 1
+  setup_runtime "$tmp"
+  # The runner owns and reaps its direct child; this test does not need a new
+  # session, and stock macOS intentionally ships no external `setsid` command.
+  FWDPORTS_TEST_CALLS=$CALLS "$RUNNER" "$RUNTIME" &
+  pid=$!
+  if wait_for_lines "$CALLS" 2; then
+    _pass "built-in SSH: retries after an early failure"
+  else
+    _fail "built-in SSH: retries after an early failure"
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  while [[ $index -lt 200 ]]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      alive=0
+      break
+    fi
+    sleep 0.01
+    index=$((index + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+  _assert_eq "built-in SSH: TERM reaps the wrapper" 0 "$alive"
+}
+
+drift_case() {
+  local tmp status calls
+  tmp=$(_tmpdir) || return 1
+  setup_runtime "$tmp"
+  set +e
+  FWDPORTS_TEST_CALLS=$CALLS FWDPORTS_TEST_FIRST_STATUS=78 \
+    "$RUNNER" "$RUNTIME"
+  status=$?
+  calls=$(wc -l <"$CALLS" | tr -d ' ')
+  _assert_exit "built-in SSH: drift status is preserved" 78 "$status"
+  _assert_eq "built-in SSH: drift is never retried" 1 "$calls"
+}
+
+run_case retry retry_case
+run_case drift drift_case
+_test_summary

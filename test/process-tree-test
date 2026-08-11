@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2034
+# Single-quoted fixture lines are expanded only by the child process.
+# shellcheck disable=SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
+# shellcheck source=../lib/fwdports/tmux.sh
+source "$ROOT/lib/fwdports/tmux.sh"
+
+file_mode() {
+  local path=$1 mode
+  if mode=$(stat -c '%a' -- "$path" 2>/dev/null); then
+    printf '%s\n' "$mode"
+  else
+    stat -f '%Lp' "$path"
+  fi
+}
+
+wait_for_file() {
+  local path=$1 attempts=0
+  while [[ ! -s "$path" && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -s "$path" ]]
+}
+
+wait_for_process_exit() {
+  local pid=$1 attempts=$2 delay=$3 index=0
+  while kill -0 "$pid" 2>/dev/null && [[ $index -lt $attempts ]]; do
+    sleep "$delay"
+    index=$((index + 1))
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+kill_test_server() {
+  local socket=$1
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    kill-server 2>/dev/null || true
+}
+
+termination_fixture() {
+  local tmp=$1 mode=$2 home state source start record
+  home=$tmp/home
+  state=$tmp/state
+  source=$tmp/resolved-profile
+  PROC_SOCKET=$tmp/tmux.sock
+  PROC_IDS=$tmp/ids
+  PROC_LEADER_MARKER=$tmp/leader-term
+  PROC_CHILD_MARKER=$tmp/child-term
+  PROC_SCRIPT=$tmp/process-tree
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    >"$source"
+  chmod 0600 "$source"
+  PROC_ROOT=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init) ||
+    return 1
+  PROC_GENERATION=$(fwdports_generation_create "$PROC_ROOT" "$source") ||
+    return 1
+  PROC_DIGEST=$(fwdports_generation_manifest_digest "$PROC_GENERATION") ||
+    return 1
+  mkdir -p "$PROC_GENERATION/legs/web"
+  chmod 0700 "$PROC_GENERATION/legs" "$PROC_GENERATION/legs/web"
+  PROC_EVIDENCE=$PROC_GENERATION/legs/web/pane
+
+  case "$mode" in
+    term)
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'ids=$1; leader_marker=$2; child_marker=$3' \
+        'child_loop() {' \
+        '  trap '\''printf "term\\n" >"$child_marker"; exit 0'\'' TERM' \
+        '  trap '\'''\'' HUP' \
+        '  while :; do sleep 0.02; done' \
+        '}' \
+        'child_loop &' \
+        'child=$!' \
+        'trap '\''printf "term\\n" >"$leader_marker"; wait "$child" 2>/dev/null; exit 0'\'' TERM' \
+        'trap '\'''\'' HUP' \
+        'printf "%s %s\\n" "$$" "$child" >"$ids"' \
+        'while :; do sleep 0.02; done' \
+        >"$PROC_SCRIPT"
+      ;;
+    stubborn | missing)
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'ids=$1' \
+        'trap '\'''\'' TERM HUP' \
+        '(trap '\'''\'' TERM HUP; while :; do sleep 0.02; done) &' \
+        'child=$!' \
+        'printf "%s %s\\n" "$$" "$child" >"$ids"' \
+        'while :; do sleep 0.02; done' \
+        >"$PROC_SCRIPT"
+      ;;
+    *) return 1 ;;
+  esac
+  chmod 0700 "$PROC_SCRIPT"
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$PROC_SOCKET" \
+    fwdports "${PROC_GENERATION##*/}" "$tmp" "$PROC_SCRIPT" "$PROC_IDS" \
+    "$PROC_LEADER_MARKER" "$PROC_CHILD_MARKER") || return 1
+  IFS=$'\t' read -r PROC_SESSION PROC_PANE <<<"$record"
+  wait_for_file "$PROC_IDS" || return 1
+  read -r PROC_LEADER PROC_CHILD <"$PROC_IDS"
+  fwdports_tmux_record_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_SESSION" \
+    "$PROC_PANE" "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" ||
+    return 1
+  record=$(_fwdports_pane_evidence_read "$PROC_GENERATION" "$PROC_DIGEST" \
+    "$PROC_EVIDENCE") || return 1
+  IFS=$'\t' read -r _ _ _ _ _ _ PROC_PGID _ _ <<<"$record"
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" running running \
+    "$$" "$start" none || return 1
+  fwdports_pointer_publish "$PROC_ROOT" active "$PROC_GENERATION" \
+    "$PROC_DIGEST" || return 1
+  fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" stopping stopped \
+    "$$" "$start" none || return 1
+}
+
+pane_identity_case() {
+  local tmp home state source root generation digest socket fixture pid_file
+  local release record session_id pane_id evidence content leader_pid
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  source=$tmp/resolved-profile
+  socket=$tmp/tmux.sock
+  fixture=$tmp/leader
+  pid_file=$tmp/pid
+  release=$tmp/release
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    >"$source"
+  chmod 0600 "$source"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  generation=$(fwdports_generation_create "$root" "$source")
+  digest=$(fwdports_generation_manifest_digest "$generation")
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  evidence=$generation/legs/web/pane
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$$" >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports "${generation##*/}" "$tmp" "$fixture" "$pid_file" "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$pid_file" || true
+  leader_pid=$(<"$pid_file")
+  fwdports_tmux_record_pane "$TMUX_BIN" "$socket" "$session_id" \
+    "$pane_id" "$generation" "$digest" "$evidence"
+  content=$(<"$evidence")
+
+  _assert_file "pane identity: publishes a regular evidence file" "$evidence"
+  _assert_eq "pane identity: protects evidence" 600 \
+    "$(file_mode "$evidence")"
+  _assert_contains "pane identity: binds generation" \
+    $'generation\t'"${generation##*/}" "$content"
+  _assert_contains "pane identity: binds manifest digest" \
+    $'manifest-digest\t'"$digest" "$content"
+  _assert_contains "pane identity: records exact session" \
+    $'session-id\t'"$session_id" "$content"
+  _assert_contains "pane identity: records exact pane" \
+    $'pane-id\t'"$pane_id" "$content"
+  _assert_contains "pane identity: records the pane leader" \
+    $'leader-pid\t'"$leader_pid" "$content"
+  _assert_contains "pane identity: records process start identity" \
+    $'leader-start\t' "$content"
+  _assert_contains "pane identity: records terminal" $'tty\t' "$content"
+  _assert_contains "pane identity: records session id" $'sid\t' "$content"
+  _assert_contains "pane identity: records process group" $'pgid\t' "$content"
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+term_owned_group_case() {
+  local tmp output error status group_status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" term || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    100 0.02 >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "process cleanup TERM: succeeds" 0 "$status"
+  _assert_eq "process cleanup TERM: reports graceful termination" \
+    "term" "$(<"$output")"
+  _assert_eq "process cleanup TERM: leader receives signal" \
+    "term" "$(<"$PROC_LEADER_MARKER")"
+  _assert_eq "process cleanup TERM: child receives group signal" \
+    "term" "$(<"$PROC_CHILD_MARKER")"
+  if _fwdports_process_group_live_records "$PROC_PGID" \
+    >/dev/null 2>&1; then
+    group_status=0
+  else
+    group_status=$?
+  fi
+  if [[ $group_status -eq 1 ]]; then
+    _pass "process cleanup TERM: leaves no live group member"
+  else
+    _fail "process cleanup TERM: leaves no live group member (inspection status $group_status)"
+  fi
+  _assert_eq "process cleanup TERM: has no diagnostic" "" "$(<"$error")"
+  kill_test_server "$PROC_SOCKET"
+}
+
+kill_escalation_case() {
+  local tmp output error status group_status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" stubborn || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    3 0.02 >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "process cleanup KILL: escalation succeeds" 0 "$status"
+  _assert_eq "process cleanup KILL: reports escalation" \
+    "kill" "$(<"$output")"
+  if _fwdports_process_group_live_records "$PROC_PGID" \
+    >/dev/null 2>&1; then
+    group_status=0
+  else
+    group_status=$?
+  fi
+  if [[ $group_status -eq 1 ]]; then
+    _pass "process cleanup KILL: leaves no live group member"
+  else
+    _fail "process cleanup KILL: leaves no live group member (inspection status $group_status)"
+  fi
+  _assert_eq "process cleanup KILL: has no diagnostic" "" "$(<"$error")"
+  kill_test_server "$PROC_SOCKET"
+}
+
+leader_missing_case() {
+  local tmp output error status child_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" missing || return 1
+  output=$tmp/output
+  error=$tmp/error
+  kill -KILL "$PROC_LEADER"
+  wait_for_process_exit "$PROC_LEADER" 100 0.01 || true
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    3 0.02 >"$output" 2>"$error"
+  status=$?
+  kill -0 "$PROC_CHILD" 2>/dev/null && child_alive=1
+
+  _assert_exit "process cleanup missing leader: fails closed" 74 "$status"
+  _assert_eq "process cleanup missing leader: signals no survivor" \
+    1 "$child_alive"
+  _assert_not_exists "process cleanup missing leader: writes no TERM marker" \
+    "$PROC_CHILD_MARKER"
+  _assert_contains "process cleanup missing leader: diagnostic is actionable" \
+    "recorded leader is no longer live" "$(<"$error")"
+
+  kill -KILL "$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+failed_process_enumeration_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_records "$$" >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "process enumeration failure: is not an empty group" 2 \
+    "$status"
+  _assert_eq "process enumeration failure: publishes no partial members" \
+    "" "$(<"$output")"
+}
+
+malformed_process_enumeration_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "1 1 1 ? S\ntruncated row\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_records 1 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "malformed process enumeration: fails closed" 2 "$status"
+  _assert_eq "malformed process enumeration: publishes no partial members" \
+    "" "$(<"$output")"
+}
+
+zombie_only_process_group_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "4242 4242 4242 ? Z\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_live_records 4242 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "zombie-only process group: is already empty" 1 "$status"
+  _assert_eq "zombie-only process group: publishes no live members" \
+    "" "$(<"$output")"
+}
+
+mixed_live_process_group_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "4242 4242 4242 ? Z\n4243 4242 4242 ? S\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_live_records 4242 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "mixed process group: remains live" 0 "$status"
+  _assert_eq "mixed process group: retains the live member only" \
+    $'4243\t4242\t?\tS' "$(<"$output")"
+}
+
+list_panes_failure_case() {
+  local tmp fake_tmux output error status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" term || return 1
+  fake_tmux=$tmp/tmux-fail-list
+  output=$tmp/output
+  error=$tmp/error
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  [[ $arg != list-panes ]] || exit 1' \
+    'done' \
+    'exec "$FWDPORTS_TEST_REAL_TMUX" "$@"' \
+    >"$fake_tmux"
+  chmod 0700 "$fake_tmux"
+
+  set +e
+  FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN \
+    fwdports_tmux_remove_generation_session "$fake_tmux" "$PROC_SOCKET" \
+    "$PROC_GENERATION" "$PROC_DIGEST" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "tmux pane enumeration failure: refuses session removal" 74 \
+    "$status"
+  if TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$PROC_SOCKET" -f /dev/null \
+    has-session -t "$PROC_SESSION" 2>/dev/null; then
+    _pass "tmux pane enumeration failure: preserves the live session"
+  else
+    _fail "tmux pane enumeration failure: preserves the live session"
+  fi
+  _assert_contains "tmux pane enumeration failure: is actionable" \
+    "cannot enumerate tmux panes" "$(<"$error")"
+  kill_test_server "$PROC_SOCKET"
+}
+
+run_case pane-identity pane_identity_case
+run_case term-owned-group term_owned_group_case
+run_case kill-escalation kill_escalation_case
+run_case leader-missing leader_missing_case
+run_case failed-process-enumeration failed_process_enumeration_case
+run_case malformed-process-enumeration malformed_process_enumeration_case
+run_case zombie-only-process-group zombie_only_process_group_case
+run_case mixed-live-process-group mixed_live_process_group_case
+run_case list-panes-failure list_panes_failure_case
+_test_summary

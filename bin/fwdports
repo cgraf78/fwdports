@@ -8,6 +8,60 @@ set -u
 FWDPORTS_VERSION=0.1.0
 FWDPORTS_DRIVER_API_VERSION=1
 
+_fwdports_entrypoint_dir() {
+  local path=$1 directory target hops=0
+
+  # The installer intentionally publishes this command as a symlink into its
+  # durable checkout. BASH_SOURCE names the link used to invoke us, so deriving
+  # `../lib` from it would look beside the user's bin directory. Resolve each
+  # link ourselves instead of using non-portable `readlink -f`; relative link
+  # targets are interpreted relative to the directory that owns that link.
+  case "$path" in
+    /*) ;;
+    */*) path=$PWD/$path ;;
+    *) path=$(type -P "$path" 2>/dev/null) || return 1 ;;
+  esac
+  while [[ -L $path ]]; do
+    hops=$((hops + 1))
+    [[ $hops -le 40 ]] || {
+      printf 'fwdports: entrypoint symlink chain is too deep\n' >&2
+      return 1
+    }
+    directory=$(cd -P -- "$(dirname "$path")" && pwd -P) || return 1
+    target=$(readlink "$path") || return 1
+    [[ -n $target && $target != *$'\n'* && $target != *$'\r'* ]] || return 1
+    case "$target" in
+      /*) path=$target ;;
+      *) path=$directory/$target ;;
+    esac
+  done
+  [[ -f $path ]] || return 1
+  cd -P -- "$(dirname "$path")" && pwd -P
+}
+
+BIN_DIR=$(_fwdports_entrypoint_dir "${BASH_SOURCE[0]}") || exit 1
+FWDPORTS_MODULE_DIR=$(cd -P -- "$BIN_DIR/../lib/fwdports" && pwd -P) ||
+  exit 1
+export FWDPORTS_MODULE_DIR
+
+# The command is installed as a checkout-backed symlink, so these sources and
+# the executable always come from one revision.  Computed paths are intentional
+# and each module is checked independently by the ShellCheck inventory.
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/runtime.sh"
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/config.sh"
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/drivers.sh"
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/driver-api.sh"
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/tmux.sh"
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/controller.sh"
+# shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/core.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -25,7 +79,7 @@ profile. Configuration defaults to ${XDG_CONFIG_HOME:-$HOME/.config}/fwdports.
 EOF
 }
 
-case "${1:-start}" in
+case "${1:-}" in
   -h | --help)
     usage
     exit 0
@@ -38,14 +92,70 @@ case "${1:-start}" in
     printf '%s\n' "$FWDPORTS_DRIVER_API_VERSION"
     exit 0
     ;;
+esac
+
+command=start
+case "${1:-}" in
   start | status | stop | attach)
-    printf 'fwdports: %s is not available in this build checkpoint\n' \
-      "${1:-start}" >&2
-    exit 69
-    ;;
-  *)
-    printf 'fwdports: unknown command: %s\n' "$1" >&2
-    usage >&2
-    exit 64
+    command=$1
+    shift
     ;;
 esac
+
+case "$command" in
+  status | stop | attach)
+    [[ $# -eq 0 ]] || {
+      printf 'fwdports: %s accepts no arguments\n' "$command" >&2
+      exit 64
+    }
+    case "$command" in
+      status) fwdports_status_command ;;
+      stop) fwdports_stop ;;
+      attach) fwdports_attach ;;
+    esac
+    exit $?
+    ;;
+esac
+
+profile=default
+config=$(_fwdports_config_root)/tunnels.conf
+force=0
+target=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      [[ $# -ge 2 ]] || {
+        printf 'fwdports: --profile requires a value\n' >&2
+        exit 64
+      }
+      profile=$2
+      shift 2
+      ;;
+    --config)
+      [[ $# -ge 2 ]] || {
+        printf 'fwdports: --config requires a value\n' >&2
+        exit 64
+      }
+      config=$2
+      shift 2
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    -*)
+      printf 'fwdports: unknown option: %s\n' "$1" >&2
+      exit 64
+      ;;
+    *)
+      [[ -z $target ]] || {
+        printf 'fwdports: only one target override is accepted\n' >&2
+        exit 64
+      }
+      target=$1
+      shift
+      ;;
+  esac
+done
+
+fwdports_start "$config" "$profile" "$force" "$target"

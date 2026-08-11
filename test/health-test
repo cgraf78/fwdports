@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Pure backoff and manifest-driven service health tests.
+# shellcheck disable=SC2329,SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/health.sh
+source "$ROOT/lib/fwdports/health.sh"
+
+backoff_case() {
+  local sequence='' failures value
+  for failures in 0 1 2 3 4 5 6 20; do
+    value=$(fwdports_backoff_for_failures "$failures") || return 1
+    sequence=${sequence:+$sequence,}$value
+  done
+  _assert_eq "backoff: doubles to a thirty-tick cap" \
+    "1,2,4,8,16,30,30,30" "$sequence"
+}
+
+probe_case() {
+  local tmp manifest fake_bin log result status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  fake_bin=$tmp/bin
+  log=$tmp/probe.log
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_PROBE_LOG"' \
+    '[[ ${FWDPORTS_TEST_PROBE_RESULT:-0} -eq 0 ]]' >"$fake_bin/nc"
+  chmod 0700 "$fake_bin/nc"
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\tgeneration.example' \
+    $'target\tnone' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'check\tweb\ttcp\t127.0.0.1\t8080\tweb' >"$manifest"
+
+  result=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PROBE_LOG=$log \
+    fwdports_health_probe "$manifest")
+  status=$?
+  _assert_exit "health: successful configured probe succeeds" 0 "$status"
+  _assert_eq "health: successful configured probe reports passing" \
+    passing "$result"
+  _assert_contains "health: invokes netcat with a bound timeout" \
+    "-z -w 5 127.0.0.1 8080" "$(<"$log")"
+
+  set +e
+  result=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PROBE_LOG=$log \
+    FWDPORTS_TEST_PROBE_RESULT=1 fwdports_health_probe "$manifest")
+  status=$?
+  _assert_exit "health: failed configured probe is observable" 1 "$status"
+  _assert_eq "health: failed configured probe reports failing" failing \
+    "$result"
+}
+
+no_probe_case() {
+  local tmp manifest result status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\tgeneration.example' \
+    $'target\tnone' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' >"$manifest"
+  set +e
+  result=$(fwdports_health_probe "$manifest")
+  status=$?
+  _assert_exit "health: omitted checks are not an error" 2 "$status"
+  _assert_eq "health: omitted checks report no claim" none "$result"
+}
+
+run_case backoff backoff_case
+run_case probe probe_case
+run_case no-probe no_probe_case
+_test_summary

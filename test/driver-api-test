@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# External executable-driver ABI tests.
+# shellcheck disable=SC2016,SC2329
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
+# The first test is intentionally added before this module during TDD.
+# shellcheck source=../lib/fwdports/driver-api.sh
+source "$ROOT/lib/fwdports/driver-api.sh"
+
+write_driver() {
+  local path=$1 version=${2:-1}
+  mkdir -p "${path%/*}"
+  chmod 0700 "${path%/*}"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+    printf 'case "${1:-}" in\n'
+    printf "  api-version) printf '%s\\n' ;;\n" "$version"
+    printf '  validate) printf "validated\\n" >>"$4/events" ;;\n'
+    printf '  prepare) printf "prepared\\n" >>"$4/events" ;;\n'
+    printf '  cleanup) printf "cleaned\\n" >>"$4/events" ;;\n'
+    printf '  is-live) exit 2 ;;\n'
+    printf '  run) while :; do sleep 1; done ;;\n'
+    printf '  *) exit 64 ;;\n'
+    printf 'esac\n'
+  } >"$path"
+  chmod 0700 "$path"
+}
+
+make_generation() {
+  local tmp=$1 source
+  source=$tmp/resolved
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tcontract' \
+    $'leg\tfixture\texample' >"$source"
+  chmod 0600 "$source"
+  RUNTIME_ROOT=$(HOME=$tmp/home XDG_STATE_HOME=$tmp/state \
+    fwdports_runtime_init) || return 1
+  GENERATION=$(fwdports_generation_create "$RUNTIME_ROOT" "$source") || \
+    return 1
+  fwdports_generation_manifest_digest "$GENERATION" >/dev/null || return 1
+}
+
+trusted_discovery_case() {
+  local tmp config_root source discovered
+  tmp=$(_tmpdir) || return 1
+  config_root=$tmp/config/fwdports
+  source=$config_root/drivers.d/example
+  mkdir -p "$tmp/config"
+  chmod 0700 "$tmp/config"
+  write_driver "$source"
+
+  discovered=$(fwdports_driver_discover "$config_root" example) || true
+  _assert_eq "driver discovery: returns the trusted executable" \
+    "$source" "$discovered"
+
+  chmod 0777 "$source"
+  if fwdports_driver_discover "$config_root" example >/dev/null 2>&1; then
+    _fail "driver discovery: rejects a writable executable"
+  else
+    _pass "driver discovery: rejects a writable executable"
+  fi
+
+  if fwdports_driver_discover "$config_root" ssh >/dev/null 2>&1; then
+    _fail "driver discovery: built-in names cannot be shadowed"
+  else
+    _pass "driver discovery: built-in names cannot be shadowed"
+  fi
+}
+
+immutable_snapshot_case() {
+  local tmp config_root source snapshot original_digest snapshot_digest
+  tmp=$(_tmpdir) || return 1
+  config_root=$tmp/config/fwdports
+  source=$config_root/drivers.d/example
+  mkdir -p "$tmp/config"
+  chmod 0700 "$tmp/config"
+  write_driver "$source"
+  make_generation "$tmp" || return 1
+
+  snapshot=$(fwdports_driver_snapshot "$config_root" example \
+    "$GENERATION") || true
+  _assert_file "driver snapshot: publishes a regular executable" "$snapshot"
+  original_digest=$(_fwdports_runtime_sha256_file "$source")
+  snapshot_digest=$(_fwdports_runtime_sha256_file "$snapshot")
+  _assert_eq "driver snapshot: preserves exact bytes" \
+    "$original_digest" "$snapshot_digest"
+
+  printf '%s\n' '# changed after snapshot' >>"$source"
+  snapshot_digest=$(_fwdports_runtime_sha256_file "$snapshot")
+  _assert_eq "driver snapshot: later source changes do not alter generation" \
+    "$original_digest" "$snapshot_digest"
+}
+
+api_version_case() {
+  local tmp config_root source snapshot
+  tmp=$(_tmpdir) || return 1
+  config_root=$tmp/config/fwdports
+  source=$config_root/drivers.d/example
+  mkdir -p "$tmp/config"
+  chmod 0700 "$tmp/config"
+  write_driver "$source"
+  make_generation "$tmp" || return 1
+  snapshot=$(fwdports_driver_snapshot "$config_root" example \
+    "$GENERATION") || true
+  _assert_file "driver API: v1 snapshot succeeds" "$snapshot"
+
+  rm -rf -- "$GENERATION"
+  make_generation "$tmp" || return 1
+  write_driver "$source" 2
+  if fwdports_driver_snapshot "$config_root" example "$GENERATION" \
+    >/dev/null 2>&1; then
+    _fail "driver API: rejects an unsupported version"
+  else
+    _pass "driver API: rejects an unsupported version"
+  fi
+}
+
+operations_case() {
+  local tmp config_root source snapshot leg_runtime events manifest
+  tmp=$(_tmpdir) || return 1
+  config_root=$tmp/config/fwdports
+  source=$config_root/drivers.d/example
+  mkdir -p "$tmp/config"
+  chmod 0700 "$tmp/config"
+  write_driver "$source"
+  make_generation "$tmp" || return 1
+  snapshot=$(fwdports_driver_snapshot "$config_root" example \
+    "$GENERATION") || return 1
+  manifest=$GENERATION/manifest
+  leg_runtime=$GENERATION/legs/fixture
+  mkdir -p "$leg_runtime"
+  chmod 0700 "$leg_runtime"
+
+  fwdports_driver_operation "$snapshot" validate "$manifest" fixture \
+    "$leg_runtime" || _fail "driver operations: validate succeeds"
+  fwdports_driver_operation "$snapshot" prepare "$manifest" fixture \
+    "$leg_runtime" || _fail "driver operations: prepare succeeds"
+  fwdports_driver_operation "$snapshot" cleanup "$manifest" fixture \
+    "$leg_runtime" || _fail "driver operations: cleanup succeeds"
+  events=$(<"$leg_runtime/events")
+  _assert_eq "driver operations: preserve operation order" \
+    $'validated\nprepared\ncleaned' "$events"
+}
+
+run_case trusted-discovery trusted_discovery_case
+run_case immutable-snapshot immutable_snapshot_case
+run_case api-version api_version_case
+run_case operations operations_case
+_test_summary

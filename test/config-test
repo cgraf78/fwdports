@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# Case callbacks are passed by name to the shared harness.
+# shellcheck disable=SC2329
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/config.sh
+source "$ROOT/lib/fwdports/config.sh"
+
+resolve_config() {
+  local config=$1 profile=$2 output=$3 error=$4
+  set +e
+  fwdports_config_resolve "$config" "$profile" "$output" 2>"$error"
+  RESOLVE_STATUS=$?
+  RESOLVE_ERROR=$(<"$error")
+  RESOLVE_OUTPUT=
+  if [[ -f "$output" ]]; then
+    RESOLVE_OUTPUT=$(<"$output")
+  fi
+}
+
+minimal_profile_case() {
+  local tmp config output error expected
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' \
+    'profile demo' \
+    'leg web' \
+    'set web host shell.example.com' \
+    'set web local-forward 127.0.0.1:8080:127.0.0.1:8080' >"$config"
+  expected=$(printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:8080')
+
+  resolve_config "$config" demo "$output" "$error"
+  _assert_exit "config minimal: resolves" 0 "$RESOLVE_STATUS"
+  _assert_eq "config minimal: canonical records" "$expected" "$RESOLVE_OUTPUT"
+  _assert_eq "config minimal: no diagnostics" "" "$RESOLVE_ERROR"
+}
+
+default_ssh_case() {
+  local tmp implicit explicit implicit_out explicit_out error
+  tmp=$(_tmpdir) || return 1
+  implicit="$tmp/implicit.conf"
+  explicit="$tmp/explicit.conf"
+  implicit_out="$tmp/implicit.out"
+  explicit_out="$tmp/explicit.out"
+  error="$tmp/error"
+  printf '%s\n' 'profile demo' 'leg web' >"$implicit"
+  printf '%s\n' 'profile demo' 'leg web ssh' >"$explicit"
+
+  resolve_config "$implicit" demo "$implicit_out" "$error"
+  _assert_exit "config default driver: implicit resolves" 0 "$RESOLVE_STATUS"
+  resolve_config "$explicit" demo "$explicit_out" "$error"
+  _assert_exit "config default driver: explicit resolves" 0 "$RESOLVE_STATUS"
+  _assert_eq "config default driver: implicit and explicit normalize equally" \
+    "$(<"$implicit_out")" "$(<"$explicit_out")"
+}
+
+unsafe_name_case() {
+  local tmp config output error
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' 'profile demo;touch' 'leg web' >"$config"
+
+  resolve_config "$config" demo "$output" "$error"
+  _assert_exit "config validation: unsafe name is rejected" 1 \
+    "$RESOLVE_STATUS"
+  _assert_contains "config validation: unsafe name identifies record" \
+    "invalid profile record" "$RESOLVE_ERROR"
+  _assert_not_exists "config validation: unsafe name publishes nothing" \
+    "$output"
+}
+
+unsafe_value_case() {
+  local tmp config output error
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' \
+    'profile demo' \
+    'leg web' \
+    'set web host host.example.com;touch' >"$config"
+
+  resolve_config "$config" demo "$output" "$error"
+  _assert_exit "config validation: unsafe value is rejected" 1 \
+    "$RESOLVE_STATUS"
+  _assert_contains "config validation: unsafe value identifies record" \
+    "invalid set record" "$RESOLVE_ERROR"
+  _assert_not_exists "config validation: unsafe value publishes nothing" \
+    "$output"
+}
+
+duplicate_record_case() {
+  local tmp config output error
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' 'profile demo' 'leg web' 'leg web' >"$config"
+
+  resolve_config "$config" demo "$output" "$error"
+  _assert_exit "config validation: duplicate leg is rejected" 1 \
+    "$RESOLVE_STATUS"
+  _assert_contains "config validation: duplicate leg is actionable" \
+    "duplicate leg" "$RESOLVE_ERROR"
+  _assert_not_exists "config validation: duplicate leg publishes nothing" \
+    "$output"
+}
+
+unknown_directive_case() {
+  local tmp config output error
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' 'profile demo' 'leg web' 'launch web anything' >"$config"
+
+  resolve_config "$config" demo "$output" "$error"
+  _assert_exit "config validation: unknown directive is rejected" 1 \
+    "$RESOLVE_STATUS"
+  _assert_contains "config validation: unknown directive is actionable" \
+    "unknown directive" "$RESOLVE_ERROR"
+  _assert_not_exists "config validation: unknown directive publishes nothing" \
+    "$output"
+}
+
+extends_parent_case() {
+  local tmp config output error expected
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' \
+    'profile base' \
+    'leg web' \
+    'set web host shell.example.com' \
+    'set web local-forward 127.0.0.1:8080:127.0.0.1:8080' \
+    'profile child extends base' \
+    'set web server-alive-interval 15' >"$config"
+  expected=$(printf '%s\n' \
+    $'version\t1' \
+    $'profile\tchild' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:8080' \
+    $'set\tweb\tserver-alive-interval\t15')
+
+  resolve_config "$config" child "$output" "$error"
+  _assert_exit "config inheritance: child resolves" 0 "$RESOLVE_STATUS"
+  _assert_eq "config inheritance: parent records precede child" \
+    "$expected" "$RESOLVE_OUTPUT"
+}
+
+reset_leg_case() {
+  local tmp config output error expected
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' \
+    'profile base' \
+    'leg web' \
+    'set web host old.example.com' \
+    'set web local-forward 127.0.0.1:8080:127.0.0.1:8080' \
+    'profile child extends base' \
+    'reset web' \
+    'set web host new.example.com' \
+    'set web remote-forward 127.0.0.1:9090:127.0.0.1:9090' >"$config"
+  expected=$(printf '%s\n' \
+    $'version\t1' \
+    $'profile\tchild' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tnew.example.com' \
+    $'set\tweb\tremote-forward\t127.0.0.1:9090:127.0.0.1:9090')
+
+  resolve_config "$config" child "$output" "$error"
+  _assert_exit "config reset: inherited leg resolves" 0 "$RESOLVE_STATUS"
+  _assert_eq "config reset: options clear but driver identity remains" \
+    "$expected" "$RESOLVE_OUTPUT"
+}
+
+inheritance_cycle_case() {
+  local tmp config output error
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' 'profile one extends two' 'profile two extends one' >"$config"
+
+  resolve_config "$config" one "$output" "$error"
+  _assert_exit "config inheritance: cycle is rejected" 1 "$RESOLVE_STATUS"
+  _assert_contains "config inheritance: cycle is actionable" \
+    "inheritance cycle" "$RESOLVE_ERROR"
+  _assert_not_exists "config inheritance: cycle publishes nothing" "$output"
+}
+
+inheritance_depth_case() {
+  local tmp config output error index
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf 'profile p0\n' >"$config"
+  index=1
+  while [[ $index -le 21 ]]; do
+    printf 'profile p%s extends p%s\n' "$index" "$((index - 1))" >>"$config"
+    index=$((index + 1))
+  done
+
+  resolve_config "$config" p21 "$output" "$error"
+  _assert_exit "config inheritance: excessive depth is rejected" 1 \
+    "$RESOLVE_STATUS"
+  _assert_contains "config inheritance: depth bound is actionable" \
+    "exceeds depth 20" "$RESOLVE_ERROR"
+  _assert_not_exists "config inheritance: excessive depth publishes nothing" \
+    "$output"
+}
+
+checks_and_failure_case() {
+  local tmp config output error expected
+  tmp=$(_tmpdir) || return 1
+  config="$tmp/tunnels.conf"
+  output="$tmp/resolved"
+  error="$tmp/error"
+  printf '%s\n' \
+    'profile demo' \
+    'leg web' \
+    'set web host shell.example.com' \
+    'set web local-forward 127.0.0.1:8080:127.0.0.1:8080' \
+    'check web loopback 8080' \
+    'check web tcp 192.0.2.10 443 upstream' \
+    'failure web preserve' >"$config"
+  expected=$(printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:8080' \
+    $'check\tweb\tloopback\t127.0.0.1\t8080\tweb' \
+    $'check\tweb\ttcp\t192.0.2.10\t443\tupstream' \
+    $'failure\tweb\tpreserve')
+
+  resolve_config "$config" demo "$output" "$error"
+  _assert_exit "config checks: records resolve" 0 "$RESOLVE_STATUS"
+  _assert_eq "config checks: records normalize deterministically" \
+    "$expected" "$RESOLVE_OUTPUT"
+}
+
+run_case minimal-profile minimal_profile_case
+run_case default-ssh default_ssh_case
+run_case unsafe-name unsafe_name_case
+run_case unsafe-value unsafe_value_case
+run_case duplicate-record duplicate_record_case
+run_case unknown-directive unknown_directive_case
+run_case extends-parent extends_parent_case
+run_case reset-leg reset_leg_case
+run_case inheritance-cycle inheritance_cycle_case
+run_case inheritance-depth inheritance_depth_case
+run_case checks-and-failure checks_and_failure_case
+_test_summary

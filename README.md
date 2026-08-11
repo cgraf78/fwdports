@@ -1,7 +1,9 @@
 # fwdports
 
 ![CI](https://github.com/cgraf78/fwdports/actions/workflows/ci.yml/badge.svg)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Termux-lightgrey.svg)](#)
 
 `fwdports` keeps a declared set of SSH port forwards alive in one inspectable
 tmux session. It uses ordinary foreground OpenSSH by default, supports autossh
@@ -61,9 +63,11 @@ fwdports stop
 ```
 
 One owned tmux session is supported. Repeating `start` with the same desired
-state repairs missing components without churning healthy ones. A differing
-configuration requires `--force`, which completes an authenticated stop before
-starting the replacement; it never overlaps two generations.
+state is a no-churn success while the generation is live and its checks pass.
+A dead generation, dead controller, or restart-policy health failure is
+replaced sequentially; `preserve` keeps a still-live degraded generation.
+A differing configuration requires `--force`, which completes an authenticated
+stop before starting the replacement. Two generations never overlap.
 
 ## Drivers
 

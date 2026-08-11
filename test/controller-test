@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2034
+# Single-quoted fixture lines are expanded only by the child process.
+# shellcheck disable=SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
+# shellcheck source=../lib/fwdports/tmux.sh
+source "$ROOT/lib/fwdports/tmux.sh"
+# shellcheck source=../lib/fwdports/driver-api.sh
+source "$ROOT/lib/fwdports/driver-api.sh"
+# shellcheck source=../lib/fwdports/controller.sh
+source "$ROOT/lib/fwdports/controller.sh"
+
+TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
+
+controller_fixture() {
+  local tmp=$1 driver=${2:-ssh} home state source root generation digest
+  home=$tmp/home
+  state=$tmp/state
+  source=$tmp/resolved-profile
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\t'"$driver" \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    >"$source"
+  chmod 0600 "$source"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init) || return 1
+  generation=$(fwdports_generation_create "$root" "$source") || return 1
+  digest=$(fwdports_generation_manifest_digest "$generation") || return 1
+  fwdports_control_write "$generation" "$digest" preparing running \
+    none none unknown || return 1
+  fwdports_pointer_publish "$root" pending "$generation" "$digest" ||
+    return 1
+  printf '%s\t%s\t%s\n' "$root" "$generation" "$digest"
+}
+
+write_status_driver() {
+  local path=$1 result=$2
+  mkdir -p "${path%/*}"
+  chmod 0700 "${path%/*}"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+    printf 'case "${1:-}" in\n'
+    printf '  is-live) printf "%%s\\n" "$2|$3|$4|$5" >"$4/is-live-call"; exit %s ;;\n' \
+      "$result"
+    printf '  *) exit 64 ;;\n'
+    printf 'esac\n'
+  } >"$path"
+  chmod 0700 "$path"
+}
+
+wait_for_ready() {
+  local path=$1 attempts=0
+  while [[ ! -s "$path" && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -s "$path" ]]
+}
+
+start_test_controller() {
+  local root=$1 generation=$2 digest=$3 stdout=$4 stderr=$5
+  FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+    FWDPORTS_CONTROLLER_MAX_TICKS=500 \
+    bash "$ROOT/lib/fwdports/controller.sh" wait-for-activation \
+    "$root" "$generation" "$digest" >"$stdout" 2>"$stderr" &
+  CONTROLLER_PID=$!
+}
+
+wait_for_file() {
+  local path=$1 attempts=0
+  while [[ ! -s "$path" && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -s "$path" ]]
+}
+
+kill_test_server() {
+  local socket=$1
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    kill-server 2>/dev/null || true
+}
+
+start_status_pane() {
+  local tmp=$1 generation=$2 digest=$3 fixture pid_file release record
+  fixture=$tmp/status-leader
+  pid_file=$tmp/status-pid
+  release=$tmp/status-release
+  STATUS_SOCKET=$tmp/status-tmux.sock
+  STATUS_RELEASE=$release
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$$" >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$STATUS_SOCKET" \
+    fwdports "${generation##*/}" "$tmp" "$fixture" "$pid_file" "$release") ||
+    return 1
+  IFS=$'\t' read -r STATUS_SESSION STATUS_PANE <<<"$record"
+  wait_for_file "$pid_file" || return 1
+  fwdports_tmux_record_pane "$TMUX_BIN" "$STATUS_SOCKET" \
+    "$STATUS_SESSION" "$STATUS_PANE" "$generation" "$digest" \
+    "$generation/legs/web/pane"
+}
+
+activate_status_generation() {
+  local tmp=$1 root=$2 generation=$3 digest=$4 start
+  start_status_pane "$tmp" "$generation" "$digest" || return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$start" none || return 1
+  fwdports_pointer_publish "$root" active "$generation" "$digest"
+}
+
+run_recovery() {
+  local root=$1 socket=$2 output=$3 error=$4
+  set +e
+  fwdports_recover_state "$TMUX_BIN" "$socket" "$root" fwdports \
+    20 0.01 >"$output" 2>"$error"
+  RECOVERY_STATUS=$?
+}
+
+controller_ready_case() {
+  local tmp fixture root generation digest stdout stderr ready content
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  stdout=$tmp/stdout
+  stderr=$tmp/stderr
+  ready=$generation/controller.ready
+
+  start_test_controller "$root" "$generation" "$digest" "$stdout" "$stderr"
+  wait_for_ready "$ready" || true
+  content=
+  [[ -f "$ready" ]] && content=$(<"$ready")
+
+  _assert_file "controller ready: publishes a regular marker" "$ready"
+  _assert_contains "controller ready: binds generation" \
+    $'generation\t'"${generation##*/}" "$content"
+  _assert_contains "controller ready: binds manifest digest" \
+    $'manifest-digest\t'"$digest" "$content"
+  _assert_contains "controller ready: records exact process" \
+    $'controller-pid\t'"$CONTROLLER_PID" "$content"
+  _assert_contains "controller ready: records process start identity" \
+    $'controller-start\t' "$content"
+
+  kill "$CONTROLLER_PID" 2>/dev/null || true
+  wait "$CONTROLLER_PID" 2>/dev/null || true
+}
+
+controller_before_publish_case() {
+  local tmp fixture root generation digest stdout stderr ready
+  local pointer_before control_before alive=0
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  stdout=$tmp/stdout
+  stderr=$tmp/stderr
+  ready=$generation/controller.ready
+  pointer_before=$(<"$root/pending")
+  control_before=$(<"$generation/control")
+
+  start_test_controller "$root" "$generation" "$digest" "$stdout" "$stderr"
+  wait_for_ready "$ready" || true
+  sleep 0.05
+  kill -0 "$CONTROLLER_PID" 2>/dev/null && alive=1
+
+  _assert_eq "controller boot gate: waits before active publication" 1 "$alive"
+  _assert_not_exists "controller boot gate: does not publish active" \
+    "$root/active"
+  _assert_eq "controller boot gate: does not change pending" \
+    "$pointer_before" "$(<"$root/pending")"
+  _assert_eq "controller boot gate: does not change control" \
+    "$control_before" "$(<"$generation/control")"
+
+  kill "$CONTROLLER_PID" 2>/dev/null || true
+  wait "$CONTROLLER_PID" 2>/dev/null || true
+}
+
+controller_after_publish_case() {
+  local tmp fixture root generation digest stdout stderr ready start status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  stdout=$tmp/stdout
+  stderr=$tmp/stderr
+  ready=$generation/controller.ready
+
+  start_test_controller "$root" "$generation" "$digest" "$stdout" "$stderr"
+  wait_for_ready "$ready" || true
+  start=$(_fwdports_process_start_identity "$CONTROLLER_PID")
+  fwdports_control_write "$generation" "$digest" running running \
+    "$CONTROLLER_PID" "$start" unknown
+  fwdports_pointer_publish "$root" active "$generation" "$digest"
+  wait "$CONTROLLER_PID"
+  status=$?
+
+  _assert_exit "controller boot gate: releases after active publication" \
+    0 "$status"
+  _assert_eq "controller boot gate: emits activation result" \
+    "activated" "$(<"$stdout")"
+  _assert_eq "controller boot gate: activation has no diagnostic" \
+    "" "$(<"$stderr")"
+}
+
+status_starting_case() {
+  local tmp fixture root generation digest output error status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_status "$root" "$TMUX_BIN" "$tmp/unused.sock" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "status starting: succeeds" 0 "$status"
+  _assert_eq "status starting: names pending state" "starting" "$(<"$output")"
+  _assert_eq "status starting: needs no tmux server" "" "$(<"$error")"
+}
+
+status_live_unverified_case() {
+  local tmp fixture root generation digest output error status start
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  start_status_pane "$tmp" "$generation" "$digest" || return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$start" none
+  fwdports_pointer_publish "$root" active "$generation" "$digest"
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_status "$root" "$TMUX_BIN" "$STATUS_SOCKET" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "status live unverified: succeeds" 0 "$status"
+  _assert_eq "status live unverified: does not overclaim health" \
+    "live/unverified" "$(<"$output")"
+  _assert_eq "status live unverified: has no diagnostic" "" "$(<"$error")"
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
+status_down_case() {
+  local tmp fixture root generation digest output error status start
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  start_status_pane "$tmp" "$generation" "$digest" || return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$start" none
+  fwdports_pointer_publish "$root" active "$generation" "$digest"
+  kill_test_server "$STATUS_SOCKET"
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_status "$root" "$TMUX_BIN" "$STATUS_SOCKET" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "status down: observation succeeds" 0 "$status"
+  _assert_eq "status down: reports dead transport" "down" "$(<"$output")"
+  _assert_eq "status down: expected death has no trust diagnostic" \
+    "" "$(<"$error")"
+}
+
+status_external_driver_liveness_case() {
+  local tmp fixture root generation digest output error status start
+  local driver call
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  start_status_pane "$tmp" "$generation" "$digest" || return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$start" none
+  fwdports_pointer_publish "$root" active "$generation" "$digest"
+  driver=$generation/drivers/example
+  write_status_driver "$driver" 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_status "$root" "$TMUX_BIN" "$STATUS_SOCKET" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+  set -e
+  call=$(<"$generation/legs/web/is-live-call")
+
+  _assert_exit "external liveness: status observation succeeds" 0 "$status"
+  _assert_eq "external liveness: driver can report a dead transport" \
+    down "$(<"$output")"
+  _assert_eq "external liveness: receives the fixed ABI paths" \
+    "$generation/manifest|web|$generation/legs/web|$STATUS_PANE" "$call"
+  _assert_eq "external liveness: expected death has no diagnostic" \
+    "" "$(<"$error")"
+
+  write_status_driver "$driver" 2
+  fwdports_status "$root" "$TMUX_BIN" "$STATUS_SOCKET" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+  _assert_exit "external liveness fallback: status succeeds" 0 "$status"
+  _assert_eq "external liveness fallback: verified pane remains live" \
+    "live/unverified" "$(<"$output")"
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
+unowned_session_case() {
+  local tmp socket fixture release record output error status
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/unowned
+  release=$tmp/release
+  output=$tmp/output
+  error=$tmp/error
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'while [[ ! -e "$1" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" fwdports \
+    generation.unowned01 "$tmp" "$fixture" "$release") || return 1
+
+  set +e
+  fwdports_status "$tmp/missing-state" "$TMUX_BIN" "$socket" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "unowned session: status refuses ownership" 1 "$status"
+  _assert_eq "unowned session: reports exact condition" \
+    "unowned-session" "$(<"$output")"
+  if TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    has-session -t fwdports 2>/dev/null; then
+    _pass "unowned session: remains untouched"
+  else
+    _fail "unowned session: remains untouched"
+  fi
+  : >"$release"
+  kill_test_server "$socket"
+  : "$record"
+}
+
+crash_before_active_case() {
+  local tmp fixture root generation digest output error
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  start_status_pane "$tmp" "$generation" "$digest" || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  run_recovery "$root" "$STATUS_SOCKET" "$output" "$error"
+
+  _assert_exit "recovery before active: succeeds" 0 "$RECOVERY_STATUS"
+  _assert_eq "recovery before active: rolls back pending generation" \
+    "pending-rolled-back" "$(<"$output")"
+  _assert_not_exists "recovery before active: removes pending pointer" \
+    "$root/pending"
+  _assert_not_exists "recovery before active: removes generation" "$generation"
+  if ! TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$STATUS_SOCKET" -f /dev/null \
+    has-session -t fwdports 2>/dev/null; then
+    _pass "recovery before active: removes authenticated session"
+  else
+    _fail "recovery before active: removes authenticated session"
+  fi
+  _assert_eq "recovery before active: has no diagnostic" "" "$(<"$error")"
+}
+
+crash_after_active_case() {
+  local tmp fixture root generation digest output error
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  run_recovery "$root" "$STATUS_SOCKET" "$output" "$error"
+
+  _assert_exit "recovery after active: succeeds" 0 "$RECOVERY_STATUS"
+  _assert_eq "recovery after active: keeps authoritative active generation" \
+    "active" "$(<"$output")"
+  _assert_not_exists "recovery after active: removes redundant pending" \
+    "$root/pending"
+  _assert_file "recovery after active: keeps active manifest" \
+    "$generation/manifest"
+  if kill -0 "$(<"$tmp/status-pid")" 2>/dev/null; then
+    _pass "recovery after active: keeps live transport"
+  else
+    _fail "recovery after active: keeps live transport"
+  fi
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
+crash_before_stop_control_case() {
+  local tmp fixture root generation digest output error control_before
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  # Simulate a stop request that crashed before its first committed mutation.
+  control_before=$(<"$generation/control")
+  output=$tmp/output
+  error=$tmp/error
+  run_recovery "$root" "$STATUS_SOCKET" "$output" "$error"
+
+  _assert_eq "recovery before stop control: leaves generation active" \
+    "active" "$(<"$output")"
+  _assert_eq "recovery before stop control: does not infer stop intent" \
+    "$control_before" "$(<"$generation/control")"
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
+crash_after_stop_control_case() {
+  local tmp fixture root generation digest output error start
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" stopping stopped \
+    "$$" "$start" none
+  output=$tmp/output
+  error=$tmp/error
+
+  run_recovery "$root" "$STATUS_SOCKET" "$output" "$error"
+
+  _assert_exit "recovery after stop control: succeeds" 0 "$RECOVERY_STATUS"
+  _assert_eq "recovery after stop control: resumes cleanup" \
+    "stopped" "$(<"$output")"
+  _assert_not_exists "recovery after stop control: removes active pointer" \
+    "$root/active"
+  _assert_not_exists "recovery after stop control: removes generation" \
+    "$generation"
+}
+
+crash_after_signal_case() {
+  local signal=$1 label=$2 tmp fixture root generation digest output error
+  local start pane_record _ _ _ _ _ _ pgid _ _ index=0
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" stopping stopped \
+    "$$" "$start" none
+  pane_record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$generation/legs/web/pane")
+  IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$pane_record"
+  kill "-$signal" -- "-$pgid" 2>/dev/null || true
+  while _fwdports_process_group_records "$pgid" >/dev/null 2>&1 &&
+    [[ $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  output=$tmp/output
+  error=$tmp/error
+
+  run_recovery "$root" "$STATUS_SOCKET" "$output" "$error"
+
+  _assert_exit "recovery after $label: succeeds" 0 "$RECOVERY_STATUS"
+  _assert_eq "recovery after $label: completes stop" "stopped" "$(<"$output")"
+  _assert_not_exists "recovery after $label: removes generation" "$generation"
+}
+
+crash_after_term_case() {
+  crash_after_signal_case TERM TERM
+}
+
+crash_after_kill_case() {
+  crash_after_signal_case KILL KILL
+}
+
+force_between_generations_case() {
+  local tmp fixture root generation digest output error source second second_digest
+  local start
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" stopping stopped \
+    "$$" "$start" none
+  output=$tmp/output
+  error=$tmp/error
+  run_recovery "$root" "$STATUS_SOCKET" "$output" "$error"
+  [[ $RECOVERY_STATUS -eq 0 ]] || return 1
+
+  source=$tmp/replacement-profile
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\treplacement' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\treplacement.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8081:127.0.0.1:81' \
+    >"$source"
+  chmod 0600 "$source"
+  second=$(fwdports_generation_create "$root" "$source")
+  second_digest=$(fwdports_generation_manifest_digest "$second")
+
+  _assert_eq "force sequencing: old generation is fully stopped first" \
+    "stopped" "$(<"$output")"
+  _assert_not_exists "force sequencing: old generation no longer exists" \
+    "$generation"
+  _assert_ne "force sequencing: replacement has a new nonce" \
+    "$generation" "$second"
+  if [[ $second_digest =~ ^[0-9a-f]{64}$ ]]; then
+    _pass "force sequencing: replacement digest is valid"
+  else
+    _fail "force sequencing: replacement digest is valid"
+  fi
+}
+
+dead_pane_process_inspection_failure_case() {
+  local tmp fixture root generation digest error status cleanup_marker
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  error=$tmp/error
+  cleanup_marker=$tmp/cleanup-called
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  fwdports_pointer_remove "$root" pending "$generation" "$digest" ||
+    return 1
+
+  fwdports_tmux_verify_pane() { return 1; }
+  _fwdports_process_group_records() { return 2; }
+  _fwdports_cleanup_generation_drivers() {
+    : >"$FWDPORTS_TEST_CLEANUP_MARKER"
+  }
+
+  set +e
+  FWDPORTS_TEST_CLEANUP_MARKER=$cleanup_marker \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    active "$generation" "$digest" fwdports 1 0 \
+    >/dev/null 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "dead pane inspection failure: stop fails closed" 74 "$status"
+  _assert_file "dead pane inspection failure: preserves generation" \
+    "$generation/manifest"
+  _assert_file "dead pane inspection failure: preserves pointer" \
+    "$root/active"
+  if TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$STATUS_SOCKET" -f /dev/null \
+    has-session -t "$STATUS_SESSION" 2>/dev/null; then
+    _pass "dead pane inspection failure: preserves tmux session"
+  else
+    _fail "dead pane inspection failure: preserves tmux session"
+  fi
+  _assert_not_exists "dead pane inspection failure: skips later cleanup" \
+    "$cleanup_marker"
+  _assert_contains "dead pane inspection failure: is actionable" \
+    "cannot inspect the recorded process group" "$(<"$error")"
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
+run_case controller-ready controller_ready_case
+run_case controller-before-publish controller_before_publish_case
+run_case controller-after-publish controller_after_publish_case
+run_case status-starting status_starting_case
+run_case status-live-unverified status_live_unverified_case
+run_case status-down status_down_case
+run_case status-external-driver-liveness status_external_driver_liveness_case
+run_case unowned-session unowned_session_case
+run_case crash-before-active crash_before_active_case
+run_case crash-after-active crash_after_active_case
+run_case crash-before-stop-control crash_before_stop_control_case
+run_case crash-after-stop-control crash_after_stop_control_case
+run_case crash-after-term crash_after_term_case
+run_case crash-after-kill crash_after_kill_case
+run_case force-between-generations force_between_generations_case
+run_case dead-pane-process-inspection-failure \
+  dead_pane_process_inspection_failure_case
+_test_summary

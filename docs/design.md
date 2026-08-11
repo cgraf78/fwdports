@@ -75,41 +75,54 @@ least one local or remote forward is required. Core forces foreground,
 no-session operation, forward-failure detection, disabled multiplex reuse,
 disabled tunnel devices, and disabled local commands. Raw SSH options are not
 accepted because they would bypass validation and desired-state fingerprinting.
+Built-in legs must use distinct local bind ports across the complete resolved
+profile so one successful leg cannot mask another leg's deterministic bind
+failure.
 
 ## Status vocabulary
 
 - `starting`: a verified pending generation has not become active.
-- `backoff`: a direct SSH restart is waiting for its next bounded attempt.
 - `healthy`: the driver is live and every configured service check passes.
 - `live/unverified`: the driver is live and has no configured service check.
 - `degraded`: the driver is live but a configured service check fails.
 - `down`: the driver is not live.
 - `controller-down`: active legs may remain, but observation needs an explicit
-  `start` to repair the controller.
-- `stopping`: repair is disabled while authenticated cleanup is incomplete.
-- `failed`: a verified generation has an actionable start/controller failure.
+  `start` to rebuild the generation.
+- `stopping`: replacement is disabled while authenticated cleanup is incomplete.
 
 Process or monitor liveness is never reported as endpoint health.
 
 ## Reconciliation
 
-Healthy or unchecked live legs are retained. A live degraded leg is recycled
-only when its policy is `restart`; `preserve` applies only while a transport is
-still live. Every dead leg is restarted with bounded backoff. Direct SSH uses
-elapsed controller ticks with a 1, 2, 4, 8, 16, 30 cap and resets after stable
-operation. Autossh owns child retries while its monitor is live.
+Each foreground transport owns reconnect behavior while its tmux pane remains
+alive. Direct SSH retries with a 1, 2, 4, 8, 16, 30-second cap and resets its
+backoff after stable operation. Autossh owns child retries while its monitor is
+live; an external driver owns retry policy inside its foreground `run` process.
+
+The controller observes configured service checks and publishes status; it does
+not mutate transport panes in the background. An explicit matching `start`
+retains a live healthy or unchecked generation. It also retains a still-live
+degraded generation only when every declared leg uses `preserve`. Otherwise,
+or when a pane/controller is dead, core authenticates and removes the complete
+generation before starting its replacement. This whole-generation transaction
+is intentionally simpler and safer than partially rewriting a running graph.
 
 Health probes use elapsed condition-loop ticks rather than wall-clock
-arithmetic so clock changes cannot skip or extend policy transitions.
-Generation invalidation cancels every pending wait.
+arithmetic so clock changes cannot skip or extend observations. Generation
+invalidation cancels every pending wait.
 
 ## State model
 
 Each start creates a stable, never-renamed random generation directory. Its
 manifest is immutable; its control file is atomically replaceable observed
-state. Small `pending` and `active` files identify a generation plus manifest
-digest. A fully written owner record is hard-linked atomically to claim the
-lifecycle lock, avoiding an ownerless lock state.
+state. It stores only the lifecycle phase, desired state, controller identity,
+and latest probe result; transport retry counters stay local to the transport
+that actually owns them. Small `pending` and `active` files identify a
+generation plus manifest digest. A fully written owner record is published by
+an atomic, relative symlink to claim the lifecycle lock. The pointer is
+accepted only when its in-root candidate name, protected file, embedded nonce,
+and repeated target read agree. This avoids both an ownerless lock state and a
+hard-link dependency that Android application filesystems cannot provide.
 
 Tmux sessions carry a random generation nonce at creation. Core records pane,
 session, PID/start identity, tty, SID, and PGID evidence. Cleanup revalidates

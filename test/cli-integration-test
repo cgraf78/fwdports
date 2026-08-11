@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# End-to-end command lifecycle on an isolated real tmux socket.
+# Named cases and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+FWDPORTS=$ROOT/bin/fwdports
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+
+run_fwdports() {
+  local output=$1
+  shift
+  set +e
+  HOME=$CASE_HOME XDG_CONFIG_HOME=$CASE_CONFIG XDG_STATE_HOME=$CASE_STATE \
+    XDG_RUNTIME_DIR=$CASE_RUNTIME FWDPORTS_TMUX_SOCKET=$CASE_SOCKET \
+    FWDPORTS_SSH_COMMAND=$CASE_SSH FWDPORTS_TEST_SSH_LOG=$CASE_SSH_LOG \
+    FWDPORTS_AUTOSSH_COMMAND=$CASE_AUTOSSH \
+    FWDPORTS_CONTROLLER_TICK_SECONDS=${FWDPORTS_CONTROLLER_TICK_SECONDS:-1} \
+    FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=${FWDPORTS_HEALTH_STARTUP_GRACE_TICKS:-5} \
+    FWDPORTS_HEALTH_INTERVAL_TICKS=${FWDPORTS_HEALTH_INTERVAL_TICKS:-30} \
+    "$FWDPORTS" "$@" >"$output" 2>&1
+  COMMAND_STATUS=$?
+  COMMAND_OUTPUT=$(<"$output")
+}
+
+configured_health_case() {
+  local tmp config output index=0 observed=''
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$tmp/bin/nc"
+  chmod 0700 "$tmp/bin/nc"
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'check shell tcp 127.0.0.1 19090 endpoint' >"$config"
+  chmod 0600 "$config"
+  PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+    FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+    FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" start
+  _assert_exit "CLI health: checked profile starts" 0 "$COMMAND_STATUS"
+  while [[ $index -lt 200 ]]; do
+    PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+      FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+      FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" status
+    observed=$COMMAND_OUTPUT
+    [[ $observed == healthy ]] && break
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_eq "CLI health: service success becomes healthy" healthy "$observed"
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
+  if [[ $COMMAND_STATUS -eq 0 ]]; then
+    _pass "CLI health: checked profile stops"
+  else
+    _fail "CLI health: checked profile stops (exit $COMMAND_STATUS: $COMMAND_OUTPUT)"
+  fi
+}
+
+write_external_driver() {
+  local path=$1
+  mkdir -p "${path%/*}"
+  chmod 0700 "${path%/*}"
+  cat >"$path" <<'DRIVER'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  api-version) printf '1\n' ;;
+  validate) printf 'validated\n' >>"$4/events" ;;
+  prepare) printf 'prepared\n' >>"$4/events" ;;
+  run)
+    trap 'exit 0' HUP INT TERM
+    while :; do sleep 1; done
+    ;;
+  is-live) exit 2 ;;
+  cleanup) : ;;
+  *) exit 64 ;;
+esac
+DRIVER
+  chmod 0700 "$path"
+}
+
+shared_external_driver_case() {
+  local tmp config output generation driver_count first_events second_events
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  write_external_driver "$CASE_CONFIG/fwdports/drivers.d/example"
+  printf '%s\n' \
+    'profile default' \
+    'leg first example' \
+    'leg second example' >"$config"
+  chmod 0600 "$config"
+
+  run_fwdports "$output" start
+  _assert_exit "external driver reuse: two legs start" 0 "$COMMAND_STATUS"
+  generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
+  driver_count=$(printf '%s\n' "$generation/drivers"/example | wc -l |
+    tr -d '[:space:]')
+  _assert_eq "external driver reuse: snapshots one executable" \
+    1 "$driver_count"
+  first_events=$(<"$generation/legs/first/events")
+  second_events=$(<"$generation/legs/second/events")
+  _assert_eq "external driver reuse: prepares first leg" \
+    $'validated\nprepared' "$first_events"
+  _assert_eq "external driver reuse: prepares second leg" \
+    $'validated\nprepared' "$second_events"
+
+  run_fwdports "$output" status
+  _assert_exit "external driver reuse: status succeeds" 0 "$COMMAND_STATUS"
+  _assert_eq "external driver reuse: both panes remain live" \
+    live/unverified "$COMMAND_OUTPUT"
+  run_fwdports "$output" stop
+  _assert_exit "external driver reuse: authenticated stop succeeds" \
+    0 "$COMMAND_STATUS"
+}
+
+setup_case_root() {
+  local tmp=$1
+  CASE_HOME=$tmp/home
+  CASE_CONFIG=$tmp/config
+  CASE_STATE=$tmp/state
+  CASE_RUNTIME=$tmp/runtime
+  CASE_SOCKET=$CASE_RUNTIME/fwdports.sock
+  CASE_SSH=$tmp/bin/ssh
+  CASE_AUTOSSH=$tmp/bin/autossh
+  CASE_SSH_LOG=$tmp/ssh.log
+  mkdir -p "$CASE_HOME" "$CASE_CONFIG/fwdports" "$CASE_STATE" \
+    "$CASE_RUNTIME" "$tmp/bin"
+  chmod 0700 "$CASE_HOME" "$CASE_CONFIG" "$CASE_CONFIG/fwdports" \
+    "$CASE_STATE" "$CASE_RUNTIME" "$tmp/bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == -G ]]; then' \
+    '  target=${!#}' \
+    '  printf "hostname %s\nuser example\nport 22\n" "$target"' \
+    '  exit 0' \
+    'fi' \
+    'printf "%s\n" "$@" >"$FWDPORTS_TEST_SSH_LOG"' \
+    'trap "exit 0" INT TERM HUP' \
+    'while :; do sleep 1; done' >"$CASE_SSH"
+  chmod 0700 "$CASE_SSH"
+}
+
+symlink_config_target_override_case() {
+  local tmp config source output generation manifest
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  source=$CASE_HOME/dotfiles/fwdports/tunnels.conf
+  output=$tmp/output
+  mkdir -p "${source%/*}"
+  chmod 0700 "$CASE_HOME/dotfiles" "${source%/*}"
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host original.example.com' \
+    'set shell remote-forward 127.0.0.1:19090:127.0.0.1:9090' >"$source"
+  chmod 0600 "$source"
+  ln -s "$source" "$config"
+
+  run_fwdports "$output" replacement.example.com
+  _assert_exit "symlink config: trusted dotfiles target starts" \
+    0 "$COMMAND_STATUS"
+  generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
+  manifest=$(<"$generation/manifest")
+  _assert_contains "target override: immutable manifest records override" \
+    $'target\treplacement.example.com' "$manifest"
+  _assert_eq "target override: SSH receives replacement target" \
+    replacement.example.com "$(tail -n 1 "$CASE_SSH_LOG")"
+
+  run_fwdports "$output" stop
+  _assert_exit "symlink config: authenticated stop succeeds" \
+    0 "$COMMAND_STATUS"
+}
+
+later_pane_failure_reaps_autossh_case() {
+  local tmp config output driver term_marker pid_file child_pid='' index=0
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  driver=$CASE_CONFIG/fwdports/drivers.d/fail-fast
+  term_marker=$tmp/autossh.term
+  pid_file=$tmp/autossh.pid
+  mkdir -p "${driver%/*}"
+  chmod 0700 "${driver%/*}"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "${1:-}" in' \
+    '  api-version) printf "1\n" ;;' \
+    '  validate | prepare | cleanup) : ;;' \
+    '  run) exit 1 ;;' \
+    '  is-live) exit 2 ;;' \
+    '  *) exit 64 ;;' \
+    'esac' \
+    >"$driver"
+  chmod 0700 "$driver"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "autossh test\n" >&2; exit 0; fi' \
+    'trap "" HUP' \
+    'trap '\''printf "term\n" >"$FWDPORTS_TEST_AUTOSSH_TERM"; exit 0'\'' TERM' \
+    'printf "%s\n" "$$" >"$FWDPORTS_TEST_AUTOSSH_PID"' \
+    'while :; do sleep 0.02; done' \
+    >"$CASE_AUTOSSH"
+  chmod 0700 "$CASE_AUTOSSH"
+  printf '%s\n' \
+    'profile default' \
+    'leg stable autossh' \
+    'set stable host shell.example.com' \
+    'set stable remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'leg broken fail-fast' \
+    >"$config"
+  chmod 0600 "$config"
+
+  FWDPORTS_TEST_AUTOSSH_TERM=$term_marker \
+    FWDPORTS_TEST_AUTOSSH_PID=$pid_file run_fwdports "$output" start
+  while [[ ! -f $term_marker && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  [[ ! -s $pid_file ]] || child_pid=$(<"$pid_file")
+
+  if [[ $COMMAND_STATUS -ne 0 ]]; then
+    _pass "later pane rollback: start reports the failed pane"
+  else
+    _fail "later pane rollback: start reports the failed pane"
+  fi
+  _assert_file "later pane rollback: converts session HUP to autossh TERM" \
+    "$term_marker"
+  if [[ -n $child_pid ]] && ! kill -0 "$child_pid" 2>/dev/null; then
+    _pass "later pane rollback: leaves no autossh child"
+  else
+    _fail "later pane rollback: leaves no autossh child"
+    [[ -z $child_pid ]] || kill -KILL "$child_pid" 2>/dev/null || true
+  fi
+  _assert_not_exists "later pane rollback: removes pending generation" \
+    "$CASE_STATE/fwdports/pending"
+}
+
+default_ssh_lifecycle_case() {
+  local tmp config output status_output generation_before generation_after
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19090:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  run_fwdports "$output" start
+  _assert_exit "CLI lifecycle: default SSH starts" 0 "$COMMAND_STATUS"
+  _assert_contains "CLI lifecycle: start names profile" \
+    "started profile default" "$COMMAND_OUTPUT"
+
+  generation_before=$(basename "$CASE_STATE/fwdports/generations"/*)
+  run_fwdports "$output" start --force
+  _assert_exit "CLI lifecycle: repeated matching start succeeds" 0 \
+    "$COMMAND_STATUS"
+  generation_after=$(basename "$CASE_STATE/fwdports/generations"/*)
+  _assert_eq "CLI lifecycle: matching --force does not churn generation" \
+    "$generation_before" "$generation_after"
+
+  run_fwdports "$output" status
+  status_output=$COMMAND_OUTPUT
+  _assert_exit "CLI lifecycle: status succeeds" 0 "$COMMAND_STATUS"
+  _assert_eq "CLI lifecycle: unchecked live tunnel is not called healthy" \
+    "live/unverified" "$status_output"
+
+  if [[ -s $CASE_SSH_LOG ]]; then
+    _pass "CLI lifecycle: SSH lifetime process was launched"
+  else
+    _fail "CLI lifecycle: SSH lifetime process was launched"
+  fi
+  _assert_contains "CLI lifecycle: SSH receives remote forward" \
+    "127.0.0.1:19090:127.0.0.1:9090" "$(<"$CASE_SSH_LOG")"
+
+  run_fwdports "$output" stop
+  _assert_exit "CLI lifecycle: authenticated stop succeeds" 0 \
+    "$COMMAND_STATUS"
+  _assert_eq "CLI lifecycle: stop reports final state" stopped \
+    "$COMMAND_OUTPUT"
+
+  run_fwdports "$output" status
+  _assert_exit "CLI lifecycle: stopped status succeeds" 0 "$COMMAND_STATUS"
+  _assert_eq "CLI lifecycle: stopped status is stable" stopped \
+    "$COMMAND_OUTPUT"
+}
+
+run_case default-ssh-lifecycle default_ssh_lifecycle_case
+run_case configured-health configured_health_case
+run_case shared-external-driver shared_external_driver_case
+run_case symlink-config-target-override symlink_config_target_override_case
+run_case later-pane-failure-reaps-autossh \
+  later_pane_failure_reaps_autossh_case
+_test_summary

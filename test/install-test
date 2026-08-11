@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Case callbacks and their helpers are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks, helpers, and TEST_CASE are consumed by the shared harness.
+# shellcheck disable=SC2329,SC2034
 
 set -u
 
@@ -22,10 +22,13 @@ fixture_checkout() {
     cp "$ROOT/bin/fwdports" "$destination/bin/fwdports"
     chmod +x "$destination/bin/fwdports"
   fi
-  if [[ -f "$ROOT/lib/fwdports/config.sh" ]]; then
-    cp "$ROOT/lib/fwdports/config.sh" \
-      "$destination/lib/fwdports/config.sh"
-  fi
+  for library in builtin-runner.sh config.sh controller.sh core.sh \
+    driver-api.sh drivers.sh health.sh runtime.sh ssh-gate.sh tmux.sh; do
+    if [[ -f "$ROOT/lib/fwdports/$library" ]]; then
+      cp "$ROOT/lib/fwdports/$library" \
+        "$destination/lib/fwdports/$library"
+    fi
+  done
 }
 
 run_delegate() {
@@ -35,7 +38,6 @@ run_delegate() {
   PREFIX=$prefix bash "$checkout/support/install-checkout.sh" "$@" \
     >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
   DELEGATE_OUTPUT=$(<"$output")
 }
 
@@ -57,7 +59,7 @@ explicit_inventory_case() {
 }
 
 delegate_direct_case() {
-  local tmp checkout prefix output target
+  local tmp checkout prefix output target installed_output installed_status
   tmp=$(_tmpdir) || return 1
   checkout="$tmp/checkout"
   prefix="$tmp/prefix"
@@ -76,6 +78,15 @@ delegate_direct_case() {
   fi
   _assert_contains "installer direct: reports destination" \
     "installed fwdports to $target" "$DELEGATE_OUTPUT"
+
+  set +e
+  installed_output=$("$target" --version 2>&1)
+  installed_status=$?
+  set -e
+  _assert_exit "installer direct: checkout-backed command executes" \
+    0 "$installed_status"
+  _assert_eq "installer direct: installed command reports version" \
+    "fwdports 0.1.0" "$installed_output"
 }
 
 custom_prefix_bin_dir_case() {
@@ -92,7 +103,6 @@ custom_prefix_bin_dir_case() {
   PREFIX=$prefix BIN_DIR=$bin_dir \
     bash "$checkout/support/install-checkout.sh" >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
 
   _assert_exit "installer destinations: custom BIN_DIR succeeds" 0 \
     "$DELEGATE_STATUS"
@@ -208,13 +218,12 @@ single_link_failure_preserves_old_target_case() {
   PATH="$fake_bin:$PATH" PREFIX=$prefix \
     bash "$new_checkout/support/install-checkout.sh" >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
 
   _assert_exit "installer publication: rename failure is preserved" 73 \
     "$DELEGATE_STATUS"
   _assert_eq "installer publication: old target survives failure" \
     "$old_checkout/bin/fwdports" "$(readlink "$target")"
-  if [[ -z $(printf '%s\n' "$prefix/bin"/.fwdports.link.* | \
+  if [[ -z $(printf '%s\n' "$prefix/bin"/.fwdports.link.* |
     sed -n '/[*]$/!p') ]]; then
     _pass "installer publication: failed temporary link is removed"
   else
@@ -231,7 +240,7 @@ provider_header_and_lock_case() {
   [[ -f "$ROOT/install.sh" ]] && installer=$(<"$ROOT/install.sh")
 
   _assert_eq "installer provider: reviewed Actions lock" \
-    "5c320ad3c24fc5f57e9402c588381ffb1dfe554e" "$lock"
+    "464468328f050e43299298fc0eac8b971ddd38b7" "$lock"
   _assert_contains "installer provider: consumer repository is fwdports" \
     "CHECKOUT_INSTALLER_REPO=cgraf78/fwdports" "$config"
   _assert_contains "installer provider: generated ownership header" \
@@ -254,7 +263,6 @@ direct_generated_delegation_case() {
     CGRAF78_CHECKOUT_INSTALL_DIR="$tmp/managed" \
     bash "$ROOT/install.sh" >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
   DELEGATE_OUTPUT=$(<"$output")
 
   _assert_exit "generated installer: checkout delegation succeeds" 0 \

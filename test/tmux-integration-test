@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Case callbacks, TEST_CASE, and scoped fixture variables are consumed by
+# sourced production functions rather than directly in this file.
+# shellcheck disable=SC2329,SC2034
+# Single-quoted fixture lines are expanded only by the child process.
+# shellcheck disable=SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/tmux.sh
+source "$ROOT/lib/fwdports/tmux.sh"
+# shellcheck source=../lib/fwdports/core.sh
+source "$ROOT/lib/fwdports/core.sh"
+
+wait_for_file() {
+  local path=$1 attempts=0
+  while [[ ! -s "$path" && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -s "$path" ]]
+}
+
+kill_test_server() {
+  local socket=$1
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    kill-server 2>/dev/null || true
+}
+
+direct_argv_case() {
+  local tmp socket fixture output release record session_id pane_id actual
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/record-argv
+  output=$tmp/argv
+  release=$tmp/release
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'output=$1' \
+    'release=$2' \
+    'shift 2' \
+    ': >"$output"' \
+    'for value in "$@"; do printf "<%s>\\n" "$value" >>"$output"; done' \
+    'while [[ ! -e "$release" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.direct01 "$tmp" "$fixture" "$output" "$release" \
+    'one value' 'semi;colon' '$literal')
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$output" || true
+  actual=$(<"$output")
+
+  _assert_contains "tmux direct argv: returns a session id" '$' "$session_id"
+  _assert_contains "tmux direct argv: returns a pane id" '%' "$pane_id"
+  _assert_eq "tmux direct argv: preserves each argument boundary" \
+    $'<one value>\n<semi;colon>\n<$literal>' "$actual"
+  _assert_not_exists "tmux direct argv: metacharacters execute no command" \
+    "$tmp/colon"
+  _assert_not_contains "tmux direct argv: implementation uses no send-keys" \
+    "send-keys" "$(<"$ROOT/lib/fwdports/tmux.sh")"
+  _assert_not_contains "tmux direct argv: implementation uses no shell -c" \
+    "sh -c" "$(<"$ROOT/lib/fwdports/tmux.sh")"
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+session_nonce_case() {
+  local tmp socket fixture output release record session_id pane_id
+  local environment
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/record-nonce
+  output=$tmp/nonce
+  release=$tmp/release
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\\n" "${FWDPORTS_GENERATION:-missing}" >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.nonce01 "$tmp" "$fixture" "$output" "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$output" || true
+  environment=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    show-environment -t "$session_id" FWDPORTS_GENERATION)
+
+  _assert_eq "tmux session nonce: initial process receives nonce" \
+    "generation.nonce01" "$(<"$output")"
+  _assert_eq "tmux session nonce: server records the same nonce" \
+    "FWDPORTS_GENERATION=generation.nonce01" "$environment"
+  _assert_contains "tmux session nonce: pane belongs to created session" \
+    "$session_id" \
+    "$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+      display-message -p -t "$pane_id" '#{session_id}')"
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+controller_record_abort_case() {
+  local tmp generation marker status content=''
+  tmp=$(_tmpdir) || return 1
+  generation=$tmp/generation.controller
+  marker=$tmp/abort
+  mkdir -p "$generation"
+  chmod 0700 "$generation"
+  FWDPORTS_MODULE_DIR=$ROOT/lib/fwdports
+  FWDPORTS_TEST_ABORT_MARKER=$marker
+
+  fwdports_tmux_split_pane() { printf '%%42\n'; }
+  fwdports_tmux_record_pane() { return 1; }
+  fwdports_tmux_abort_created_session() {
+    printf '%s\t%s\n' "$3" "$4" >"$FWDPORTS_TEST_ABORT_MARKER"
+  }
+
+  set +e
+  _fwdports_start_controller /fake/tmux "$tmp/socket" "$tmp/root" \
+    "$generation" digest '$9' >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ ! -f $marker ]] || content=$(<"$marker")
+
+  _assert_exit "controller record failure: start fails" 1 "$status"
+  _assert_eq "controller record failure: aborts the exact created session" \
+    $'$9\tgeneration.controller' "$content"
+}
+
+run_case direct-argv direct_argv_case
+run_case session-nonce session_nonce_case
+run_case controller-record-abort controller_record_abort_case
+_test_summary

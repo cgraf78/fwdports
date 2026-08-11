@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Case callbacks are passed by name to the shared harness.
+# shellcheck disable=SC2329
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+FWDPORTS="$ROOT/bin/fwdports"
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+
+run_cli() {
+  local output_file=$1
+  shift
+  set +e
+  "$FWDPORTS" "$@" >"$output_file" 2>&1
+  CLI_STATUS=$?
+  set -e
+  CLI_OUTPUT=$(<"$output_file")
+}
+
+help_version_case() {
+  local tmp output
+  tmp=$(_tmpdir) || return 1
+  output="$tmp/output"
+
+  run_cli "$output" --help
+  _assert_exit "cli: help succeeds" 0 "$CLI_STATUS"
+  _assert_contains "cli: help names command" "fwdports [start]" "$CLI_OUTPUT"
+  _assert_contains "cli: help documents status" "fwdports status" "$CLI_OUTPUT"
+
+  run_cli "$output" --version
+  _assert_exit "cli: version succeeds" 0 "$CLI_STATUS"
+  _assert_eq "cli: version is machine-readable" "fwdports 0.1.0" "$CLI_OUTPUT"
+
+  run_cli "$output" --driver-api-version
+  _assert_exit "cli: driver API query succeeds" 0 "$CLI_STATUS"
+  _assert_eq "cli: driver API is v1" 1 "$CLI_OUTPUT"
+}
+
+run_case help-version help_version_case
+_test_summary

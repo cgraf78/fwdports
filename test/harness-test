@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Case callbacks are passed by name to the shared harness.
+# shellcheck disable=SC2329
+# Exercise the shared harness through the same case-filter interface used by
+# every behavior suite. A misspelled case must fail instead of silently running
+# nothing, because filtered cases are the unit of the repository's TDD loop.
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+
+case_filter_case() {
+  _assert_eq "case filter: selected case runs" "case-filter" "$CURRENT_TEST_CASE"
+}
+
+UNSELECTED_RAN=0
+unselected_case() {
+  UNSELECTED_RAN=1
+  _pass "case filter: second case runs without a filter"
+}
+
+run_case case-filter case_filter_case
+run_case unselected unselected_case
+if [[ "$TEST_CASE" == case-filter ]]; then
+  _assert_eq "case filter: other cases are skipped" 0 "$UNSELECTED_RAN"
+fi
+_test_summary

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run suites sequentially. Several suites later own real tmux sockets and
+# process groups, so avoiding cross-suite parallelism is part of isolation.
+
+set -uo pipefail
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+status=0
+found=0
+
+for suite in "$TEST_DIR"/*-test; do
+  [[ -f "$suite" && -x "$suite" ]] || continue
+  found=1
+  bash "$suite" || status=$?
+done
+
+if [[ "$found" -eq 0 ]]; then
+  printf 'test/run: no executable test suites found\n' >&2
+  exit 1
+fi
+
+exit "$status"

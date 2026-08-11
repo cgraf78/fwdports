@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Case callbacks are passed by name to the shared harness.
+# shellcheck disable=SC2329
+# The license is part of the public repository contract, not documentation
+# decoration. Assert the canonical grant and attribution explicitly.
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+
+canonical_mit_case() {
+  local content=
+  if [[ -f "$ROOT/LICENSE" ]]; then
+    content=$(<"$ROOT/LICENSE")
+  fi
+  _assert_contains "license: canonical heading" "MIT License" "$content"
+  _assert_contains "license: public attribution" \
+    "Copyright (c) 2026 Chris Graf" "$content"
+  _assert_contains "license: permission grant" \
+    "Permission is hereby granted, free of charge" "$content"
+  _assert_contains "license: warranty disclaimer" \
+    "THE SOFTWARE IS PROVIDED \"AS IS\"" "$content"
+}
+
+run_case canonical-mit canonical_mit_case
+_test_summary

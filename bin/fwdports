@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# fwdports deliberately keeps its public command thin. Runtime policy lives in
+# checkout-owned libraries so an installed command and its implementation are
+# always updated together.
+
+set -u
+
+FWDPORTS_VERSION=0.1.0
+FWDPORTS_DRIVER_API_VERSION=1
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fwdports [start] [TARGET] [--profile NAME] [--config FILE] [--force]
+  fwdports status
+  fwdports stop
+  fwdports attach
+  fwdports --version
+  fwdports --driver-api-version
+  fwdports --help
+
+Start or inspect one profile-driven set of SSH port forwards in tmux.
+OpenSSH is the default driver; autossh is available only when selected by the
+profile. Configuration defaults to ${XDG_CONFIG_HOME:-$HOME/.config}/fwdports.
+EOF
+}
+
+case "${1:-start}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --version)
+    printf 'fwdports %s\n' "$FWDPORTS_VERSION"
+    exit 0
+    ;;
+  --driver-api-version)
+    printf '%s\n' "$FWDPORTS_DRIVER_API_VERSION"
+    exit 0
+    ;;
+  start | status | stop | attach)
+    printf 'fwdports: %s is not available in this build checkpoint\n' \
+      "${1:-start}" >&2
+    exit 69
+    ;;
+  *)
+    printf 'fwdports: unknown command: %s\n' "$1" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

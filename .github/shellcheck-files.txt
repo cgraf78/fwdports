@@ -1,0 +1,13 @@
+# type<TAB>repository-relative path
+# `fixture` records are discovered but intentionally excluded from ShellCheck.
+program	bin/fwdports
+program	install.sh
+program	lib/fwdports/config.sh
+program	scripts/checkout-installer.conf
+program	support/install-checkout.sh
+program	test/cli-test
+program	test/harness-test
+program	test/install-test
+program	test/lib/test.sh
+program	test/license-test
+program	test/run

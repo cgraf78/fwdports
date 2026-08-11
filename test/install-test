@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# Case callbacks and their helpers are passed by name to the shared harness.
+# shellcheck disable=SC2329
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+
+fixture_checkout() {
+  local destination=$1 include_command=${2:-yes}
+  mkdir -p "$destination/support" "$destination/bin" \
+    "$destination/lib/fwdports"
+  cp "$ROOT/support/install-checkout.sh" \
+    "$destination/support/install-checkout.sh"
+  chmod +x "$destination/support/install-checkout.sh"
+  if [[ "$include_command" == yes ]]; then
+    cp "$ROOT/bin/fwdports" "$destination/bin/fwdports"
+    chmod +x "$destination/bin/fwdports"
+  fi
+  if [[ -f "$ROOT/lib/fwdports/config.sh" ]]; then
+    cp "$ROOT/lib/fwdports/config.sh" \
+      "$destination/lib/fwdports/config.sh"
+  fi
+}
+
+run_delegate() {
+  local checkout=$1 prefix=$2 output=$3
+  shift 3
+  set +e
+  PREFIX=$prefix bash "$checkout/support/install-checkout.sh" "$@" \
+    >"$output" 2>&1
+  DELEGATE_STATUS=$?
+  set -e
+  DELEGATE_OUTPUT=$(<"$output")
+}
+
+explicit_inventory_case() {
+  local tmp checkout prefix output
+  tmp=$(_tmpdir) || return 1
+  checkout="$tmp/checkout"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  fixture_checkout "$checkout" no
+
+  run_delegate "$checkout" "$prefix" "$output"
+  _assert_exit "installer inventory: missing command fails" 1 \
+    "$DELEGATE_STATUS"
+  _assert_contains "installer inventory: diagnostic names source" \
+    "command source is not executable" "$DELEGATE_OUTPUT"
+  _assert_not_exists "installer inventory: failure creates no bin directory" \
+    "$prefix/bin"
+}
+
+delegate_direct_case() {
+  local tmp checkout prefix output target
+  tmp=$(_tmpdir) || return 1
+  checkout="$tmp/checkout"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  target="$prefix/bin/fwdports"
+  fixture_checkout "$checkout"
+
+  run_delegate "$checkout" "$prefix" "$output"
+  _assert_exit "installer direct: succeeds" 0 "$DELEGATE_STATUS"
+  if [[ -L "$target" ]]; then
+    _pass "installer direct: publishes a symlink"
+    _assert_eq "installer direct: link selects checkout command" \
+      "$checkout/bin/fwdports" "$(readlink "$target")"
+  else
+    _fail "installer direct: publishes a symlink"
+  fi
+  _assert_contains "installer direct: reports destination" \
+    "installed fwdports to $target" "$DELEGATE_OUTPUT"
+}
+
+custom_prefix_bin_dir_case() {
+  local tmp checkout prefix bin_dir output target
+  tmp=$(_tmpdir) || return 1
+  checkout="$tmp/checkout"
+  prefix="$tmp/prefix"
+  bin_dir="$tmp/custom-bin"
+  output="$tmp/output"
+  target="$bin_dir/fwdports"
+  fixture_checkout "$checkout"
+
+  set +e
+  PREFIX=$prefix BIN_DIR=$bin_dir \
+    bash "$checkout/support/install-checkout.sh" >"$output" 2>&1
+  DELEGATE_STATUS=$?
+  set -e
+
+  _assert_exit "installer destinations: custom BIN_DIR succeeds" 0 \
+    "$DELEGATE_STATUS"
+  if [[ -L "$target" ]]; then
+    _pass "installer destinations: custom BIN_DIR receives command"
+  else
+    _fail "installer destinations: custom BIN_DIR receives command"
+  fi
+  _assert_not_exists "installer destinations: PREFIX bin remains untouched" \
+    "$prefix/bin/fwdports"
+}
+
+idempotent_case() {
+  local tmp checkout prefix output target leftovers
+  tmp=$(_tmpdir) || return 1
+  checkout="$tmp/checkout"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  target="$prefix/bin/fwdports"
+  fixture_checkout "$checkout"
+
+  run_delegate "$checkout" "$prefix" "$output"
+  run_delegate "$checkout" "$prefix" "$output"
+  _assert_exit "installer idempotence: second run succeeds" 0 \
+    "$DELEGATE_STATUS"
+  _assert_eq "installer idempotence: target is unchanged" \
+    "$checkout/bin/fwdports" "$(readlink "$target")"
+  leftovers=$(printf '%s\n' "$prefix/bin"/.fwdports.link.*)
+  _assert_eq "installer idempotence: no temporary links remain" \
+    "$prefix/bin/.fwdports.link.*" "$leftovers"
+}
+
+retarget_owned_symlink_case() {
+  local tmp first second prefix output target
+  tmp=$(_tmpdir) || return 1
+  first="$tmp/first"
+  second="$tmp/second"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  target="$prefix/bin/fwdports"
+  fixture_checkout "$first"
+  fixture_checkout "$second"
+
+  run_delegate "$first" "$prefix" "$output"
+  run_delegate "$second" "$prefix" "$output"
+  _assert_exit "installer retarget: second checkout succeeds" 0 \
+    "$DELEGATE_STATUS"
+  _assert_eq "installer retarget: owned link selects second checkout" \
+    "$second/bin/fwdports" "$(readlink "$target")"
+}
+
+reject_real_path_case() {
+  local tmp checkout prefix output target content
+  tmp=$(_tmpdir) || return 1
+  checkout="$tmp/checkout"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  target="$prefix/bin/fwdports"
+  fixture_checkout "$checkout"
+  mkdir -p "$prefix/bin"
+  printf 'user-owned\n' >"$target"
+
+  run_delegate "$checkout" "$prefix" "$output"
+  _assert_exit "installer collision: real file is rejected" 1 \
+    "$DELEGATE_STATUS"
+  _assert_contains "installer collision: diagnostic names refusal" \
+    "refusing to replace non-symlink path" "$DELEGATE_OUTPUT"
+  if [[ -f "$target" && ! -L "$target" ]]; then
+    _pass "installer collision: real file remains a file"
+  else
+    _fail "installer collision: real file remains a file"
+  fi
+  content=$(<"$target")
+  _assert_eq "installer collision: real file content is preserved" \
+    "user-owned" "$content"
+}
+
+missing_source_no_mutation_case() {
+  local tmp checkout prefix output
+  tmp=$(_tmpdir) || return 1
+  checkout="$tmp/checkout"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  fixture_checkout "$checkout"
+  rm -f -- "$checkout/lib/fwdports/config.sh"
+
+  run_delegate "$checkout" "$prefix" "$output"
+  _assert_exit "installer inventory: missing library fails" 1 \
+    "$DELEGATE_STATUS"
+  _assert_contains "installer inventory: missing library is actionable" \
+    "library source is missing" "$DELEGATE_OUTPUT"
+  _assert_not_exists "installer inventory: missing library creates no target" \
+    "$prefix/bin/fwdports"
+}
+
+single_link_failure_preserves_old_target_case() {
+  local tmp old_checkout new_checkout prefix output target fake_bin
+  tmp=$(_tmpdir) || return 1
+  old_checkout="$tmp/old"
+  new_checkout="$tmp/new"
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  target="$prefix/bin/fwdports"
+  fake_bin="$tmp/fake-bin"
+  fixture_checkout "$old_checkout"
+  fixture_checkout "$new_checkout"
+  run_delegate "$old_checkout" "$prefix" "$output"
+
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 73' >"$fake_bin/mv"
+  chmod +x "$fake_bin/mv"
+  set +e
+  PATH="$fake_bin:$PATH" PREFIX=$prefix \
+    bash "$new_checkout/support/install-checkout.sh" >"$output" 2>&1
+  DELEGATE_STATUS=$?
+  set -e
+
+  _assert_exit "installer publication: rename failure is preserved" 73 \
+    "$DELEGATE_STATUS"
+  _assert_eq "installer publication: old target survives failure" \
+    "$old_checkout/bin/fwdports" "$(readlink "$target")"
+  if [[ -z $(printf '%s\n' "$prefix/bin"/.fwdports.link.* | \
+    sed -n '/[*]$/!p') ]]; then
+    _pass "installer publication: failed temporary link is removed"
+  else
+    _fail "installer publication: failed temporary link is removed"
+  fi
+}
+
+provider_header_and_lock_case() {
+  local lock='' config='' installer=''
+  [[ -f "$ROOT/.github/cgraf78-actions.lock" ]] &&
+    lock=$(<"$ROOT/.github/cgraf78-actions.lock")
+  [[ -f "$ROOT/scripts/checkout-installer.conf" ]] &&
+    config=$(<"$ROOT/scripts/checkout-installer.conf")
+  [[ -f "$ROOT/install.sh" ]] && installer=$(<"$ROOT/install.sh")
+
+  _assert_eq "installer provider: reviewed Actions lock" \
+    "5c320ad3c24fc5f57e9402c588381ffb1dfe554e" "$lock"
+  _assert_contains "installer provider: consumer repository is fwdports" \
+    "CHECKOUT_INSTALLER_REPO=cgraf78/fwdports" "$config"
+  _assert_contains "installer provider: generated ownership header" \
+    "Generated by cgraf78/actions checkout-installer. Do not edit." \
+    "$installer"
+  _assert_contains "installer provider: generated repository is fwdports" \
+    "checkout_repo='cgraf78/fwdports'" "$installer"
+}
+
+direct_generated_delegation_case() {
+  local tmp prefix output target
+  tmp=$(_tmpdir) || return 1
+  prefix="$tmp/prefix"
+  output="$tmp/output"
+  target="$prefix/bin/fwdports"
+
+  set +e
+  PREFIX=$prefix \
+    CGRAF78_CHECKOUT_INSTALL_REPO_URL="$tmp/missing.git" \
+    CGRAF78_CHECKOUT_INSTALL_DIR="$tmp/managed" \
+    bash "$ROOT/install.sh" >"$output" 2>&1
+  DELEGATE_STATUS=$?
+  set -e
+  DELEGATE_OUTPUT=$(<"$output")
+
+  _assert_exit "generated installer: checkout delegation succeeds" 0 \
+    "$DELEGATE_STATUS"
+  if [[ -L "$target" ]]; then
+    _pass "generated installer: publishes checkout-backed command"
+    _assert_eq "generated installer: command selects this checkout" \
+      "$ROOT/bin/fwdports" "$(readlink "$target")"
+  else
+    _fail "generated installer: publishes checkout-backed command"
+  fi
+  _assert_contains "generated installer: preserves delegate output" \
+    "installed fwdports to $target" "$DELEGATE_OUTPUT"
+}
+
+run_case explicit-inventory explicit_inventory_case
+run_case delegate-direct delegate_direct_case
+run_case custom-prefix-bin-dir custom_prefix_bin_dir_case
+run_case idempotent idempotent_case
+run_case retarget-owned-symlink retarget_owned_symlink_case
+run_case reject-real-path reject_real_path_case
+run_case missing-source-no-mutation missing_source_no_mutation_case
+run_case single-link-failure-preserves-old-target \
+  single_link_failure_preserves_old_target_case
+run_case provider-header-and-lock provider_header_and_lock_case
+run_case direct-generated-delegation direct_generated_delegation_case
+_test_summary

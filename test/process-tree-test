@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Case callbacks are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2034
 # Single-quoted fixture lines are expanded only by the child process.
 # shellcheck disable=SC2016
 
@@ -124,11 +124,11 @@ termination_fixture() {
     return 1
   start=$(_fwdports_process_start_identity "$$")
   fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" running running \
-    "$$" "$start" 0 0 none || return 1
+    "$$" "$start" none || return 1
   fwdports_pointer_publish "$PROC_ROOT" active "$PROC_GENERATION" \
     "$PROC_DIGEST" || return 1
   fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" stopping stopped \
-    "$$" "$start" 0 0 none || return 1
+    "$$" "$start" none || return 1
 }
 
 pane_identity_case() {
@@ -281,8 +281,92 @@ leader_missing_case() {
   kill_test_server "$PROC_SOCKET"
 }
 
+failed_process_enumeration_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_records "$$" >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "process enumeration failure: is not an empty group" 2 \
+    "$status"
+  _assert_eq "process enumeration failure: publishes no partial members" \
+    "" "$(<"$output")"
+}
+
+malformed_process_enumeration_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "1 1 1 ? S\ntruncated row\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_records 1 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "malformed process enumeration: fails closed" 2 "$status"
+  _assert_eq "malformed process enumeration: publishes no partial members" \
+    "" "$(<"$output")"
+}
+
+list_panes_failure_case() {
+  local tmp fake_tmux output error status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" term || return 1
+  fake_tmux=$tmp/tmux-fail-list
+  output=$tmp/output
+  error=$tmp/error
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  [[ $arg != list-panes ]] || exit 1' \
+    'done' \
+    'exec "$FWDPORTS_TEST_REAL_TMUX" "$@"' \
+    >"$fake_tmux"
+  chmod 0700 "$fake_tmux"
+
+  set +e
+  FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN \
+    fwdports_tmux_remove_generation_session "$fake_tmux" "$PROC_SOCKET" \
+    "$PROC_GENERATION" "$PROC_DIGEST" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "tmux pane enumeration failure: refuses session removal" 74 \
+    "$status"
+  if TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$PROC_SOCKET" -f /dev/null \
+    has-session -t "$PROC_SESSION" 2>/dev/null; then
+    _pass "tmux pane enumeration failure: preserves the live session"
+  else
+    _fail "tmux pane enumeration failure: preserves the live session"
+  fi
+  _assert_contains "tmux pane enumeration failure: is actionable" \
+    "cannot enumerate tmux panes" "$(<"$error")"
+  kill_test_server "$PROC_SOCKET"
+}
+
 run_case pane-identity pane_identity_case
 run_case term-owned-group term_owned_group_case
 run_case kill-escalation kill_escalation_case
 run_case leader-missing leader_missing_case
+run_case failed-process-enumeration failed_process_enumeration_case
+run_case malformed-process-enumeration malformed_process_enumeration_case
+run_case list-panes-failure list_panes_failure_case
 _test_summary

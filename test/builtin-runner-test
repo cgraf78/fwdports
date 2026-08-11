@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Built-in foreground wrapper retry and signal behavior.
-# shellcheck disable=SC2329,SC2016
+# Named cases and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
 
 set -u
 
@@ -46,7 +47,9 @@ retry_case() {
   local tmp pid index=0 alive=1
   tmp=$(_tmpdir) || return 1
   setup_runtime "$tmp"
-  FWDPORTS_TEST_CALLS=$CALLS setsid "$RUNNER" "$RUNTIME" &
+  # The runner owns and reaps its direct child; this test does not need a new
+  # session, and stock macOS intentionally ships no external `setsid` command.
+  FWDPORTS_TEST_CALLS=$CALLS "$RUNNER" "$RUNTIME" &
   pid=$!
   if wait_for_lines "$CALLS" 2; then
     _pass "built-in SSH: retries after an early failure"
@@ -55,7 +58,10 @@ retry_case() {
   fi
   kill -TERM "$pid" 2>/dev/null || true
   while [[ $index -lt 200 ]]; do
-    if ! kill -0 "$pid" 2>/dev/null; then alive=0; break; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      alive=0
+      break
+    fi
     sleep 0.01
     index=$((index + 1))
   done

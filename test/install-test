@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Case callbacks and their helpers are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks, helpers, and TEST_CASE are consumed by the shared harness.
+# shellcheck disable=SC2329,SC2034
 
 set -u
 
@@ -59,7 +59,7 @@ explicit_inventory_case() {
 }
 
 delegate_direct_case() {
-  local tmp checkout prefix output target
+  local tmp checkout prefix output target installed_output installed_status
   tmp=$(_tmpdir) || return 1
   checkout="$tmp/checkout"
   prefix="$tmp/prefix"
@@ -78,6 +78,15 @@ delegate_direct_case() {
   fi
   _assert_contains "installer direct: reports destination" \
     "installed fwdports to $target" "$DELEGATE_OUTPUT"
+
+  set +e
+  installed_output=$("$target" --version 2>&1)
+  installed_status=$?
+  set -e
+  _assert_exit "installer direct: checkout-backed command executes" \
+    0 "$installed_status"
+  _assert_eq "installer direct: installed command reports version" \
+    "fwdports 0.1.0" "$installed_output"
 }
 
 custom_prefix_bin_dir_case() {
@@ -214,7 +223,7 @@ single_link_failure_preserves_old_target_case() {
     "$DELEGATE_STATUS"
   _assert_eq "installer publication: old target survives failure" \
     "$old_checkout/bin/fwdports" "$(readlink "$target")"
-  if [[ -z $(printf '%s\n' "$prefix/bin"/.fwdports.link.* | \
+  if [[ -z $(printf '%s\n' "$prefix/bin"/.fwdports.link.* |
     sed -n '/[*]$/!p') ]]; then
     _pass "installer publication: failed temporary link is removed"
   else

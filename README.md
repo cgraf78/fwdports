@@ -62,7 +62,7 @@ fwdports stop
 
 One owned tmux session is supported. Repeating `start` with the same desired
 state is a no-churn success while the generation is live and its checks pass.
-A dead generation, failed controller, or restart-policy health failure is
+A dead generation, dead controller, or restart-policy health failure is
 replaced sequentially; `preserve` keeps a still-live degraded generation.
 A differing configuration requires `--force`, which completes an authenticated
 stop before starting the replacement. Two generations never overlap.

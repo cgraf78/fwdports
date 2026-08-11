@@ -446,6 +446,48 @@ _fwdports_local_forward_port() {
   printf '%s\n' "$port"
 }
 
+fwdports_builtin_validate_profile_ports() {
+  local manifest=$1 kind leg key value _extra driver candidate port seen
+  local -a builtin_legs=() seen_ports=()
+
+  [[ -f $manifest && ! -L $manifest ]] || return 1
+  while IFS=$'\t' read -r kind leg driver _extra || [[ -n ${kind:-} ]]; do
+    [[ $kind == leg ]] || continue
+    case "$driver" in
+      ssh | autossh) builtin_legs+=("$leg") ;;
+    esac
+  done <"$manifest"
+
+  while IFS=$'\t' read -r kind leg key value _extra ||
+    [[ -n ${kind:-} ]]; do
+    [[ $kind == set && $key == local-forward ]] || continue
+    candidate=0
+    for driver in ${builtin_legs[@]+"${builtin_legs[@]}"}; do
+      [[ $driver == "$leg" ]] && candidate=1
+    done
+    [[ $candidate -eq 1 ]] || continue
+    port=$(_fwdports_local_forward_port "$value") || {
+      printf 'fwdports: cannot parse local-forward port for leg %s\n' \
+        "$leg" >&2
+      return 1
+    }
+    seen=0
+    for candidate in ${seen_ports[@]+"${seen_ports[@]}"}; do
+      [[ $candidate == "$port" ]] && seen=1
+    done
+    if [[ $seen -eq 1 ]]; then
+      # Built-in legs share the local network namespace. Rejecting duplicate
+      # numeric ports before any pane starts is deliberately conservative:
+      # relying on bind-address subtleties can leave one retrying leg masked
+      # by another leg's successful health probe.
+      printf 'fwdports: local forward port %s is claimed more than once\n' \
+        "$port" >&2
+      return 1
+    fi
+    seen_ports+=("$port")
+  done <"$manifest"
+}
+
 fwdports_ssh_preflight_local_ports() {
   local argv_file=$1 line expect_local=0 port details status
 
@@ -609,8 +651,7 @@ fwdports_autossh_resolve() {
   if ! {
     printf 'path\t%s\n' "$path"
     printf 'version\t%s\n' "$version_text"
-  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output";
-  then
+  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
     rm -f -- "$tmp"
     return 1
   fi

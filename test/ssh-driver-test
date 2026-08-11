@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Case callbacks are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2034
 # Single-quoted lines below are literal fixture scripts expanded by the child.
 # shellcheck disable=SC2016
 
@@ -63,14 +63,16 @@ effective_digest_case() {
     'exit 0' >"$fake_ssh"
   chmod 0755 "$fake_ssh"
   printf '%s\n' '-N' '-T' '-o' 'ControlMaster=no' >"$argv_file"
-  expected=$(printf '%s\n' \
-    'hostname shell.example.com' 'user example' 'port 22' | sha256sum)
-  expected=${expected%% *}
+  printf '%s\n' \
+    'hostname shell.example.com' 'user example' 'port 22' >"$tmp/expected"
+  # Exercise the same portable digest selection as production. Stock macOS
+  # has `shasum` but not GNU `sha256sum`.
+  expected=$(_fwdports_sha256_file "$tmp/expected")
 
   set +e
   FWDPORTS_TEST_SSH_LOG=$log \
     fwdports_ssh_effective_digest "$fake_ssh" shell.example.com \
-      "$argv_file" "$output" 2>"$error"
+    "$argv_file" "$output" 2>"$error"
   status=$?
   content=
   [[ -f "$output" ]] && content=$(<"$output")
@@ -184,7 +186,7 @@ retry_gate_case() {
     fwdports_ssh_resolve "$fake_ssh" "$identity"
   FWDPORTS_TEST_EFFECTIVE_CONFIG=$config_source \
     fwdports_ssh_effective_digest "$fake_ssh" shell.example.com \
-      "$argv_file" "$digest"
+    "$argv_file" "$digest"
 
   set +e
   fwdports_ssh_prepare_gate "$gate_dir" "$identity" "$digest" 2>"$error"
@@ -223,11 +225,13 @@ local_port_conflict_case() {
   argv_file="$tmp/argv"
   target_file="$tmp/target"
   error="$tmp/error"
-  timeout 15 python3 - "$port_file" <<'PY' &
+  python3 - "$port_file" <<'PY' &
 import socket
+import signal
 import sys
 import time
 
+signal.alarm(15)
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind(("127.0.0.1", 0))
@@ -297,6 +301,46 @@ remote_port_no_preflight_case() {
   _assert_eq "remote forward: no diagnostic" "" "$(<"$error")"
 }
 
+duplicate_profile_local_ports_case() {
+  local tmp manifest error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  error=$tmp/error
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\tgeneration.test' \
+    $'target\tnone' \
+    $'profile\tdemo' \
+    $'leg\texternal\texample' \
+    >"$manifest"
+  status=0
+  fwdports_builtin_validate_profile_ports "$manifest" 2>"$error" ||
+    status=$?
+  _assert_exit "profile local ports: external-only profile is unaffected" \
+    0 "$status"
+
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\tgeneration.test' \
+    $'target\tnone' \
+    $'profile\tdemo' \
+    $'leg\tfirst\tssh' \
+    $'leg\tsecond\tautossh' \
+    $'set\tfirst\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    $'set\tsecond\tlocal-forward\t127.0.0.1:8080:127.0.0.1:81' \
+    >"$manifest"
+
+  set +e
+  fwdports_builtin_validate_profile_ports "$manifest" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "profile local ports: duplicate built-in bind is rejected" \
+    1 "$status"
+  _assert_contains "profile local ports: diagnostic names the duplicate" \
+    "local forward port 8080 is claimed more than once" "$(<"$error")"
+}
+
 run_case resolve-executable resolve_executable_case
 run_case effective-digest effective_digest_case
 run_case lifecycle-options lifecycle_options_case
@@ -304,4 +348,5 @@ run_case inherited-forward-rejected inherited_forward_rejected_case
 run_case retry-gate retry_gate_case
 run_case local-port-conflict local_port_conflict_case
 run_case remote-port-no-preflight remote_port_no_preflight_case
+run_case duplicate-profile-local-ports duplicate_profile_local_ports_case
 _test_summary

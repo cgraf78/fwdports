@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end command lifecycle on an isolated real tmux socket.
-# shellcheck disable=SC2329,SC2016
+# Named cases and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
 
 set -u
 
@@ -19,6 +20,7 @@ run_fwdports() {
   HOME=$CASE_HOME XDG_CONFIG_HOME=$CASE_CONFIG XDG_STATE_HOME=$CASE_STATE \
     XDG_RUNTIME_DIR=$CASE_RUNTIME FWDPORTS_TMUX_SOCKET=$CASE_SOCKET \
     FWDPORTS_SSH_COMMAND=$CASE_SSH FWDPORTS_TEST_SSH_LOG=$CASE_SSH_LOG \
+    FWDPORTS_AUTOSSH_COMMAND=$CASE_AUTOSSH \
     FWDPORTS_CONTROLLER_TICK_SECONDS=${FWDPORTS_CONTROLLER_TICK_SECONDS:-1} \
     FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=${FWDPORTS_HEALTH_STARTUP_GRACE_TICKS:-5} \
     FWDPORTS_HEALTH_INTERVAL_TICKS=${FWDPORTS_HEALTH_INTERVAL_TICKS:-30} \
@@ -57,7 +59,11 @@ configured_health_case() {
   done
   _assert_eq "CLI health: service success becomes healthy" healthy "$observed"
   PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
-  _assert_exit "CLI health: checked profile stops" 0 "$COMMAND_STATUS"
+  if [[ $COMMAND_STATUS -eq 0 ]]; then
+    _pass "CLI health: checked profile stops"
+  else
+    _fail "CLI health: checked profile stops (exit $COMMAND_STATUS: $COMMAND_OUTPUT)"
+  fi
 }
 
 write_external_driver() {
@@ -127,6 +133,7 @@ setup_case_root() {
   CASE_RUNTIME=$tmp/runtime
   CASE_SOCKET=$CASE_RUNTIME/fwdports.sock
   CASE_SSH=$tmp/bin/ssh
+  CASE_AUTOSSH=$tmp/bin/autossh
   CASE_SSH_LOG=$tmp/ssh.log
   mkdir -p "$CASE_HOME" "$CASE_CONFIG/fwdports" "$CASE_STATE" \
     "$CASE_RUNTIME" "$tmp/bin"
@@ -176,6 +183,71 @@ symlink_config_target_override_case() {
   run_fwdports "$output" stop
   _assert_exit "symlink config: authenticated stop succeeds" \
     0 "$COMMAND_STATUS"
+}
+
+later_pane_failure_reaps_autossh_case() {
+  local tmp config output driver term_marker pid_file child_pid='' index=0
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  driver=$CASE_CONFIG/fwdports/drivers.d/fail-fast
+  term_marker=$tmp/autossh.term
+  pid_file=$tmp/autossh.pid
+  mkdir -p "${driver%/*}"
+  chmod 0700 "${driver%/*}"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "${1:-}" in' \
+    '  api-version) printf "1\n" ;;' \
+    '  validate | prepare | cleanup) : ;;' \
+    '  run) exit 1 ;;' \
+    '  is-live) exit 2 ;;' \
+    '  *) exit 64 ;;' \
+    'esac' \
+    >"$driver"
+  chmod 0700 "$driver"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "autossh test\n" >&2; exit 0; fi' \
+    'trap "" HUP' \
+    'trap '\''printf "term\n" >"$FWDPORTS_TEST_AUTOSSH_TERM"; exit 0'\'' TERM' \
+    'printf "%s\n" "$$" >"$FWDPORTS_TEST_AUTOSSH_PID"' \
+    'while :; do sleep 0.02; done' \
+    >"$CASE_AUTOSSH"
+  chmod 0700 "$CASE_AUTOSSH"
+  printf '%s\n' \
+    'profile default' \
+    'leg stable autossh' \
+    'set stable host shell.example.com' \
+    'set stable remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'leg broken fail-fast' \
+    >"$config"
+  chmod 0600 "$config"
+
+  FWDPORTS_TEST_AUTOSSH_TERM=$term_marker \
+    FWDPORTS_TEST_AUTOSSH_PID=$pid_file run_fwdports "$output" start
+  while [[ ! -f $term_marker && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  [[ ! -s $pid_file ]] || child_pid=$(<"$pid_file")
+
+  if [[ $COMMAND_STATUS -ne 0 ]]; then
+    _pass "later pane rollback: start reports the failed pane"
+  else
+    _fail "later pane rollback: start reports the failed pane"
+  fi
+  _assert_file "later pane rollback: converts session HUP to autossh TERM" \
+    "$term_marker"
+  if [[ -n $child_pid ]] && ! kill -0 "$child_pid" 2>/dev/null; then
+    _pass "later pane rollback: leaves no autossh child"
+  else
+    _fail "later pane rollback: leaves no autossh child"
+    [[ -z $child_pid ]] || kill -KILL "$child_pid" 2>/dev/null || true
+  fi
+  _assert_not_exists "later pane rollback: removes pending generation" \
+    "$CASE_STATE/fwdports/pending"
 }
 
 default_ssh_lifecycle_case() {
@@ -234,4 +306,6 @@ run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case configured-health configured_health_case
 run_case shared-external-driver shared_external_driver_case
 run_case symlink-config-target-override symlink_config_target_override_case
+run_case later-pane-failure-reaps-autossh \
+  later_pane_failure_reaps_autossh_case
 _test_summary

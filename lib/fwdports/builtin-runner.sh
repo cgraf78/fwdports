@@ -18,31 +18,45 @@ while IFS= read -r element || [[ -n $element ]]; do
 done <"$runtime/ssh-argv"
 [[ ${#argv[@]} -gt 0 ]] || exit 70
 
+# Keep one foreground supervisor for both built-in transports. tmux tears a
+# pane down with HUP, but autossh may deliberately ignore HUP while its SSH
+# child remains alive. Converting every catchable shutdown to TERM and reaping
+# the direct child prevents a failed startup rollback from orphaning a tunnel.
+child=
+signal_status=0
+
+stop_child() {
+  [[ -n ${child:-} ]] || return 0
+  kill -TERM "$child" 2>/dev/null || true
+}
+on_hup() {
+  signal_status=129
+  stop_child
+}
+on_int() {
+  signal_status=130
+  stop_child
+}
+on_term() {
+  signal_status=143
+  stop_child
+}
+cleanup_child() {
+  stop_child
+  [[ -z ${child:-} ]] || wait "$child" 2>/dev/null || true
+}
+trap on_hup HUP
+trap on_int INT
+trap on_term TERM
+trap cleanup_child EXIT
+
 case "$kind" in
   ssh)
     RUNNER_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) ||
       exit 70
     # shellcheck disable=SC1091
     source "$RUNNER_DIR/health.sh"
-    child=
-    signal_status=0
     failures=0
-
-    stop_child() {
-      [[ -n ${child:-} ]] || return 0
-      kill -TERM "$child" 2>/dev/null || true
-    }
-    on_hup() { signal_status=129; stop_child; }
-    on_int() { signal_status=130; stop_child; }
-    on_term() { signal_status=143; stop_child; }
-    cleanup_child() {
-      stop_child
-      [[ -z ${child:-} ]] || wait "$child" 2>/dev/null || true
-    }
-    trap on_hup HUP
-    trap on_int INT
-    trap on_term TERM
-    trap cleanup_child EXIT
 
     while :; do
       started=$SECONDS
@@ -85,7 +99,16 @@ case "$kind" in
     AUTOSSH_PORT=0
     AUTOSSH_PATH=$runtime/ssh-gate
     export AUTOSSH_GATETIME AUTOSSH_PORT AUTOSSH_PATH
-    exec "$autossh_path" -M 0 "${argv[@]}" "$target"
+    "$autossh_path" -M 0 "${argv[@]}" "$target" &
+    child=$!
+    wait "$child"
+    status=$?
+    # A signal can interrupt wait before the child has finished handling TERM.
+    # Reap it before exposing the signal-derived wrapper status to tmux.
+    wait "$child" 2>/dev/null || true
+    child=
+    [[ $signal_status -eq 0 ]] || exit "$signal_status"
+    exit "$status"
     ;;
   *)
     printf 'fwdports: invalid built-in driver snapshot\n' >&2

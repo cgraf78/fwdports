@@ -75,6 +75,9 @@ least one local or remote forward is required. Core forces foreground,
 no-session operation, forward-failure detection, disabled multiplex reuse,
 disabled tunnel devices, and disabled local commands. Raw SSH options are not
 accepted because they would bypass validation and desired-state fingerprinting.
+Built-in legs must use distinct local bind ports across the complete resolved
+profile so one successful leg cannot mask another leg's deterministic bind
+failure.
 
 ## Status vocabulary
 
@@ -86,7 +89,6 @@ accepted because they would bypass validation and desired-state fingerprinting.
 - `controller-down`: active legs may remain, but observation needs an explicit
   `start` to rebuild the generation.
 - `stopping`: replacement is disabled while authenticated cleanup is incomplete.
-- `failed`: a verified generation has an actionable start/controller failure.
 
 Process or monitor liveness is never reported as endpoint health.
 
@@ -113,9 +115,11 @@ invalidation cancels every pending wait.
 
 Each start creates a stable, never-renamed random generation directory. Its
 manifest is immutable; its control file is atomically replaceable observed
-state. Small `pending` and `active` files identify a generation plus manifest
-digest. A fully written owner record is hard-linked atomically to claim the
-lifecycle lock, avoiding an ownerless lock state.
+state. It stores only the lifecycle phase, desired state, controller identity,
+and latest probe result; transport retry counters stay local to the transport
+that actually owns them. Small `pending` and `active` files identify a
+generation plus manifest digest. A fully written owner record is hard-linked
+atomically to claim the lifecycle lock, avoiding an ownerless lock state.
 
 Tmux sessions carry a random generation nonce at creation. Core records pane,
 session, PID/start identity, tty, SID, and PGID evidence. Cleanup revalidates

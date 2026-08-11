@@ -278,12 +278,30 @@ _fwdports_lock_read_owner() {
   while IFS=$'\t' read -r kind value rest || [[ -n ${kind:-} ]]; do
     [[ -n $kind && -n $value && -z $rest ]] || return 2
     case "$kind" in
-      version) [[ -z $version ]] || return 2; version=$value ;;
-      nonce) [[ -z $nonce ]] || return 2; nonce=$value ;;
-      uid) [[ -z $uid ]] || return 2; uid=$value ;;
-      pid) [[ -z $pid ]] || return 2; pid=$value ;;
-      start) [[ -z $start ]] || return 2; start=$value ;;
-      target) [[ -z $target ]] || return 2; target=$value ;;
+      version)
+        [[ -z $version ]] || return 2
+        version=$value
+        ;;
+      nonce)
+        [[ -z $nonce ]] || return 2
+        nonce=$value
+        ;;
+      uid)
+        [[ -z $uid ]] || return 2
+        uid=$value
+        ;;
+      pid)
+        [[ -z $pid ]] || return 2
+        pid=$value
+        ;;
+      start)
+        [[ -z $start ]] || return 2
+        start=$value
+        ;;
+      target)
+        [[ -z $target ]] || return 2
+        target=$value
+        ;;
       *) return 2 ;;
     esac
   done <"$file"
@@ -595,7 +613,7 @@ fwdports_generation_create() {
   _fwdports_runtime_validate_node "$source" 'resolved profile' || return 1
   [[ -z $target_override ||
     ($target_override != -* &&
-      $target_override =~ ^[][A-Za-z0-9._:@%+,=-]+$) ]] || {
+    $target_override =~ ^[][A-Za-z0-9._:@%+,=-]+$) ]] || {
     printf 'fwdports: target override is unsafe\n' >&2
     return 1
   }
@@ -603,8 +621,7 @@ fwdports_generation_create() {
   generations=$root/generations
   old_umask=$(umask)
   umask 077
-  if ! mkdir -p "$generations" || ! chmod 0700 "$generations";
-  then
+  if ! mkdir -p "$generations" || ! chmod 0700 "$generations"; then
     umask "$old_umask"
     return 1
   fi
@@ -693,12 +710,12 @@ fwdports_generation_manifest_digest() {
 
 fwdports_control_write() {
   local generation=$1 expected_digest=$2 phase=$3 desired=$4
-  local controller_pid=$5 controller_start=$6 failures=$7 backoff=$8
-  local probe=$9 control=$generation/control tmp old_umask
+  local controller_pid=$5 controller_start=$6 probe=$7
+  local control=$generation/control tmp old_umask
   local digest_before digest_after identity_before identity_after nonce
 
   case "$phase" in
-    preparing | starting | running | backoff | stopping | failed) ;;
+    preparing | running | stopping) ;;
     *)
       printf 'fwdports: invalid generation control phase\n' >&2
       return 1
@@ -715,10 +732,6 @@ fwdports_control_write() {
   [[ $controller_start != *$'\t'* && $controller_start != *$'\n'* &&
     $controller_start != *$'\r'* ]] || {
     printf 'fwdports: invalid controller start identity\n' >&2
-    return 1
-  }
-  [[ $failures =~ ^[0-9]+$ && $backoff =~ ^[0-9]+$ ]] || {
-    printf 'fwdports: invalid generation counters\n' >&2
     return 1
   }
   case "$probe" in
@@ -764,8 +777,6 @@ fwdports_control_write() {
     printf 'desired\t%s\n' "$desired"
     printf 'controller-pid\t%s\n' "$controller_pid"
     printf 'controller-start\t%s\n' "$controller_start"
-    printf 'failure-count\t%s\n' "$failures"
-    printf 'backoff-ticks\t%s\n' "$backoff"
     printf 'probe\t%s\n' "$probe"
   } >"$tmp" || ! chmod 0600 "$tmp"; then
     rm -f -- "$tmp"
@@ -799,7 +810,7 @@ fwdports_control_read() {
   local generation=$1 expected_digest=$2 control
   local line key value extra line_number identity_before identity_after
   local version nonce digest phase desired controller_pid controller_start
-  local failures backoff probe attempt=0
+  local probe attempt=0
 
   control=$generation/control
   while [[ $attempt -lt 8 ]]; do
@@ -818,8 +829,6 @@ fwdports_control_read() {
     desired=
     controller_pid=
     controller_start=
-    failures=
-    backoff=
     probe=
     while IFS= read -r line || [[ -n $line ]]; do
       line_number=$((line_number + 1))
@@ -836,9 +845,7 @@ fwdports_control_read() {
         5:desired) desired=$value ;;
         6:controller-pid) controller_pid=$value ;;
         7:controller-start) controller_start=$value ;;
-        8:failure-count) failures=$value ;;
-        9:backoff-ticks) backoff=$value ;;
-        10:probe) probe=$value ;;
+        8:probe) probe=$value ;;
         *)
           printf 'fwdports: generation control schema is invalid\n' >&2
           return 1
@@ -853,22 +860,20 @@ fwdports_control_read() {
       # bound prevents a pathological writer from starving a reader forever.
       continue
     fi
-    [[ $line_number -eq 10 && $version == 1 &&
+    [[ $line_number -eq 8 && $version == 1 &&
       $nonce == "${generation##*/}" && $digest == "$expected_digest" ]] || {
       printf 'fwdports: generation control binding is invalid\n' >&2
       return 1
     }
     case "$phase" in
-      preparing | starting | running | backoff | stopping | failed) ;;
+      preparing | running | stopping) ;;
       *) return 1 ;;
     esac
     [[ $desired == running || $desired == stopped ]] || return 1
     [[ $controller_pid == none || $controller_pid =~ ^[0-9]+$ ]] || return 1
-    [[ $failures =~ ^[0-9]+$ && $backoff =~ ^[0-9]+$ ]] || return 1
     case "$probe" in unknown | passing | failing | none) ;; *) return 1 ;; esac
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$phase" "$desired" "$controller_pid" "$controller_start" \
-      "$failures" "$backoff" "$probe"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$phase" "$desired" "$controller_pid" "$controller_start" "$probe"
     return 0
   done
   printf 'fwdports: generation control changed repeatedly while being read\n' \
@@ -1064,8 +1069,7 @@ fwdports_generation_remove() {
     return 1
   _fwdports_generation_under_root "$root" "$generation" || return 1
   [[ $root_identity == "$(_fwdports_runtime_identity "$root")" &&
-    $generations_identity == \
-      "$(_fwdports_runtime_identity "$root/generations")" ]] || {
+  $generations_identity == "$(_fwdports_runtime_identity "$root/generations")" ]] || {
     printf 'fwdports: generation namespace changed before removal\n' >&2
     return 1
   }

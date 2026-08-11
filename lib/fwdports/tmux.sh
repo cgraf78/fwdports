@@ -155,7 +155,9 @@ _fwdports_process_snapshot() {
   # Request named columns rather than parsing the platform's default `ps`
   # layout. GNU and BSD ps both accept these fields; LC_ALL=C keeps tty and
   # state tokens stable enough for the on-disk evidence grammar.
-  line=$(LC_ALL=C ps -o pid= -o ppid= -o pgid= -o sid= -o tty= -o stat= \
+  # Darwin calls the session column `sess`; procps accepts that spelling too.
+  # Using `sid` works on GNU/Linux but makes every macOS pane unverifiable.
+  line=$(LC_ALL=C ps -o pid= -o ppid= -o pgid= -o sess= -o tty= -o stat= \
     -p "$pid" 2>/dev/null) || return 1
   read -r observed_pid parent_pid pgid sid tty stat extra <<<"$line"
   [[ -z $extra && $observed_pid == "$pid" &&
@@ -282,8 +284,7 @@ fwdports_tmux_record_pane() {
     printf 'pgid\t%s\n' "$pgid"
     printf 'parent-pid\t%s\n' "$parent_pid"
     printf 'process-state\t%s\n' "$process_stat"
-  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output";
-  then
+  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
     rm -f -- "$tmp"
     return 1
   fi
@@ -296,7 +297,7 @@ _fwdports_pane_evidence_read() {
   local leader_start='' tty='' sid='' pgid='' parent_pid='' process_state=''
 
   [[ ($evidence == "$generation"/legs/*/pane ||
-      $evidence == "$generation/controller.pane") &&
+    $evidence == "$generation/controller.pane") &&
     -f "$evidence" && ! -L "$evidence" ]] || {
     printf 'fwdports: pane evidence is unavailable\n' >&2
     return 2
@@ -380,10 +381,12 @@ fwdports_tmux_verify_pane() {
     printf 'fwdports: tmux pane identity changed\n' >&2
     return 2
   }
-  process_record=$(_fwdports_process_snapshot "$expected_pid") || return 1
+  # tmux just proved this exact pane live. Failure to inspect its process is
+  # therefore missing ownership evidence, not proof that the pane is dead.
+  process_record=$(_fwdports_process_snapshot "$expected_pid") || return 2
   IFS=$'\t' read -r parent_pid pgid sid process_tty process_state \
     <<<"$process_record"
-  current_start=$(_fwdports_process_start_identity "$expected_pid") || return 1
+  current_start=$(_fwdports_process_start_identity "$expected_pid") || return 2
   process_tty=${process_tty#/dev/}
   if [[ $current_start != "$expected_start" ||
     ${expected_tty#/dev/} != "$process_tty" ||
@@ -403,19 +406,23 @@ fwdports_tmux_session_named_exists() {
 }
 
 _fwdports_process_group_records() {
-  local wanted_pgid=$1 line pid pgid sid tty state extra found=0
+  local wanted_pgid=$1 output line pid pgid sid tty state extra found=0
+  local records=''
 
   [[ $wanted_pgid =~ ^[0-9]+$ ]] || return 1
+  output=$(LC_ALL=C ps -e -o pid= -o pgid= -o sess= -o tty= -o stat= \
+    2>/dev/null) || return 2
+  [[ -n $output ]] || return 1
   while IFS= read -r line || [[ -n $line ]]; do
     read -r pid pgid sid tty state extra <<<"$line"
     [[ -z $extra && $pid =~ ^[0-9]+$ && $pgid =~ ^[0-9]+$ &&
-      $sid =~ ^[0-9]+$ && -n $tty && -n $state ]] || continue
+      $sid =~ ^[0-9]+$ && -n $tty && -n $state ]] || return 2
     [[ $pgid == "$wanted_pgid" ]] || continue
-    printf '%s\t%s\t%s\t%s\n' "$pid" "$sid" "$tty" "$state"
+    records=$records$pid$'\t'$sid$'\t'$tty$'\t'$state$'\n'
     found=1
-  done < <(LC_ALL=C ps -e -o pid= -o pgid= -o sid= -o tty= -o stat= \
-    2>/dev/null)
-  [[ $found -eq 1 ]]
+  done <<<"$output"
+  [[ $found -eq 1 ]] || return 1
+  printf '%s' "$records"
 }
 
 _fwdports_verify_owned_group() {
@@ -465,17 +472,28 @@ _fwdports_lifecycle_allows_stop() {
   pointer=$(fwdports_pointer_read "$root" "$pointer_kind") || return 1
   [[ $pointer == "$generation"$'\t'"$digest" ]] || return 1
   control_record=$(fwdports_control_read "$generation" "$digest") || return 1
-  IFS=$'\t' read -r phase desired _ _ _ _ _ <<<"$control_record"
+  IFS=$'\t' read -r phase desired _ _ _ <<<"$control_record"
   [[ $phase == stopping && $desired == stopped ]]
 }
 
 _fwdports_wait_group_empty() {
-  local pgid=$1 attempts=$2 delay=$3 index=0
+  local pgid=$1 attempts=$2 delay=$3 index=0 status
 
-  while _fwdports_process_group_records "$pgid" >/dev/null 2>&1; do
-    [[ $index -lt $attempts ]] || return 1
-    sleep "$delay"
-    index=$((index + 1))
+  while :; do
+    if _fwdports_process_group_records "$pgid" >/dev/null 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    case "$status" in
+      0)
+        [[ $index -lt $attempts ]] || return 1
+        sleep "$delay"
+        index=$((index + 1))
+        ;;
+      1) return 0 ;;
+      *) return 2 ;;
+    esac
   done
 }
 
@@ -548,7 +566,7 @@ fwdports_tmux_terminate_pane() {
 fwdports_tmux_remove_generation_session() {
   local tmux_path=$1 socket=$2 generation=$3 digest=$4 session_name=$5
   local evidence record evidence_session evidence_pane session_id=''
-  local known_panes='|' recorded_nonce pane
+  local known_panes='|' recorded_nonce pane panes
 
   for evidence in "$generation"/legs/*/pane \
     "$generation"/controller.pane; do
@@ -579,8 +597,21 @@ fwdports_tmux_remove_generation_session() {
       >&2
     return 74
   }
+  panes=$(_fwdports_tmux_call "$tmux_path" "$socket" list-panes -s \
+    -t "$session_id" -F '#{pane_id}') || {
+    printf 'fwdports: cannot enumerate tmux panes before removal\n' >&2
+    return 74
+  }
+  [[ -n $panes ]] || {
+    printf 'fwdports: tmux returned no panes for a live session\n' >&2
+    return 74
+  }
   while IFS= read -r pane || [[ -n $pane ]]; do
     [[ -n $pane ]] || continue
+    [[ $pane =~ ^%[0-9]+$ ]] || {
+      printf 'fwdports: tmux returned a malformed pane identifier\n' >&2
+      return 74
+    }
     case "$known_panes" in
       *"|$pane|"*) ;;
       *)
@@ -588,8 +619,7 @@ fwdports_tmux_remove_generation_session() {
         return 74
         ;;
     esac
-  done < <(_fwdports_tmux_call "$tmux_path" "$socket" list-panes -s \
-    -t "$session_id" -F '#{pane_id}')
+  done <<<"$panes"
   # The exact server socket, session ID, and nonce—not the friendly name—are
   # the authority for this destructive operation.
   _fwdports_tmux_call "$tmux_path" "$socket" kill-session -t "$session_id"

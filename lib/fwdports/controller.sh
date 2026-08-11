@@ -15,9 +15,8 @@ _fwdports_controller_write_ready() {
     return 1
   }
   control_record=$(fwdports_control_read "$generation" "$digest") || return 1
-  IFS=$'\t' read -r phase desired _ _ _ _ _ <<<"$control_record"
-  [[ ($phase == preparing || $phase == starting) &&
-    $desired == running ]] || {
+  IFS=$'\t' read -r phase desired _ _ _ <<<"$control_record"
+  [[ $phase == preparing && $desired == running ]] || {
     printf 'fwdports: controller cannot become ready in this phase\n' >&2
     return 1
   }
@@ -42,8 +41,7 @@ _fwdports_controller_write_ready() {
     printf 'manifest-digest\t%s\n' "$digest"
     printf 'controller-pid\t%s\n' "$controller_pid"
     printf 'controller-start\t%s\n' "$controller_start"
-  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$ready";
-  then
+  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$ready"; then
     rm -f -- "$tmp"
     return 1
   fi
@@ -75,10 +73,9 @@ fwdports_controller_wait_for_activation() {
       control_record=$(fwdports_control_read "$generation" "$digest") ||
         return 1
       IFS=$'\t' read -r phase desired controller_pid controller_start \
-        _ _ _ <<<"$control_record"
+        _ <<<"$control_record"
       if [[ $phase == running && $desired == running &&
-        $controller_pid == "$$" && $controller_start == "$current_start" ]];
-      then
+        $controller_pid == "$$" && $controller_start == "$current_start" ]]; then
         printf 'activated\n'
         return 0
       fi
@@ -95,8 +92,8 @@ fwdports_controller_wait_for_activation() {
       control_record=$(fwdports_control_read "$generation" "$digest") ||
         return 1
       IFS=$'\t' read -r phase desired controller_pid controller_start \
-        _ _ _ <<<"$control_record"
-      [[ ($phase == preparing || $phase == starting || $phase == running) &&
+        _ <<<"$control_record"
+      [[ ($phase == preparing || $phase == running) &&
         $desired == running ]] || {
         printf 'fwdports: controller boot was cancelled\n' >&2
         return 1
@@ -106,8 +103,7 @@ fwdports_controller_wait_for_activation() {
       # exists is a valid, read-only transition state; the controller keeps
       # waiting and gains mutation authority only after active also matches.
       if [[ $phase == running &&
-        ($controller_pid != "$$" || $controller_start != "$current_start") ]];
-      then
+        ($controller_pid != "$$" || $controller_start != "$current_start") ]]; then
         printf 'fwdports: running control names another controller\n' >&2
         return 1
       fi
@@ -124,7 +120,7 @@ fwdports_controller_wait_for_activation() {
 _fwdports_controller_publish_probe() {
   local root=$1 generation=$2 digest=$3 probe=$4
   local candidate pointer control_record phase desired controller_pid
-  local controller_start failures backoff current_start status=0
+  local controller_start current_start status=0
 
   candidate=$(fwdports_lock_acquire "$root" 2>/dev/null) || return 75
   pointer=$(fwdports_pointer_read "$root" active) || status=$?
@@ -138,18 +134,16 @@ _fwdports_controller_publish_probe() {
   fi
   if [[ $status -eq 0 ]]; then
     IFS=$'\t' read -r phase desired controller_pid controller_start \
-      failures backoff _ <<<"$control_record"
+      _ <<<"$control_record"
     current_start=$(_fwdports_process_start_identity "$$") || status=$?
   fi
   if [[ $status -eq 0 && ($phase != running || $desired != running ||
-    $controller_pid != "$$" || $controller_start != "$current_start") ]];
-  then
+    $controller_pid != "$$" || $controller_start != "$current_start") ]]; then
     status=74
   fi
   if [[ $status -eq 0 ]]; then
     fwdports_control_write "$generation" "$digest" running running \
-      "$controller_pid" "$controller_start" "$failures" "$backoff" \
-      "$probe" || status=$?
+      "$controller_pid" "$controller_start" "$probe" || status=$?
   fi
   fwdports_lock_release "$root" "$candidate" >/dev/null 2>&1 || {
     [[ $status -ne 0 ]] || status=74
@@ -160,7 +154,7 @@ _fwdports_controller_publish_probe() {
 fwdports_controller_run() {
   local root=$1 generation=$2 digest=$3 tick_seconds interval grace ticks=0
   local pointer control_record phase desired controller_pid controller_start
-  local failures backoff probe_result probe_status current_start
+  local current_probe probe_result probe_status current_start
 
   tick_seconds=${FWDPORTS_CONTROLLER_TICK_SECONDS:-1}
   interval=${FWDPORTS_HEALTH_INTERVAL_TICKS:-30}
@@ -176,7 +170,7 @@ fwdports_controller_run() {
     control_record=$(fwdports_control_read "$generation" "$digest") ||
       return 0
     IFS=$'\t' read -r phase desired controller_pid controller_start \
-      failures backoff _ <<<"$control_record"
+      current_probe <<<"$control_record"
     [[ $phase == running && $desired == running ]] || return 0
     [[ $controller_pid == "$$" && $controller_start == "$current_start" ]] ||
       return 74
@@ -192,10 +186,16 @@ fwdports_controller_run() {
       # A foreground user operation may briefly own the lifecycle lock.  A
       # health observation can wait for the next tick; it must never interfere
       # with start/stop merely to publish telemetry.
-      _fwdports_controller_publish_probe "$root" "$generation" "$digest" \
-        "$probe_result"
-      probe_status=$?
-      [[ $probe_status -eq 0 || $probe_status -eq 75 ]] || return 74
+      # Publishing an unchanged observation only churns the control inode and
+      # briefly contends with foreground start/stop for no semantic gain.
+      # Keep telemetry edge-triggered so a fast test interval—and eventually a
+      # slow real probe—cannot starve a user lifecycle operation.
+      if [[ $probe_result != "$current_probe" ]]; then
+        _fwdports_controller_publish_probe "$root" "$generation" "$digest" \
+          "$probe_result"
+        probe_status=$?
+        [[ $probe_status -eq 0 || $probe_status -eq 75 ]] || return 74
+      fi
     fi
     sleep "$tick_seconds"
   done
@@ -215,8 +215,8 @@ _fwdports_manifest_driver_for_leg() {
 
 fwdports_status() {
   local root=$1 tmux_path=$2 socket=$3 session_name=$4 pointer generation digest
-  local control_record phase desired controller_pid controller_start failures
-  local backoff probe current_start evidence found=0 verify_status all_live=1
+  local control_record phase desired controller_pid controller_start probe
+  local current_start evidence found=0 verify_status all_live=1
   local controller_live=0 runtime leg driver snapshot record pane_id
   local driver_status
 
@@ -227,12 +227,16 @@ fwdports_status() {
     control_record=$(fwdports_control_read "$generation" "$digest") ||
       return 74
     IFS=$'\t' read -r phase desired controller_pid controller_start \
-      failures backoff probe <<<"$control_record"
+      probe <<<"$control_record"
     case "$phase" in
-      stopping) printf 'stopping\n'; return 0 ;;
-      failed) printf 'failed\n'; return 0 ;;
-      backoff) printf 'backoff\n'; return 0 ;;
-      preparing | starting) printf 'starting\n'; return 0 ;;
+      stopping)
+        printf 'stopping\n'
+        return 0
+        ;;
+      preparing)
+        printf 'starting\n'
+        return 0
+        ;;
       running) ;;
       *) return 74 ;;
     esac
@@ -276,8 +280,7 @@ fwdports_status() {
               # fallback; status 1 lets a driver report a dead transport
               # without granting the driver any signalling authority.
               if fwdports_driver_operation "$snapshot" is-live \
-                "$generation/manifest" "$leg" "$runtime" "$pane_id";
-              then
+                "$generation/manifest" "$leg" "$runtime" "$pane_id"; then
                 driver_status=0
               else
                 driver_status=$?
@@ -315,7 +318,6 @@ fwdports_status() {
       none | unknown) printf 'live/unverified\n' ;;
       *) return 74 ;;
     esac
-    : "$failures" "$backoff"
     return 0
   fi
 
@@ -325,9 +327,8 @@ fwdports_status() {
     IFS=$'\t' read -r generation digest <<<"$pointer"
     control_record=$(fwdports_control_read "$generation" "$digest") ||
       return 74
-    IFS=$'\t' read -r phase desired _ _ _ _ _ <<<"$control_record"
+    IFS=$'\t' read -r phase desired _ _ _ <<<"$control_record"
     case "$phase" in
-      failed) printf 'failed\n' ;;
       stopping) printf 'stopping\n' ;;
       *) printf 'starting\n' ;;
     esac
@@ -389,18 +390,17 @@ _fwdports_stop_generation_locked() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 session_name=$7 attempts=$8 delay=$9
   local control_record phase desired controller_pid controller_start
-  local failures backoff probe evidence verify_status record pgid
+  local probe evidence verify_status record pgid group_status
 
   control_record=$(fwdports_control_read "$generation" "$digest") || return 74
-  IFS=$'\t' read -r phase desired controller_pid controller_start failures \
-    backoff probe <<<"$control_record"
+  IFS=$'\t' read -r phase desired controller_pid controller_start probe \
+    <<<"$control_record"
   if [[ $phase != stopping || $desired != stopped ]]; then
     # Commit stop intent before the first signal. A crash after this atomic
     # write is resumable; a crash before it leaves the running generation
     # untouched because recovery does not infer intent from an invocation.
     fwdports_control_write "$generation" "$digest" stopping stopped \
-      "$controller_pid" "$controller_start" "$failures" "$backoff" \
-      "$probe" || return 74
+      "$controller_pid" "$controller_start" "$probe" || return 74
   fi
 
   for evidence in "$generation"/legs/*/pane; do
@@ -426,6 +426,12 @@ _fwdports_stop_generation_locked() {
         IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$record"
         if _fwdports_process_group_records "$pgid" >/dev/null 2>&1; then
           printf 'fwdports: recorded leader is gone but its group remains\n' >&2
+          return 74
+        else
+          group_status=$?
+        fi
+        if [[ $group_status -ne 1 ]]; then
+          printf 'fwdports: cannot inspect the recorded process group\n' >&2
           return 74
         fi
         ;;
@@ -479,7 +485,7 @@ _fwdports_recover_state_locked() {
   if [[ -n $active ]]; then
     control_record=$(fwdports_control_read "$active_generation" \
       "$active_digest") || return 74
-    IFS=$'\t' read -r phase desired _ _ _ _ _ <<<"$control_record"
+    IFS=$'\t' read -r phase desired _ _ _ <<<"$control_record"
     if [[ $phase == stopping && $desired == stopped ]]; then
       _fwdports_stop_generation_locked "$tmux_path" "$socket" "$root" \
         active "$active_generation" "$active_digest" "$session_name" \

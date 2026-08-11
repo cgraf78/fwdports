@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Named adapters for GNU/Linux and stock macOS command differences.
-# shellcheck disable=SC2329,SC2016
+# Named cases and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
 
 set -u
 
@@ -12,6 +13,8 @@ TEST_CASE=${1:-}
 source "$TEST_DIR/lib/test.sh"
 # shellcheck source=../lib/fwdports/drivers.sh
 source "$ROOT/lib/fwdports/drivers.sh"
+# shellcheck source=../lib/fwdports/tmux.sh
+source "$ROOT/lib/fwdports/tmux.sh"
 
 bsd_stat_case() {
   local tmp fake_bin log output
@@ -47,6 +50,62 @@ canonicalization_case() {
     "$real" "$result"
 }
 
+stock_macos_bash_ci_case() {
+  local workflow
+  workflow=$ROOT/.github/workflows/ci.yml
+
+  # The shared matrix installs a current Homebrew Bash before running tests.
+  # Keep a repository-owned gate for Apple's stock Bash so the documented
+  # 3.2 compatibility promise cannot silently turn into a modern-Bash-only
+  # claim when the shared workflow evolves.
+  _assert_contains "portability CI: has a stock macOS Bash job" \
+    "macos-bash32:" "$(<"$workflow")"
+  _assert_contains "portability CI: invokes stock /bin/bash" \
+    'shell: /bin/bash {0}' "$(<"$workflow")"
+  _assert_contains "portability CI: checks the Bash 3.2 version" \
+    'BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2' \
+    "$(<"$workflow")"
+  _assert_contains "portability CI: exercises the installed entrypoint" \
+    '"$install_prefix/bin/fwdports" --version' "$(<"$workflow")"
+  _assert_contains "portability CI: required gate includes Bash 3.2" \
+    'needs: [shell, macos-bash32]' "$(<"$workflow")"
+}
+
+bsd_ps_session_keyword_case() {
+  local tmp fake_bin log snapshot members
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  log=$tmp/ps.log
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_PS_LOG"' \
+    '[[ " $* " != *" sid= "* ]] || exit 2' \
+    'if [[ " $* " == *" -e "* ]]; then' \
+    '  printf "123 456 789 ?? S\n"' \
+    'else' \
+    '  printf "123 12 456 789 ?? S\n"' \
+    'fi' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  snapshot=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PS_LOG=$log \
+    _fwdports_process_snapshot 123) || true
+  members=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PS_LOG=$log \
+    _fwdports_process_group_records 456) || true
+
+  _assert_eq "portability: BSD ps snapshot records session identity" \
+    $'12\t456\t789\t??\tS' "$snapshot"
+  _assert_eq "portability: BSD ps group records session identity" \
+    $'123\t789\t??\tS' "$members"
+  _assert_contains "portability: ps requests the shared sess keyword" \
+    'sess=' "$(<"$log")"
+  _assert_not_contains "portability: ps avoids Darwin-unsupported sid keyword" \
+    'sid=' "$(<"$log")"
+}
+
 run_case bsd-stat bsd_stat_case
 run_case canonicalization canonicalization_case
+run_case stock-macos-bash-ci stock_macos_bash_ci_case
+run_case bsd-ps-session-keyword bsd_ps_session_keyword_case
 _test_summary

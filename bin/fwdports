@@ -7,8 +7,40 @@ set -u
 
 FWDPORTS_VERSION=0.1.0
 FWDPORTS_DRIVER_API_VERSION=1
-BIN_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
-FWDPORTS_MODULE_DIR=$(cd -P -- "$BIN_DIR/../lib/fwdports" && pwd -P) || \
+
+_fwdports_entrypoint_dir() {
+  local path=$1 directory target hops=0
+
+  # The installer intentionally publishes this command as a symlink into its
+  # durable checkout. BASH_SOURCE names the link used to invoke us, so deriving
+  # `../lib` from it would look beside the user's bin directory. Resolve each
+  # link ourselves instead of using non-portable `readlink -f`; relative link
+  # targets are interpreted relative to the directory that owns that link.
+  case "$path" in
+    /*) ;;
+    */*) path=$PWD/$path ;;
+    *) path=$(type -P "$path" 2>/dev/null) || return 1 ;;
+  esac
+  while [[ -L $path ]]; do
+    hops=$((hops + 1))
+    [[ $hops -le 40 ]] || {
+      printf 'fwdports: entrypoint symlink chain is too deep\n' >&2
+      return 1
+    }
+    directory=$(cd -P -- "$(dirname "$path")" && pwd -P) || return 1
+    target=$(readlink "$path") || return 1
+    [[ -n $target && $target != *$'\n'* && $target != *$'\r'* ]] || return 1
+    case "$target" in
+      /*) path=$target ;;
+      *) path=$directory/$target ;;
+    esac
+  done
+  [[ -f $path ]] || return 1
+  cd -P -- "$(dirname "$path")" && pwd -P
+}
+
+BIN_DIR=$(_fwdports_entrypoint_dir "${BASH_SOURCE[0]}") || exit 1
+FWDPORTS_MODULE_DIR=$(cd -P -- "$BIN_DIR/../lib/fwdports" && pwd -P) ||
   exit 1
 export FWDPORTS_MODULE_DIR
 

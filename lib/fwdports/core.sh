@@ -137,7 +137,7 @@ _fwdports_generation_rollback_locked() {
   # That prevents a controller which happened to start early from gaining
   # permission to repair a generation being rolled back.
   fwdports_control_write "$generation" "$digest" stopping stopped \
-    none none 0 0 unknown || return 1
+    none none unknown || return 1
   _fwdports_stop_generation_locked "$tmux_path" "$socket" "$root" \
     pending "$generation" "$digest" "$FWDPORTS_SESSION_NAME" 40 0.05
 }
@@ -159,6 +159,7 @@ _fwdports_start_generation() {
     printf 'fwdports: selected profile has no legs\n' >&2
     return 1
   }
+  fwdports_builtin_validate_profile_ports "$generation/manifest" || return 1
   # Validate every leg before invoking any interactive prepare operation.  A
   # bad later leg therefore cannot solicit credentials or leave partial state
   # for an earlier one.
@@ -273,8 +274,16 @@ _fwdports_start_controller() {
     "${generation##*/}" "$generation" \
     "$FWDPORTS_MODULE_DIR/controller.sh" run "$root" "$generation" \
     "$digest") || return 1
-  fwdports_tmux_record_pane "$tmux_path" "$socket" "$session" "$pane" \
-    "$generation" "$digest" "$evidence" || return 1
+  if ! fwdports_tmux_record_pane "$tmux_path" "$socket" "$session" \
+    "$pane" "$generation" "$digest" "$evidence"; then
+    # The controller pane exists but is not yet authenticated into durable
+    # generation evidence. Abort only the exact session ID and nonce returned
+    # by this start; the transport wrappers convert tmux HUP to TERM and reap
+    # their children, so rollback cannot strand an unowned forwarding process.
+    fwdports_tmux_abort_created_session "$tmux_path" "$socket" "$session" \
+      "${generation##*/}" >/dev/null 2>&1 || true
+    return 1
+  fi
   while [[ ! -f $generation/controller.ready && $index -lt 500 ]]; do
     fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
       "$digest" "$evidence" >/dev/null 2>&1 || return 1
@@ -364,7 +373,7 @@ fwdports_start() {
           "$FWDPORTS_SESSION_NAME") || status=$?
         if [[ $status -eq 0 ]]; then
           case "$observed_state" in
-            healthy | live/unverified | backoff)
+            healthy | live/unverified)
               printf 'fwdports: profile %s is already running (%s)\n' \
                 "$profile" "$observed_state"
               return_existing=1
@@ -381,7 +390,7 @@ fwdports_start() {
                   "$FWDPORTS_SESSION_NAME" 40 0.05 || status=$?
               fi
               ;;
-            down | controller-down | failed | stopping)
+            down | controller-down | stopping)
               printf 'fwdports: repairing profile %s from %s\n' \
                 "$profile" "$observed_state"
               _fwdports_stop_generation_locked "$tmux_path" "$socket" \
@@ -426,7 +435,7 @@ fwdports_start() {
   fi
   if [[ $status -eq 0 ]]; then
     fwdports_control_write "$generation" "$digest" preparing running \
-      none none 0 0 unknown || status=$?
+      none none unknown || status=$?
   fi
   if [[ $status -eq 0 ]]; then
     fwdports_pointer_publish "$root" pending "$generation" "$digest" ||
@@ -459,7 +468,7 @@ fwdports_start() {
     IFS=$'\t' read -r controller_pid controller_start \
       <<<"$controller_record"
     fwdports_control_write "$generation" "$digest" running running \
-      "$controller_pid" "$controller_start" 0 0 unknown || status=$?
+      "$controller_pid" "$controller_start" unknown || status=$?
   fi
   if [[ $status -eq 0 ]]; then
     fwdports_pointer_publish "$root" active "$generation" "$digest" ||

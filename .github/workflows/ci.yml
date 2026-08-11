@@ -19,14 +19,66 @@ jobs:
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@464468328f050e43299298fc0eac8b971ddd38b7
     with:
-      # Process groups, Bash 3.2, tmux direct argv, and BSD command adapters
-      # materially differ on macOS, Linux, and Termux, so every PR gets the
-      # full shared matrix rather than deferring compatibility to a schedule.
+      # Process groups, tmux direct argv, and BSD command adapters materially
+      # differ on macOS, Linux, and Termux, so every PR gets the full shared
+      # matrix rather than deferring compatibility to a schedule. The separate
+      # job below keeps the stock macOS Bash 3.2 promise explicit: shared CI
+      # intentionally installs a current Bash before it invokes consumers.
       matrix-set: full
       profiles: base,python,tmux,openssh-netcat-lsof,procps
       shellcheck-inventory-path: .github/shellcheck-files.txt
       test-command: bash test/run
       termux-profiles: runtime,python,tmux,openssh-netcat-lsof,procps
+
+  macos-bash32:
+    name: Stock macOS Bash 3.2
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exercise portable surfaces with stock macOS Bash
+        shell: /bin/bash {0}
+        run: |-
+          set -euo pipefail
+          [[ ${BASH_VERSINFO[0]} -eq 3 && ${BASH_VERSINFO[1]} -eq 2 ]]
+
+          # Keep env-based shebangs and child `bash` calls on the same stock
+          # interpreter. This prevents a preinstalled Homebrew Bash from
+          # making the job look more portable than the installed command is.
+          stock_bin="$RUNNER_TEMP/fwdports-stock-bash"
+          mkdir -p "$stock_bin"
+          ln -s /bin/bash "$stock_bin/bash"
+          export PATH="$stock_bin:$PATH"
+
+          install_prefix="$RUNNER_TEMP/fwdports-bash32"
+          PREFIX="$install_prefix" /bin/bash install.sh
+          [[ -L "$install_prefix/bin/fwdports" ]]
+          "$install_prefix/bin/fwdports" --version
+
+          for suite in autossh-driver builtin-runner cli config driver-api \
+            examples install portability ssh-driver; do
+            /bin/bash "test/$suite-test"
+          done
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs: [shell, macos-bash32]
+    runs-on: ubuntu-24.04
+    env:
+      SHELL_RESULT: ${{ needs.shell.result }}
+      BASH32_RESULT: ${{ needs.macos-bash32.result }}
+    steps:
+      - name: Require all fwdports compatibility checks
+        shell: bash
+        run: |-
+          printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
+          printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
+
+          test "$SHELL_RESULT" = success
+          test "$BASH32_RESULT" = success
 
   actions-sync:
     name: cgraf78/actions sync

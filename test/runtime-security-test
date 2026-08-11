@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Case callbacks are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2034
 # Single-quoted fixture lines are expanded only by the child process.
 # shellcheck disable=SC2016
 
@@ -44,7 +44,7 @@ pointer_fixture() {
   generation=$(fwdports_generation_create "$root" "$source") || return 1
   digest=$(fwdports_generation_manifest_digest "$generation") || return 1
   fwdports_control_write "$generation" "$digest" preparing running \
-    none none 0 0 unknown || return 1
+    none none unknown || return 1
   printf '%s\t%s\t%s\n' "$root" "$generation" "$digest"
 }
 
@@ -190,7 +190,7 @@ replacement_race_case() {
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
     fwdports_snapshot_trusted_file "$source" "$destination" "$anchor" \
-      2>"$error"
+    2>"$error"
   status=$?
 
   _assert_exit "path trust: replacement during copy is rejected" 1 "$status"
@@ -453,7 +453,7 @@ mutable_control_case() {
   control=$generation/control
 
   fwdports_control_write "$generation" "$digest" preparing running \
-    none none 0 0 unknown
+    none none unknown
   before=$(<"$control")
   inode_before=$(_fwdports_runtime_identity "$control")
   _assert_file "generation control: is a regular file" "$control"
@@ -465,9 +465,13 @@ mutable_control_case() {
     $'manifest-digest\t'"$digest" "$before"
   _assert_contains "generation control: records initial phase" \
     $'phase\tpreparing' "$before"
+  _assert_not_contains "generation control: omits unreachable retry counters" \
+    'failure-count' "$before"
+  _assert_not_contains "generation control: omits unused backoff state" \
+    'backoff-ticks' "$before"
 
   fwdports_control_write "$generation" "$digest" running running \
-    "$$" "$(_fwdports_process_start_identity "$$")" 0 0 passing
+    "$$" "$(_fwdports_process_start_identity "$$")" passing
   after=$(<"$control")
   inode_after=$(_fwdports_runtime_identity "$control")
   _assert_contains "generation control: atomically replaces phase" \
@@ -478,8 +482,8 @@ mutable_control_case() {
   set +e
   fwdports_control_write "$generation" \
     "0000000000000000000000000000000000000000000000000000000000000000" \
-    failed stopped \
-    none none 1 0 failing 2>"$error"
+    stopping stopped \
+    none none failing 2>"$error"
   status=$?
   _assert_exit "generation control: wrong manifest binding is rejected" \
     1 "$status"
@@ -503,7 +507,7 @@ control_replacement_read_case() {
   error=$tmp/error
   cp "$control" "$old"
   fwdports_control_write "$generation" "$digest" running running \
-    "$$" "$(_fwdports_process_start_identity "$$")" 0 0 passing
+    "$$" "$(_fwdports_process_start_identity "$$")" passing
   cp "$control" "$replacement"
   mv -f -- "$old" "$control"
   chmod 0600 "$control" "$replacement"
@@ -572,7 +576,7 @@ active_pointer_case() {
   output=$tmp/output
   error=$tmp/error
   fwdports_control_write "$generation" "$digest" running running \
-    "$$" "$(_fwdports_process_start_identity "$$")" 0 0 unknown
+    "$$" "$(_fwdports_process_start_identity "$$")" unknown
 
   set +e
   fwdports_pointer_publish "$root" active "$generation" "$digest" \
@@ -643,7 +647,7 @@ pointer_replacement_case() {
   second=$(fwdports_generation_create "$root" "$second_source")
   second_digest=$(fwdports_generation_manifest_digest "$second")
   fwdports_control_write "$second" "$second_digest" preparing running \
-    none none 0 0 unknown
+    none none unknown
 
   fake_bin=$tmp/bin
   error=$tmp/error
@@ -656,7 +660,7 @@ pointer_replacement_case() {
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
     fwdports_pointer_publish "$root" pending "$second" "$second_digest" \
-      2>"$error"
+    2>"$error"
   status=$?
   leftovers=$(compgen -G "$root/.pending.*" || true)
 

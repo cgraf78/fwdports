@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Case callbacks are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks, TEST_CASE, and scoped fixture variables are consumed by
+# sourced production functions rather than directly in this file.
+# shellcheck disable=SC2329,SC2034
 # Single-quoted fixture lines are expanded only by the child process.
 # shellcheck disable=SC2016
 
@@ -15,6 +16,8 @@ TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
 source "$TEST_DIR/lib/test.sh"
 # shellcheck source=../lib/fwdports/tmux.sh
 source "$ROOT/lib/fwdports/tmux.sh"
+# shellcheck source=../lib/fwdports/core.sh
+source "$ROOT/lib/fwdports/core.sh"
 
 wait_for_file() {
   local path=$1 attempts=0
@@ -106,6 +109,35 @@ session_nonce_case() {
   kill_test_server "$socket"
 }
 
+controller_record_abort_case() {
+  local tmp generation marker status content=''
+  tmp=$(_tmpdir) || return 1
+  generation=$tmp/generation.controller
+  marker=$tmp/abort
+  mkdir -p "$generation"
+  chmod 0700 "$generation"
+  FWDPORTS_MODULE_DIR=$ROOT/lib/fwdports
+  FWDPORTS_TEST_ABORT_MARKER=$marker
+
+  fwdports_tmux_split_pane() { printf '%%42\n'; }
+  fwdports_tmux_record_pane() { return 1; }
+  fwdports_tmux_abort_created_session() {
+    printf '%s\t%s\n' "$3" "$4" >"$FWDPORTS_TEST_ABORT_MARKER"
+  }
+
+  set +e
+  _fwdports_start_controller /fake/tmux "$tmp/socket" "$tmp/root" \
+    "$generation" digest '$9' >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ ! -f $marker ]] || content=$(<"$marker")
+
+  _assert_exit "controller record failure: start fails" 1 "$status"
+  _assert_eq "controller record failure: aborts the exact created session" \
+    $'$9\tgeneration.controller' "$content"
+}
+
 run_case direct-argv direct_argv_case
 run_case session-nonce session_nonce_case
+run_case controller-record-abort controller_record_abort_case
 _test_summary

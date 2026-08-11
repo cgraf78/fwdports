@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # External executable-driver ABI tests.
-# shellcheck disable=SC2016,SC2329
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2016,SC2329,SC2034
 
 set -u
 
@@ -45,7 +46,7 @@ make_generation() {
   chmod 0600 "$source"
   RUNTIME_ROOT=$(HOME=$tmp/home XDG_STATE_HOME=$tmp/state \
     fwdports_runtime_init) || return 1
-  GENERATION=$(fwdports_generation_create "$RUNTIME_ROOT" "$source") || \
+  GENERATION=$(fwdports_generation_create "$RUNTIME_ROOT" "$source") ||
     return 1
   fwdports_generation_manifest_digest "$GENERATION" >/dev/null || return 1
 }
@@ -75,6 +76,75 @@ trusted_discovery_case() {
   else
     _pass "driver discovery: built-in names cannot be shadowed"
   fi
+}
+
+managed_symlink_snapshot_case() {
+  local tmp home config_root source target snapshot error status
+  local original_digest snapshot_digest
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  config_root=$home/.config/fwdports
+  source=$config_root/drivers.d/example
+  target=$home/.dotfiles-overlay/home/.config/fwdports/drivers.d/example
+  error=$tmp/error
+
+  write_driver "$target"
+  mkdir -p "${source%/*}"
+  chmod 0700 "$home" "$home/.config" "$config_root" "${source%/*}" \
+    "$home/.dotfiles-overlay" "$home/.dotfiles-overlay/home" \
+    "$home/.dotfiles-overlay/home/.config" \
+    "$home/.dotfiles-overlay/home/.config/fwdports" \
+    "${target%/*}"
+  # Match dot's installed overlay topology: the public configuration owns the
+  # visible driver name, while the executable bytes remain in another trusted
+  # same-user checkout beneath HOME.
+  ln -s '../../../.dotfiles-overlay/home/.config/fwdports/drivers.d/example' \
+    "$source"
+  make_generation "$tmp" || return 1
+
+  set +e
+  snapshot=$(fwdports_driver_snapshot "$config_root" example \
+    "$GENERATION" "$home" 2>"$error")
+  status=$?
+  set -e
+
+  _assert_exit "driver symlink: managed target snapshots" 0 "$status"
+  _assert_file "driver symlink: snapshot is a regular executable" "$snapshot"
+  _assert_eq "driver symlink: accepted target emits no diagnostic" \
+    "" "$(<"$error")"
+  if [[ -f $snapshot && ! -L $snapshot ]]; then
+    original_digest=$(_fwdports_runtime_sha256_file "$target")
+    snapshot_digest=$(_fwdports_runtime_sha256_file "$snapshot")
+    _assert_eq "driver symlink: snapshot preserves target bytes" \
+      "$original_digest" "$snapshot_digest"
+  else
+    _fail "driver symlink: snapshot preserves target bytes"
+  fi
+}
+
+escaping_symlink_snapshot_case() {
+  local tmp home config_root source outside
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  config_root=$home/.config/fwdports
+  source=$config_root/drivers.d/example
+  outside=$tmp/outside/example
+
+  write_driver "$outside"
+  mkdir -p "${source%/*}"
+  chmod 0700 "$home" "$home/.config" "$config_root" "${source%/*}" \
+    "$tmp/outside"
+  ln -s "$outside" "$source"
+  make_generation "$tmp" || return 1
+
+  if fwdports_driver_snapshot "$config_root" example "$GENERATION" "$home" \
+    >/dev/null 2>&1; then
+    _fail "driver symlink: target outside HOME is rejected"
+  else
+    _pass "driver symlink: target outside HOME is rejected"
+  fi
+  _assert_not_exists "driver symlink: rejected target publishes no snapshot" \
+    "$GENERATION/drivers/example"
 }
 
 immutable_snapshot_case() {
@@ -153,6 +223,8 @@ operations_case() {
 }
 
 run_case trusted-discovery trusted_discovery_case
+run_case managed-symlink-snapshot managed_symlink_snapshot_case
+run_case escaping-symlink-snapshot escaping_symlink_snapshot_case
 run_case immutable-snapshot immutable_snapshot_case
 run_case api-version api_version_case
 run_case operations operations_case

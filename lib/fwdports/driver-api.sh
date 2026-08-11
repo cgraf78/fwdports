@@ -45,8 +45,14 @@ fwdports_driver_discover() {
   fwdports_validate_trusted_path "$drivers_dir" directory "$config_root" \
     "$config_root" >/dev/null || return 1
   source=$drivers_dir/$name
+  # Validate both the configured link and its canonical executable now, but
+  # preserve the configured path for the caller. Snapshotting deliberately
+  # repeats that validation before and after copying; returning only the
+  # canonical target here would lose the config-root anchor and incorrectly
+  # reject a trusted dotfiles-managed link outside the visible drivers.d.
   fwdports_validate_trusted_path "$source" executable "$config_root" \
-    "$allowed_target_root"
+    "$allowed_target_root" >/dev/null || return 1
+  printf '%s\n' "$source"
 }
 
 fwdports_driver_snapshot() {

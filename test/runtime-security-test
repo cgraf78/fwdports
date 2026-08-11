@@ -1,0 +1,729 @@
+#!/usr/bin/env bash
+# Case callbacks are passed by name to the shared harness.
+# shellcheck disable=SC2329
+# Single-quoted fixture lines are expanded only by the child process.
+# shellcheck disable=SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
+
+file_mode() {
+  local path=$1 mode
+  if mode=$(stat -c '%a' -- "$path" 2>/dev/null); then
+    printf '%s\n' "$mode"
+  else
+    stat -f '%Lp' "$path"
+  fi
+}
+
+pointer_fixture() {
+  local tmp=$1 home state source
+  local root generation digest
+  home=$tmp/home
+  state=$tmp/state
+  source=$tmp/resolved-profile
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    >"$source"
+  chmod 0600 "$source"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init) || return 1
+  generation=$(fwdports_generation_create "$root" "$source") || return 1
+  digest=$(fwdports_generation_manifest_digest "$generation") || return 1
+  fwdports_control_write "$generation" "$digest" preparing running \
+    none none 0 0 unknown || return 1
+  printf '%s\t%s\t%s\n' "$root" "$generation" "$digest"
+}
+
+private_root_case() {
+  local tmp home state output error status runtime_root
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  output="$tmp/output"
+  error="$tmp/error"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+
+  set +e
+  HOME=$home XDG_STATE_HOME=$state \
+    fwdports_runtime_init >"$output" 2>"$error"
+  status=$?
+  runtime_root=$(<"$output")
+
+  _assert_exit "runtime root: initialization succeeds" 0 "$status"
+  _assert_eq "runtime root: follows absolute XDG state home" \
+    "$state/fwdports" "$runtime_root"
+  if [[ -d "$runtime_root" && ! -L "$runtime_root" ]]; then
+    _pass "runtime root: creates a regular directory"
+  else
+    _fail "runtime root: creates a regular directory"
+  fi
+  _assert_eq "runtime root: protects directory" 700 \
+    "$(file_mode "$runtime_root")"
+  _assert_eq "runtime root: no diagnostics" "" "$(<"$error")"
+}
+
+foreign_owned_file_case() {
+  local error status
+  error=$(_tmpdir)/error
+  set +e
+  _fwdports_runtime_trust_record 424242 600 2>"$error"
+  status=$?
+
+  _assert_exit "path trust: foreign owner is rejected" 1 "$status"
+  _assert_contains "path trust: foreign owner is actionable" \
+    "untrusted owner" "$(<"$error")"
+}
+
+writable_file_case() {
+  local error status
+  error=$(_tmpdir)/error
+  set +e
+  _fwdports_runtime_trust_record "$(id -u)" 666 2>"$error"
+  status=$?
+
+  _assert_exit "path trust: writable file is rejected" 1 "$status"
+  _assert_contains "path trust: writable file is actionable" \
+    "writable by an untrusted" "$(<"$error")"
+}
+
+unsafe_parent_case() {
+  local tmp anchor path error status
+  tmp=$(_tmpdir) || return 1
+  anchor="$tmp/config"
+  path="$anchor/tunnels.conf"
+  error="$tmp/error"
+  mkdir -p "$anchor"
+  printf 'profile demo\n' >"$path"
+  chmod 0777 "$anchor"
+  chmod 0600 "$path"
+
+  set +e
+  fwdports_validate_trusted_path "$path" file "$anchor" 2>"$error"
+  status=$?
+
+  _assert_exit "path trust: unsafe parent is rejected" 1 "$status"
+  _assert_contains "path trust: unsafe parent is actionable" \
+    "untrusted parent" "$(<"$error")"
+}
+
+safe_overlay_symlink_case() {
+  local tmp anchor source link output error status
+  tmp=$(_tmpdir) || return 1
+  anchor="$tmp/config"
+  source="$anchor/sources/tunnels.conf"
+  link="$anchor/tunnels.conf"
+  output="$tmp/output"
+  error="$tmp/error"
+  mkdir -p "$anchor/sources"
+  chmod 0700 "$anchor" "$anchor/sources"
+  printf 'profile demo\n' >"$source"
+  chmod 0600 "$source"
+  ln -s sources/tunnels.conf "$link"
+
+  set +e
+  fwdports_validate_trusted_path "$link" file "$anchor" \
+    >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "path trust: safe overlay link is accepted" 0 "$status"
+  _assert_eq "path trust: safe overlay resolves exact target" \
+    "$source" "$(<"$output")"
+  _assert_eq "path trust: safe overlay has no diagnostics" "" "$(<"$error")"
+}
+
+unsafe_symlink_case() {
+  local tmp anchor outside link error status
+  tmp=$(_tmpdir) || return 1
+  anchor="$tmp/config"
+  outside="$tmp/outside.conf"
+  link="$anchor/tunnels.conf"
+  error="$tmp/error"
+  mkdir -p "$anchor"
+  chmod 0700 "$anchor"
+  printf 'profile outside\n' >"$outside"
+  chmod 0600 "$outside"
+  ln -s "$outside" "$link"
+
+  set +e
+  fwdports_validate_trusted_path "$link" file "$anchor" \
+    >"$tmp/output" 2>"$error"
+  status=$?
+
+  _assert_exit "path trust: escaping symlink is rejected" 1 "$status"
+  _assert_contains "path trust: escaping symlink is actionable" \
+    "escapes allowed root" "$(<"$error")"
+}
+
+replacement_race_case() {
+  local tmp anchor source destination fake_bin error status
+  tmp=$(_tmpdir) || return 1
+  anchor="$tmp/config"
+  source="$anchor/driver"
+  destination="$tmp/snapshot"
+  fake_bin="$tmp/bin"
+  error="$tmp/error"
+  mkdir -p "$anchor" "$fake_bin"
+  chmod 0700 "$anchor"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$source"
+  chmod 0700 "$source"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '/bin/cp "$@"' \
+    'printf "# replaced\\n" >>"$1"' >"$fake_bin/cp"
+  chmod 0700 "$fake_bin/cp"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    fwdports_snapshot_trusted_file "$source" "$destination" "$anchor" \
+      2>"$error"
+  status=$?
+
+  _assert_exit "path trust: replacement during copy is rejected" 1 "$status"
+  _assert_contains "path trust: replacement race is actionable" \
+    "changed while being copied" "$(<"$error")"
+  _assert_not_exists "path trust: replacement race publishes no snapshot" \
+    "$destination"
+}
+
+atomic_owner_lock_case() {
+  local tmp home state root candidate error status content
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  error="$tmp/error"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+
+  set +e
+  candidate=$(fwdports_lock_acquire "$root" 2>"$error")
+  status=$?
+  content=
+  [[ -f "$root/lifecycle.lock" ]] && content=$(<"$root/lifecycle.lock")
+
+  _assert_exit "owner lock: acquisition succeeds" 0 "$status"
+  _assert_file "owner lock: candidate is a complete regular file" "$candidate"
+  _assert_file "owner lock: fixed lock is a regular file" \
+    "$root/lifecycle.lock"
+  if [[ -f "$candidate" && "$candidate" -ef "$root/lifecycle.lock" ]]; then
+    _pass "owner lock: fixed lock is the candidate hard link"
+  else
+    _fail "owner lock: fixed lock is the candidate hard link"
+  fi
+  _assert_contains "owner lock: records current pid" $'pid\t'"$$" "$content"
+  _assert_contains "owner lock: records process start identity" \
+    $'start\t' "$content"
+  _assert_contains "owner lock: records random nonce" $'nonce\t' "$content"
+  _assert_eq "owner lock: protects owner record" 600 \
+    "$(file_mode "$root/lifecycle.lock")"
+
+  fwdports_lock_release "$root" "$candidate"
+  _assert_not_exists "owner lock: release removes fixed link" \
+    "$root/lifecycle.lock"
+  _assert_not_exists "owner lock: release removes candidate" "$candidate"
+}
+
+live_lock_case() {
+  local tmp home state root first second error status
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  error="$tmp/error"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  first=$(fwdports_lock_acquire "$root")
+
+  set +e
+  second=$(fwdports_lock_acquire "$root" 2>"$error")
+  status=$?
+  _assert_exit "owner lock: live owner keeps lock" 75 "$status"
+  _assert_eq "owner lock: contender receives no candidate" "" "$second"
+  if [[ "$first" -ef "$root/lifecycle.lock" ]]; then
+    _pass "owner lock: contender leaves live lock unchanged"
+  else
+    _fail "owner lock: contender leaves live lock unchanged"
+  fi
+  _assert_contains "owner lock: live conflict is actionable" \
+    "already locked" "$(<"$error")"
+  fwdports_lock_release "$root" "$first"
+}
+
+stale_lock_case() {
+  local tmp home state root stale candidate error status
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  error="$tmp/error"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  mkdir -p "$root/lock-candidates"
+  chmod 0700 "$root/lock-candidates"
+  stale="$root/lock-candidates/candidate.stale000"
+  printf '%s\n' \
+    $'version\t1' \
+    $'nonce\tcandidate.stale000' \
+    $'uid\t'"$(id -u)" \
+    $'pid\t99999999' \
+    $'start\tlinux:1' >"$stale"
+  chmod 0600 "$stale"
+  ln "$stale" "$root/lifecycle.lock"
+
+  set +e
+  candidate=$(fwdports_lock_acquire "$root" 2>"$error")
+  status=$?
+
+  _assert_exit "owner lock: stale owner is recovered" 0 "$status"
+  _assert_not_exists "owner lock: stale candidate is collected" "$stale"
+  if [[ -f "$candidate" && "$candidate" -ef "$root/lifecycle.lock" ]]; then
+    _pass "owner lock: recovered lock belongs to new candidate"
+  else
+    _fail "owner lock: recovered lock belongs to new candidate"
+  fi
+  fwdports_lock_release "$root" "$candidate"
+}
+
+orphan_candidate_case() {
+  local tmp home state root orphan candidate
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  mkdir -p "$root/lock-candidates"
+  chmod 0700 "$root/lock-candidates"
+  orphan="$root/lock-candidates/candidate.orphan00"
+  printf '%s\n' \
+    $'version\t1' \
+    $'nonce\tcandidate.orphan00' \
+    $'uid\t'"$(id -u)" \
+    $'pid\t99999999' \
+    $'start\tlinux:1' >"$orphan"
+  chmod 0600 "$orphan"
+
+  candidate=$(fwdports_lock_acquire "$root")
+  _assert_not_exists "owner lock: dead orphan candidate is collected" "$orphan"
+  if [[ "$candidate" -ef "$root/lifecycle.lock" ]]; then
+    _pass "owner lock: orphan collection does not impede acquisition"
+  else
+    _fail "owner lock: orphan collection does not impede acquisition"
+  fi
+  fwdports_lock_release "$root" "$candidate"
+}
+
+concurrent_contenders_case() {
+  local tmp home state root out1 out2 status1 status2 combined candidate
+  local contender1 contender2
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  out1="$tmp/out1"
+  out2="$tmp/out2"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+
+  (
+    set +e
+    fwdports_lock_acquire "$root" >"$out1" 2>"$tmp/err1"
+    printf '%s\n' "$?" >"$tmp/status1"
+  ) &
+  contender1=$!
+  (
+    set +e
+    fwdports_lock_acquire "$root" >"$out2" 2>"$tmp/err2"
+    printf '%s\n' "$?" >"$tmp/status2"
+  ) &
+  contender2=$!
+  wait "$contender1"
+  wait "$contender2"
+  status1=$(<"$tmp/status1")
+  status2=$(<"$tmp/status2")
+  combined=$(printf '%s\n%s\n' "$status1" "$status2" | sort -n)
+
+  _assert_eq "owner lock: exactly one concurrent contender wins" \
+    $'0\n75' "$combined"
+  if [[ $status1 -eq 0 ]]; then
+    candidate=$(<"$out1")
+  else
+    candidate=$(<"$out2")
+  fi
+  if [[ "$candidate" -ef "$root/lifecycle.lock" ]]; then
+    _pass "owner lock: winning contender owns fixed link"
+  else
+    _fail "owner lock: winning contender owns fixed link"
+  fi
+  fwdports_lock_release "$root" "$candidate"
+}
+
+immutable_manifest_case() {
+  local tmp home state root source generation manifest before after digest
+  local generation2
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  source="$tmp/resolved-profile"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    >"$source"
+  chmod 0600 "$source"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+
+  generation=$(fwdports_generation_create "$root" "$source")
+  manifest=$generation/manifest
+  before=$(<"$manifest")
+  digest=$(fwdports_generation_manifest_digest "$generation")
+
+  if [[ -d "$generation" && ! -L "$generation" ]]; then
+    _pass "generation manifest: final directory exists before publication"
+  else
+    _fail "generation manifest: final directory exists before publication"
+  fi
+  _assert_file "generation manifest: is a regular file" "$manifest"
+  _assert_eq "generation manifest: protects desired state" 600 \
+    "$(file_mode "$manifest")"
+  _assert_contains "generation manifest: binds its stable nonce" \
+    $'generation\t'"${generation##*/}" "$before"
+  _assert_contains "generation manifest: preserves resolved records" \
+    $'set\tweb\thost\tshell.example.com' "$before"
+  if [[ $digest =~ ^[0-9a-f]{64}$ ]]; then
+    _pass "generation manifest: has a portable SHA-256 digest"
+  else
+    _fail "generation manifest: has a portable SHA-256 digest"
+  fi
+
+  # The source is desired-state input, not generation state. Later edits must
+  # not change the stable file that drivers and pointers authenticate.
+  printf '%s\n' $'set\tweb\thost\tchanged.example.com' >>"$source"
+  after=$(<"$manifest")
+  _assert_eq "generation manifest: source changes cannot alter snapshot" \
+    "$before" "$after"
+  _assert_eq "generation manifest: digest remains bound to snapshot" \
+    "$digest" "$(fwdports_generation_manifest_digest "$generation")"
+
+  generation2=$(fwdports_generation_create "$root" "$source")
+  _assert_ne "generation manifest: each start gets a distinct final path" \
+    "$generation" "$generation2"
+}
+
+mutable_control_case() {
+  local tmp home state root source generation digest control before after
+  local error status inode_before inode_after
+  tmp=$(_tmpdir) || return 1
+  home="$tmp/home"
+  state="$tmp/state"
+  source="$tmp/resolved-profile"
+  error="$tmp/error"
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
+    >"$source"
+  chmod 0600 "$source"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  generation=$(fwdports_generation_create "$root" "$source")
+  digest=$(fwdports_generation_manifest_digest "$generation")
+  control=$generation/control
+
+  fwdports_control_write "$generation" "$digest" preparing running \
+    none none 0 0 unknown
+  before=$(<"$control")
+  inode_before=$(_fwdports_runtime_identity "$control")
+  _assert_file "generation control: is a regular file" "$control"
+  _assert_eq "generation control: protects observed state" 600 \
+    "$(file_mode "$control")"
+  _assert_contains "generation control: binds generation" \
+    $'generation\t'"${generation##*/}" "$before"
+  _assert_contains "generation control: binds manifest digest" \
+    $'manifest-digest\t'"$digest" "$before"
+  _assert_contains "generation control: records initial phase" \
+    $'phase\tpreparing' "$before"
+
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$(_fwdports_process_start_identity "$$")" 0 0 passing
+  after=$(<"$control")
+  inode_after=$(_fwdports_runtime_identity "$control")
+  _assert_contains "generation control: atomically replaces phase" \
+    $'phase\trunning' "$after"
+  _assert_ne "generation control: replacement publishes a new inode" \
+    "$inode_before" "$inode_after"
+
+  set +e
+  fwdports_control_write "$generation" \
+    "0000000000000000000000000000000000000000000000000000000000000000" \
+    failed stopped \
+    none none 1 0 failing 2>"$error"
+  status=$?
+  _assert_exit "generation control: wrong manifest binding is rejected" \
+    1 "$status"
+  _assert_eq "generation control: rejected update preserves old bytes" \
+    "$after" "$(<"$control")"
+  _assert_contains "generation control: binding failure is actionable" \
+    "manifest changed" "$(<"$error")"
+}
+
+control_replacement_read_case() {
+  local tmp fixture root generation digest control old replacement fake_bin
+  local output error status record
+  tmp=$(_tmpdir) || return 1
+  fixture=$(pointer_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  control=$generation/control
+  old=$tmp/old-control
+  replacement=$tmp/new-control
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  error=$tmp/error
+  cp "$control" "$old"
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$(_fwdports_process_start_identity "$$")" 0 0 passing
+  cp "$control" "$replacement"
+  mv -f -- "$old" "$control"
+  chmod 0600 "$control" "$replacement"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -c && ${2:-} == *:* && ${*: -1} == "$CONTROL" ]]; then' \
+    '  count=0; [[ ! -f "$COUNT" ]] || count=$(<"$COUNT")' \
+    '  count=$((count + 1)); printf "%s\\n" "$count" >"$COUNT"' \
+    '  if [[ $count -eq 2 ]]; then /bin/mv -f -- "$REPLACEMENT" "$CONTROL"; fi' \
+    'fi' \
+    'exec /usr/bin/stat "$@"' \
+    >"$fake_bin/stat"
+  chmod 0700 "$fake_bin/stat"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" CONTROL=$control REPLACEMENT=$replacement \
+    COUNT=$tmp/stat-count \
+    fwdports_control_read "$generation" "$digest" >"$output" 2>"$error"
+  status=$?
+  record=
+  [[ -f "$output" ]] && record=$(<"$output")
+
+  _assert_exit "control read race: atomic replacement is retryable" 0 "$status"
+  _assert_contains "control read race: returns one complete new record" \
+    $'running\trunning\t' "$record"
+  _assert_not_contains "control read race: never returns old preparing phase" \
+    $'preparing\trunning\t' "$record"
+  _assert_eq "control read race: has no corruption diagnostic" \
+    "" "$(<"$error")"
+}
+
+pending_pointer_case() {
+  local tmp fixture root generation digest pointer output error status
+  local status_read
+  tmp=$(_tmpdir) || return 1
+  fixture=$(pointer_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  pointer=$root/pending
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_pointer_publish "$root" pending "$generation" "$digest" \
+    2>"$error"
+  status=$?
+  fwdports_pointer_read "$root" pending >"$output" 2>>"$error"
+  status_read=$?
+
+  _assert_exit "pending pointer: publication succeeds" 0 "$status"
+  _assert_exit "pending pointer: verified read succeeds" 0 "$status_read"
+  _assert_file "pending pointer: is a small regular file" "$pointer"
+  _assert_eq "pending pointer: protects publication" 600 \
+    "$(file_mode "$pointer")"
+  _assert_eq "pending pointer: resolves exact generation and digest" \
+    "$generation"$'\t'"$digest" "$(<"$output")"
+  _assert_eq "pending pointer: emits no diagnostic" "" "$(<"$error")"
+}
+
+active_pointer_case() {
+  local tmp fixture root generation digest output error status record
+  local status_read
+  tmp=$(_tmpdir) || return 1
+  fixture=$(pointer_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  output=$tmp/output
+  error=$tmp/error
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$(_fwdports_process_start_identity "$$")" 0 0 unknown
+
+  set +e
+  fwdports_pointer_publish "$root" active "$generation" "$digest" \
+    2>"$error"
+  status=$?
+  record=$(fwdports_pointer_read "$root" active 2>>"$error")
+  status_read=$?
+
+  _assert_exit "active pointer: publication succeeds" 0 "$status"
+  _assert_exit "active pointer: verified read succeeds" 0 "$status_read"
+  _assert_eq "active pointer: resolves exact generation and digest" \
+    "$generation"$'\t'"$digest" "$record"
+  if [[ ! -e "$root/pending" && ! -L "$root/pending" ]]; then
+    _pass "active pointer: does not create pending implicitly"
+  else
+    _fail "active pointer: does not create pending implicitly"
+  fi
+  _assert_eq "active pointer: emits no diagnostic" "" "$(<"$error")"
+}
+
+tampered_pointer_case() {
+  local tmp fixture root generation digest pointer error output status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(pointer_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  pointer=$root/pending
+  error=$tmp/error
+  output=$tmp/output
+  fwdports_pointer_publish "$root" pending "$generation" "$digest"
+
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\t'"${generation##*/}" \
+    $'manifest-digest\t0000000000000000000000000000000000000000000000000000000000000000' \
+    >"$pointer"
+  chmod 0600 "$pointer"
+  set +e
+  fwdports_pointer_read "$root" pending >"$output" 2>"$error"
+  status=$?
+
+  _assert_exit "tampered pointer: digest mismatch is rejected" 1 "$status"
+  _assert_eq "tampered pointer: yields no generation authority" \
+    "" "$(<"$output")"
+  _assert_contains "tampered pointer: diagnostic names manifest mismatch" \
+    "manifest digest does not match" "$(<"$error")"
+  _assert_file "tampered pointer: evidence is retained for diagnosis" \
+    "$pointer"
+}
+
+pointer_replacement_case() {
+  local tmp fixture root generation digest old_bytes second_source second
+  local second_digest fake_bin error status leftovers
+  tmp=$(_tmpdir) || return 1
+  fixture=$(pointer_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  fwdports_pointer_publish "$root" pending "$generation" "$digest"
+  old_bytes=$(<"$root/pending")
+
+  second_source=$tmp/second-profile
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tother' \
+    $'leg\tdb\tssh' \
+    $'set\tdb\thost\tdb.example.com' \
+    $'set\tdb\tremote-forward\t127.0.0.1:9090:127.0.0.1:90' \
+    >"$second_source"
+  chmod 0600 "$second_source"
+  second=$(fwdports_generation_create "$root" "$second_source")
+  second_digest=$(fwdports_generation_manifest_digest "$second")
+  fwdports_control_write "$second" "$second_digest" preparing running \
+    none none 0 0 unknown
+
+  fake_bin=$tmp/bin
+  error=$tmp/error
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "simulated pointer rename failure" >&2' \
+    'exit 99' >"$fake_bin/mv"
+  chmod 0700 "$fake_bin/mv"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    fwdports_pointer_publish "$root" pending "$second" "$second_digest" \
+      2>"$error"
+  status=$?
+  leftovers=$(compgen -G "$root/.pending.*" || true)
+
+  _assert_exit "pointer replacement: rename failure is reported" 1 "$status"
+  _assert_eq "pointer replacement: old publication survives failure" \
+    "$old_bytes" "$(<"$root/pending")"
+  _assert_eq "pointer replacement: failed temporary file is removed" \
+    "" "$leftovers"
+  _assert_contains "pointer replacement: underlying failure is visible" \
+    "simulated pointer rename failure" "$(<"$error")"
+}
+
+cleanup_boundary_case() {
+  local tmp fixture root generation digest outside root_sentinel sibling
+  local dangling status error
+  tmp=$(_tmpdir) || return 1
+  fixture=$(pointer_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  outside=$tmp/outside-sentinel
+  root_sentinel=$root/root-sentinel
+  sibling=$root/generations/generation.sibling00
+  dangling=$tmp/missing-target
+  error=$tmp/error
+  printf '%s\n' outside >"$outside"
+  printf '%s\n' root >"$root_sentinel"
+  mkdir -p "$sibling" "$generation/links"
+  chmod 0700 "$sibling" "$generation/links"
+  printf '%s\n' sibling >"$sibling/sentinel"
+  ln -s "$outside" "$generation/links/outside"
+  ln -s "$dangling" "$generation/links/dangling"
+  fwdports_pointer_publish "$root" pending "$generation" "$digest"
+  fwdports_pointer_remove "$root" pending "$generation" "$digest"
+
+  set +e
+  fwdports_generation_remove "$root" "$generation" "$digest" 2>"$error"
+  status=$?
+
+  _assert_exit "cleanup boundary: authenticated generation removal succeeds" \
+    0 "$status"
+  _assert_not_exists "cleanup boundary: removes only target generation" \
+    "$generation"
+  _assert_file "cleanup boundary: preserves outside symlink target" "$outside"
+  _assert_file "cleanup boundary: preserves runtime-root sibling" "$root_sentinel"
+  _assert_file "cleanup boundary: preserves generation-shaped sibling" \
+    "$sibling/sentinel"
+  _assert_not_exists "cleanup boundary: follows no dangling target" "$dangling"
+  _assert_eq "cleanup boundary: emits no diagnostic" "" "$(<"$error")"
+}
+
+run_case private-root private_root_case
+run_case foreign-owned-file foreign_owned_file_case
+run_case writable-file writable_file_case
+run_case unsafe-parent unsafe_parent_case
+run_case safe-overlay-symlink safe_overlay_symlink_case
+run_case unsafe-symlink unsafe_symlink_case
+run_case replacement-race replacement_race_case
+run_case atomic-owner-lock atomic_owner_lock_case
+run_case live-lock live_lock_case
+run_case stale-lock stale_lock_case
+run_case orphan-candidate orphan_candidate_case
+run_case concurrent-contenders concurrent_contenders_case
+run_case immutable-manifest immutable_manifest_case
+run_case mutable-control mutable_control_case
+run_case control-replacement-read control_replacement_read_case
+run_case pending-pointer pending_pointer_case
+run_case active-pointer active_pointer_case
+run_case tampered-pointer tampered_pointer_case
+run_case pointer-replacement pointer_replacement_case
+run_case cleanup-boundary cleanup_boundary_case
+_test_summary

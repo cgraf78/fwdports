@@ -20,3 +20,9 @@ Process-group, signal, tmux, and listener suites remain sequential because
 parallel load weakens their timing and ownership evidence. Fakes are used at
 external executable boundaries, while real tmux/process/autossh integration
 tests prove the behavior those fakes cannot establish.
+
+Runtime tests deliberately force atomic-replacement races and crash seams.
+They distinguish a complete old/new control record—which readers may retry—
+from malformed ownership evidence, which must fail closed. Cleanup cases place
+sentinels beside generations and behind symlinks so future refactors prove the
+destructive boundary rather than merely asserting the expected target vanished.

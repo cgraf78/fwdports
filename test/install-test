@@ -22,7 +22,8 @@ fixture_checkout() {
     cp "$ROOT/bin/fwdports" "$destination/bin/fwdports"
     chmod +x "$destination/bin/fwdports"
   fi
-  for library in config.sh drivers.sh ssh-gate.sh; do
+  for library in config.sh controller.sh drivers.sh runtime.sh ssh-gate.sh \
+    tmux.sh; do
     if [[ -f "$ROOT/lib/fwdports/$library" ]]; then
       cp "$ROOT/lib/fwdports/$library" \
         "$destination/lib/fwdports/$library"

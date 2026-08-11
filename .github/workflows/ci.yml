@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     # main is the only maintained branch. Keep this aligned with the protected
-    # default branch when the remote repository is eventually created.
+    # default branch so a direct branch-policy change cannot silently narrow CI.
     branches: [main]
   pull_request:
   schedule:

@@ -1,7 +1,9 @@
 # fwdports
 
 ![CI](https://github.com/cgraf78/fwdports/actions/workflows/ci.yml/badge.svg)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Termux-lightgrey.svg)](#)
 
 `fwdports` keeps a declared set of SSH port forwards alive in one inspectable
 tmux session. It uses ordinary foreground OpenSSH by default, supports autossh

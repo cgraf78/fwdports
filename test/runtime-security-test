@@ -524,6 +524,45 @@ newline_lock_pointer_case() {
     "$candidate"
 }
 
+newline_normalizing_readlink_case() {
+  local tmp home state root candidate fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$home" "$state" "$fake_bin"
+  chmod 0700 "$home" "$state" "$fake_bin"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  _fwdports_lock_prepare_candidates "$root" || return 1
+  candidate=$root/lock-candidates/candidate.newline0
+  _fwdports_lock_write_owner "$candidate" candidate.newline0
+  ln -s $'lock-candidates/candidate.newline0\n' "$root/lifecycle.lock"
+
+  # Some readlink implementations normalize a trailing target newline into
+  # the same byte stream used for an ordinary output delimiter. Simulate that
+  # behavior so Linux still exercises the independent inode-binding check.
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "printf '%s\\n' 'lock-candidates/candidate.newline0'" \
+    >"$fake_bin/readlink"
+  chmod 0700 "$fake_bin/readlink"
+
+  set +e
+  PATH="$fake_bin:$PATH" \
+    _fwdports_lock_candidate_for "$root" "$root/lifecycle.lock" \
+    >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: normalized newline pointer is rejected" 2 \
+    "$status"
+  _assert_eq "owner lock: normalized newline grants no authority" \
+    "" "$(<"$output")"
+  _assert_file "owner lock: normalized newline candidate is untouched" \
+    "$candidate"
+}
+
 escaping_lock_pointer_case() {
   local tmp home state root outside error status absolute mismatch
   tmp=$(_tmpdir) || return 1
@@ -967,6 +1006,7 @@ run_case lock-publication-failure lock_publication_failure_case
 run_case candidate-directory-symlink candidate_directory_symlink_case
 run_case directory-pointer-publication directory_pointer_publication_case
 run_case newline-lock-pointer newline_lock_pointer_case
+run_case newline-normalizing-readlink newline_normalizing_readlink_case
 run_case escaping-lock-pointer escaping_lock_pointer_case
 run_case retargeted-lock-release retargeted_lock_release_case
 run_case immutable-manifest immutable_manifest_case

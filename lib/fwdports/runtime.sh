@@ -420,6 +420,11 @@ _fwdports_lock_candidate_for() {
     return 2
   candidate=$root/$pointer_target
   [[ -f "$candidate" && ! -L "$candidate" ]] || return 2
+  # Bind the parsed text back to the kernel-resolved directory entry. Besides
+  # narrowing pointer races, this catches readlink implementations that render
+  # a trailing target newline like their normal output delimiter: the actual
+  # link remains dangling and therefore cannot be the candidate's inode.
+  [[ "$owner_file" -ef "$candidate" ]] || return 2
 
   record=$(_fwdports_lock_read_owner "$candidate") || return 2
   IFS=$'\t' read -r nonce uid pid start target <<<"$record"

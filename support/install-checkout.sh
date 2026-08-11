@@ -24,6 +24,8 @@ fi
 # become an accidental part of the published contract.
 LIBRARY_SOURCES=(
   "$ROOT/lib/fwdports/config.sh"
+  "$ROOT/lib/fwdports/drivers.sh"
+  "$ROOT/lib/fwdports/ssh-gate.sh"
 )
 for source in "${LIBRARY_SOURCES[@]}"; do
   if [[ ! -f "$source" ]]; then

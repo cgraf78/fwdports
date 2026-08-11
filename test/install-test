@@ -22,10 +22,12 @@ fixture_checkout() {
     cp "$ROOT/bin/fwdports" "$destination/bin/fwdports"
     chmod +x "$destination/bin/fwdports"
   fi
-  if [[ -f "$ROOT/lib/fwdports/config.sh" ]]; then
-    cp "$ROOT/lib/fwdports/config.sh" \
-      "$destination/lib/fwdports/config.sh"
-  fi
+  for library in config.sh drivers.sh ssh-gate.sh; do
+    if [[ -f "$ROOT/lib/fwdports/$library" ]]; then
+      cp "$ROOT/lib/fwdports/$library" \
+        "$destination/lib/fwdports/$library"
+    fi
+  done
 }
 
 run_delegate() {
@@ -35,7 +37,6 @@ run_delegate() {
   PREFIX=$prefix bash "$checkout/support/install-checkout.sh" "$@" \
     >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
   DELEGATE_OUTPUT=$(<"$output")
 }
 
@@ -92,7 +93,6 @@ custom_prefix_bin_dir_case() {
   PREFIX=$prefix BIN_DIR=$bin_dir \
     bash "$checkout/support/install-checkout.sh" >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
 
   _assert_exit "installer destinations: custom BIN_DIR succeeds" 0 \
     "$DELEGATE_STATUS"
@@ -208,7 +208,6 @@ single_link_failure_preserves_old_target_case() {
   PATH="$fake_bin:$PATH" PREFIX=$prefix \
     bash "$new_checkout/support/install-checkout.sh" >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
 
   _assert_exit "installer publication: rename failure is preserved" 73 \
     "$DELEGATE_STATUS"
@@ -254,7 +253,6 @@ direct_generated_delegation_case() {
     CGRAF78_CHECKOUT_INSTALL_DIR="$tmp/managed" \
     bash "$ROOT/install.sh" >"$output" 2>&1
   DELEGATE_STATUS=$?
-  set -e
   DELEGATE_OUTPUT=$(<"$output")
 
   _assert_exit "generated installer: checkout delegation succeeds" 0 \

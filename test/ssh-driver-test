@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# Case callbacks are passed by name to the shared harness.
+# shellcheck disable=SC2329
+# Single-quoted lines below are literal fixture scripts expanded by the child.
+# shellcheck disable=SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/drivers.sh
+source "$ROOT/lib/fwdports/drivers.sh"
+
+resolve_executable_case() {
+  local tmp fake_bin output error status content
+  tmp=$(_tmpdir) || return 1
+  fake_bin="$tmp/bin"
+  output="$tmp/identity"
+  error="$tmp/error"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then' \
+    "  printf '%s\\n' 'OpenSSH_9.9p1, test crypto' >&2" \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$fake_bin/ssh"
+  chmod 0755 "$fake_bin/ssh"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    fwdports_ssh_resolve ssh "$output" 2>"$error"
+  status=$?
+  content=
+  [[ -f "$output" ]] && content=$(<"$output")
+
+  _assert_exit "ssh executable: resolves" 0 "$status"
+  _assert_contains "ssh executable: records canonical path" \
+    $'path\t'"$fake_bin/ssh" "$content"
+  _assert_contains "ssh executable: records OpenSSH version" \
+    $'version\tOpenSSH_9.9p1' "$content"
+  _assert_contains "ssh executable: records file identity" \
+    $'identity\t' "$content"
+  _assert_eq "ssh executable: no diagnostics" "" "$(<"$error")"
+}
+
+effective_digest_case() {
+  local tmp fake_ssh argv_file output error log status expected content
+  tmp=$(_tmpdir) || return 1
+  fake_ssh="$tmp/ssh"
+  argv_file="$tmp/argv"
+  output="$tmp/digest"
+  error="$tmp/error"
+  log="$tmp/log"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$@" >"$FWDPORTS_TEST_SSH_LOG"' \
+    "printf '%s\\n' 'hostname shell.example.com' 'user example' 'port 22'" \
+    'exit 0' >"$fake_ssh"
+  chmod 0755 "$fake_ssh"
+  printf '%s\n' '-N' '-T' '-o' 'ControlMaster=no' >"$argv_file"
+  expected=$(printf '%s\n' \
+    'hostname shell.example.com' 'user example' 'port 22' | sha256sum)
+  expected=${expected%% *}
+
+  set +e
+  FWDPORTS_TEST_SSH_LOG=$log \
+    fwdports_ssh_effective_digest "$fake_ssh" shell.example.com \
+      "$argv_file" "$output" 2>"$error"
+  status=$?
+  content=
+  [[ -f "$output" ]] && content=$(<"$output")
+
+  _assert_exit "ssh effective config: digest succeeds" 0 "$status"
+  _assert_eq "ssh effective config: complete normalized digest" \
+    "$expected" "$content"
+  _assert_not_contains "ssh effective config: raw host is not persisted" \
+    "shell.example.com" "$content"
+  _assert_contains "ssh effective config: invokes config expansion" \
+    "-G" "$(<"$log")"
+}
+
+lifecycle_options_case() {
+  local tmp manifest argv_file target_file error status argv
+  tmp=$(_tmpdir) || return 1
+  manifest="$tmp/manifest"
+  argv_file="$tmp/argv"
+  target_file="$tmp/target"
+  error="$tmp/error"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:8080' \
+    $'set\tweb\tserver-alive-interval\t15' >"$manifest"
+
+  set +e
+  fwdports_ssh_build_argv "$manifest" web '' "$argv_file" \
+    "$target_file" 2>"$error"
+  status=$?
+  argv=
+  [[ -f "$argv_file" ]] && argv=$(<"$argv_file")
+
+  _assert_exit "ssh argv: lifecycle options build" 0 "$status"
+  _assert_contains "ssh argv: no session" $'-N\n-T' "$argv"
+  _assert_contains "ssh argv: disables control socket selection" \
+    $'-S\nnone' "$argv"
+  _assert_contains "ssh argv: disables multiplexing" \
+    $'-o\nControlMaster=no\n-o\nControlPersist=no' "$argv"
+  _assert_contains "ssh argv: disables tunnel devices" \
+    $'-o\nTunnel=no' "$argv"
+  _assert_contains "ssh argv: fails closed on forward setup" \
+    $'-o\nExitOnForwardFailure=yes' "$argv"
+  _assert_contains "ssh argv: forwards as distinct argv" \
+    $'-L\n127.0.0.1:8080:127.0.0.1:8080' "$argv"
+  _assert_not_contains "ssh argv: never backgrounds itself" "-f" "$argv"
+  _assert_eq "ssh argv: target is separate" \
+    "shell.example.com" "$(<"$target_file")"
+}
+
+inherited_forward_rejected_case() {
+  local tmp fake_ssh argv_file output error status diagnostic
+  tmp=$(_tmpdir) || return 1
+  fake_ssh="$tmp/ssh"
+  argv_file="$tmp/argv"
+  output="$tmp/digest"
+  error="$tmp/error"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "printf '%s\\n' 'hostname shell.example.com'" \
+    "printf '%s\\n' 'localforward 127.0.0.1:9000 127.0.0.1:9000'" \
+    'exit 0' >"$fake_ssh"
+  chmod 0755 "$fake_ssh"
+  printf '%s\n' '-N' '-T' >"$argv_file"
+
+  set +e
+  fwdports_ssh_effective_digest "$fake_ssh" shell.example.com \
+    "$argv_file" "$output" 2>"$error"
+  status=$?
+  diagnostic=$(<"$error")
+
+  _assert_exit "ssh ambient config: inherited forward is rejected" 1 "$status"
+  _assert_contains "ssh ambient config: rejection is actionable" \
+    "ambient SSH forwarding is not allowed" "$diagnostic"
+  _assert_not_contains "ssh ambient config: diagnostic omits raw endpoint" \
+    "127.0.0.1:9000" "$diagnostic"
+  _assert_not_exists "ssh ambient config: rejected digest is unpublished" \
+    "$output"
+}
+
+retry_gate_case() {
+  local tmp fake_ssh config_source launch_log argv_file identity digest
+  local gate_dir error status before after marker
+  tmp=$(_tmpdir) || return 1
+  fake_ssh="$tmp/ssh"
+  config_source="$tmp/effective"
+  launch_log="$tmp/launch-log"
+  argv_file="$tmp/argv"
+  identity="$tmp/identity"
+  digest="$tmp/digest"
+  gate_dir="$tmp/generation"
+  error="$tmp/error"
+  printf '%s\n' 'hostname shell.example.com' 'user example' >"$config_source"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then' \
+    "  printf '%s\\n' 'OpenSSH_9.9p1' >&2" \
+    '  exit 0' \
+    'fi' \
+    'if [[ ${1:-} == -G ]]; then' \
+    '  cat "$FWDPORTS_TEST_EFFECTIVE_CONFIG"' \
+    '  exit 0' \
+    'fi' \
+    'printf "%s\\n" "$*" >>"$FWDPORTS_TEST_LAUNCH_LOG"' \
+    'exit 0' >"$fake_ssh"
+  chmod 0755 "$fake_ssh"
+  printf '%s\n' '-N' '-T' >"$argv_file"
+  FWDPORTS_TEST_EFFECTIVE_CONFIG=$config_source \
+    fwdports_ssh_resolve "$fake_ssh" "$identity"
+  FWDPORTS_TEST_EFFECTIVE_CONFIG=$config_source \
+    fwdports_ssh_effective_digest "$fake_ssh" shell.example.com \
+      "$argv_file" "$digest"
+
+  set +e
+  fwdports_ssh_prepare_gate "$gate_dir" "$identity" "$digest" 2>"$error"
+  status=$?
+  _assert_exit "ssh retry gate: generation gate is prepared" 0 "$status"
+
+  FWDPORTS_TEST_EFFECTIVE_CONFIG=$config_source \
+    FWDPORTS_TEST_LAUNCH_LOG=$launch_log \
+    "$gate_dir/ssh-gate" -N -T shell.example.com
+  status=$?
+  _assert_exit "ssh retry gate: matching generation launches" 0 "$status"
+  before=$(<"$launch_log")
+
+  printf '%s\n' 'hostname changed.example.com' 'user example' >"$config_source"
+  FWDPORTS_TEST_EFFECTIVE_CONFIG=$config_source \
+    FWDPORTS_TEST_LAUNCH_LOG=$launch_log \
+    "$gate_dir/ssh-gate" -N -T shell.example.com 2>"$error"
+  status=$?
+  after=$(<"$launch_log")
+  marker=
+  [[ -f "$gate_dir/ssh-drift" ]] && marker=$(<"$gate_dir/ssh-drift")
+  _assert_exit "ssh retry gate: config drift refuses launch" 78 "$status"
+  _assert_eq "ssh retry gate: drift launches no transport" "$before" "$after"
+  _assert_eq "ssh retry gate: private marker names drift class" \
+    "ssh-config-drift" "$marker"
+  _assert_not_contains "ssh retry gate: marker contains no raw config" \
+    "changed.example.com" "$marker"
+}
+
+local_port_conflict_case() {
+  local tmp port_file listener port manifest argv_file target_file error
+  local status diagnostic index=0 alive=0
+  tmp=$(_tmpdir) || return 1
+  port_file="$tmp/port"
+  manifest="$tmp/manifest"
+  argv_file="$tmp/argv"
+  target_file="$tmp/target"
+  error="$tmp/error"
+  timeout 15 python3 - "$port_file" <<'PY' &
+import socket
+import sys
+import time
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+with open(sys.argv[1], "w", encoding="ascii") as output:
+    output.write(str(listener.getsockname()[1]))
+while True:
+    time.sleep(1)
+PY
+  listener=$!
+  while [[ ! -s "$port_file" && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  port=$(<"$port_file")
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    "set"$'\t'"web"$'\t'"local-forward"$'\t'"127.0.0.1:$port:127.0.0.1:80" \
+    >"$manifest"
+  fwdports_ssh_build_argv "$manifest" web '' "$argv_file" "$target_file"
+
+  set +e
+  fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  diagnostic=$(<"$error")
+  if kill -0 "$listener" 2>/dev/null; then
+    alive=1
+  fi
+  kill "$listener" 2>/dev/null || true
+  wait "$listener" 2>/dev/null || true
+
+  _assert_exit "local port conflict: occupied port is rejected" 1 "$status"
+  _assert_contains "local port conflict: diagnostic names port" \
+    "$port" "$diagnostic"
+  _assert_contains "local port conflict: diagnostic identifies inspection" \
+    "listener details" "$diagnostic"
+  _assert_eq "local port conflict: owner is not signalled" 1 "$alive"
+}
+
+remote_port_no_preflight_case() {
+  local tmp fake_bin argv_file marker error status
+  tmp=$(_tmpdir) || return 1
+  fake_bin="$tmp/bin"
+  argv_file="$tmp/argv"
+  marker="$tmp/inspected"
+  error="$tmp/error"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$FWDPORTS_TEST_INSPECTION_MARKER"' \
+    'exit 99' >"$fake_bin/lsof"
+  chmod 0755 "$fake_bin/lsof"
+  printf '%s\n' '-R' '127.0.0.1:9090:127.0.0.1:80' >"$argv_file"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_INSPECTION_MARKER=$marker \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+
+  _assert_exit "remote forward: no local preflight succeeds" 0 "$status"
+  _assert_not_exists "remote forward: local listener tool is not invoked" \
+    "$marker"
+  _assert_eq "remote forward: no diagnostic" "" "$(<"$error")"
+}
+
+run_case resolve-executable resolve_executable_case
+run_case effective-digest effective_digest_case
+run_case lifecycle-options lifecycle_options_case
+run_case inherited-forward-rejected inherited_forward_rejected_case
+run_case retry-gate retry_gate_case
+run_case local-port-conflict local_port_conflict_case
+run_case remote-port-no-preflight remote_port_no_preflight_case
+_test_summary

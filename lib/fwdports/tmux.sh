@@ -425,6 +425,32 @@ _fwdports_process_group_records() {
   printf '%s' "$records"
 }
 
+_fwdports_process_group_live_records() {
+  local wanted_pgid=$1 records status line pid sid tty state extra found=0
+  local live=''
+
+  if records=$(_fwdports_process_group_records "$wanted_pgid"); then
+    status=0
+  else
+    status=$?
+  fi
+  [[ $status -eq 0 ]] || return "$status"
+  while IFS= read -r line || [[ -n $line ]]; do
+    IFS=$'\t' read -r pid sid tty state extra <<<"$line"
+    [[ -z $extra && $pid =~ ^[0-9]+$ && $sid =~ ^[0-9]+$ &&
+      -n $tty && -n $state ]] || return 2
+    # Zombies and dead rows retain process-table identities until reaping, but
+    # they cannot execute, hold a forwarding socket, or receive another
+    # signal. Keep them in the full ownership snapshot above, while excluding
+    # them only from the question of whether cleanup still has live work.
+    [[ $state != Z* && $state != X* ]] || continue
+    live=$live$line$'\n'
+    found=1
+  done <<<"$records"
+  [[ $found -eq 1 ]] || return 1
+  printf '%s' "$live"
+}
+
 _fwdports_verify_owned_group() {
   local generation=$1 digest=$2 evidence=$3 record session pane leader
   local leader_start expected_tty expected_sid expected_pgid parent state
@@ -480,7 +506,7 @@ _fwdports_wait_group_empty() {
   local pgid=$1 attempts=$2 delay=$3 index=0 status
 
   while :; do
-    if _fwdports_process_group_records "$pgid" >/dev/null 2>&1; then
+    if _fwdports_process_group_live_records "$pgid" >/dev/null 2>&1; then
       status=0
     else
       status=$?

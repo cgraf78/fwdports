@@ -118,8 +118,11 @@ manifest is immutable; its control file is atomically replaceable observed
 state. It stores only the lifecycle phase, desired state, controller identity,
 and latest probe result; transport retry counters stay local to the transport
 that actually owns them. Small `pending` and `active` files identify a
-generation plus manifest digest. A fully written owner record is hard-linked
-atomically to claim the lifecycle lock, avoiding an ownerless lock state.
+generation plus manifest digest. A fully written owner record is published by
+an atomic, relative symlink to claim the lifecycle lock. The pointer is
+accepted only when its in-root candidate name, protected file, embedded nonce,
+and repeated target read agree. This avoids both an ownerless lock state and a
+hard-link dependency that Android application filesystems cannot provide.
 
 Tmux sessions carry a random generation nonce at creation. Core records pane,
 session, PID/start identity, tty, SID, and PGID evidence. Cleanup revalidates

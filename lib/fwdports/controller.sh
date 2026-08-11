@@ -356,6 +356,7 @@ _fwdports_cleanup_generation_drivers() {
     legs+=("$leg")
     drivers+=("$driver")
   done <"$generation/manifest"
+  [[ -n ${legs[0]+set} ]] || return 0
   # Cleanup unwinds preparation order.  Drivers may deliberately layer one
   # transport over another, so reversing declaration order is the only
   # predictable contract and mirrors ordinary stack unwinding.
@@ -424,7 +425,8 @@ _fwdports_stop_generation_locked() {
         record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
           "$evidence") || return 74
         IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$record"
-        if _fwdports_process_group_records "$pgid" >/dev/null 2>&1; then
+        if _fwdports_process_group_live_records "$pgid" \
+          >/dev/null 2>&1; then
           printf 'fwdports: recorded leader is gone but its group remains\n' >&2
           return 74
         else

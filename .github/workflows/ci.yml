@@ -28,7 +28,10 @@ jobs:
       profiles: base,python,tmux,openssh-netcat-lsof,procps
       shellcheck-inventory-path: .github/shellcheck-files.txt
       test-command: bash test/run
-      termux-profiles: runtime,python,tmux,openssh-netcat-lsof,procps
+      # The repository-owned installer authenticates checkout files through
+      # Git. Use the shared suite profile rather than a runtime-only image so
+      # Termux exercises that same trust boundary instead of skipping it.
+      termux-profiles: base,python,tmux,openssh-netcat-lsof,procps
 
   macos-bash32:
     name: Stock macOS Bash 3.2

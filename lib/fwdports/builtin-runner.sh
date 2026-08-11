@@ -16,7 +16,7 @@ while IFS= read -r element || [[ -n $element ]]; do
   [[ -n $element && $element != *$'\t'* && $element != *$'\r'* ]] || exit 70
   argv+=("$element")
 done <"$runtime/ssh-argv"
-[[ ${#argv[@]} -gt 0 ]] || exit 70
+[[ -n ${argv[0]+set} ]] || exit 70
 
 # Keep one foreground supervisor for both built-in transports. tmux tears a
 # pane down with HUP, but autossh may deliberately ignore HUP while its SSH

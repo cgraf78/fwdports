@@ -26,6 +26,7 @@ _fwdports_config_find_profile() {
   # Bash 3.2 cannot pass arrays by reference. These helpers deliberately use
   # Bash's dynamic function scope: `profile_names` and `found_index` are local
   # to the active resolver invocation, so no parser state leaks after return.
+  [[ -n ${profile_names[0]+set} ]] || return 1
   found_index=-1
   for ((index = 0; index < ${#profile_names[@]}; index++)); do
     if [[ ${profile_names[index]} == "$wanted" ]]; then
@@ -39,7 +40,7 @@ _fwdports_config_find_profile() {
 _fwdports_config_leg_exists() {
   local wanted=$1 line kind leg rest
 
-  for line in "${resolved[@]}"; do
+  for line in ${resolved[@]+"${resolved[@]}"}; do
     IFS=$'\t' read -r kind leg rest <<<"$line"
     if [[ $kind == leg && $leg == "$wanted" ]]; then
       return 0
@@ -105,17 +106,17 @@ _fwdports_config_resolve_profile() {
         # its driver identity. This keeps inheritance from changing transport
         # type indirectly while still allowing a child to rebuild its options.
         kept=()
-        for kept_record in "${resolved[@]}"; do
+        for kept_record in ${resolved[@]+"${resolved[@]}"}; do
           IFS=$'\t' read -r kept_kind kept_leg _kept_field _kept_value \
             _kept_extra <<<"$kept_record"
           if [[ $kept_leg == "$leg" &&
             ($kept_kind == set || $kept_kind == check ||
-              $kept_kind == failure) ]]; then
+            $kept_kind == failure) ]]; then
             continue
           fi
           kept+=("$kept_record")
         done
-        resolved=("${kept[@]}")
+        resolved=(${kept[@]+"${kept[@]}"})
         ;;
       *)
         printf 'fwdports: internal unsupported config record: %s\n' "$kind" >&2
@@ -167,7 +168,7 @@ fwdports_config_resolve() {
           return 1
         fi
         profile_name=${fields[1]}
-        for existing in "${profile_names[@]}"; do
+        for existing in ${profile_names[@]+"${profile_names[@]}"}; do
           if [[ $existing == "$profile_name" ]]; then
             _fwdports_config_error "$line_number" \
               "duplicate profile: $profile_name"
@@ -323,7 +324,13 @@ fwdports_config_resolve() {
   if ! {
     printf 'version\t1\n'
     printf 'profile\t%s\n' "$selected_profile"
-    printf '%s\n' "${resolved[@]}"
+    if [[ -n ${resolved[0]+set} ]]; then
+      printf '%s\n' "${resolved[@]}"
+    else
+      # Preserve the canonical empty-record line produced by printf on newer
+      # Bash while avoiding an unsafe empty-array expansion on Bash 3.2.
+      printf '\n'
+    fi
   } >"$tmp"; then
     rm -f -- "$tmp"
     printf 'fwdports: cannot write resolved config: %s\n' "$output" >&2

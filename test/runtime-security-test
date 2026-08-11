@@ -170,7 +170,7 @@ unsafe_symlink_case() {
 }
 
 replacement_race_case() {
-  local tmp anchor source destination fake_bin error status
+  local tmp anchor source destination fake_bin error status real_cp
   tmp=$(_tmpdir) || return 1
   anchor="$tmp/config"
   source="$anchor/driver"
@@ -181,14 +181,15 @@ replacement_race_case() {
   chmod 0700 "$anchor"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$source"
   chmod 0700 "$source"
+  real_cp=$(command -v cp) || return 1
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    '/bin/cp "$@"' \
+    '"$REAL_CP" "$@"' \
     'printf "# replaced\\n" >>"$1"' >"$fake_bin/cp"
   chmod 0700 "$fake_bin/cp"
 
   set +e
-  PATH="$fake_bin:/usr/bin:/bin" \
+  PATH="$fake_bin:$PATH" REAL_CP=$real_cp \
     fwdports_snapshot_trusted_file "$source" "$destination" "$anchor" \
     2>"$error"
   status=$?
@@ -218,19 +219,22 @@ atomic_owner_lock_case() {
 
   _assert_exit "owner lock: acquisition succeeds" 0 "$status"
   _assert_file "owner lock: candidate is a complete regular file" "$candidate"
-  _assert_file "owner lock: fixed lock is a regular file" \
-    "$root/lifecycle.lock"
-  if [[ -f "$candidate" && "$candidate" -ef "$root/lifecycle.lock" ]]; then
-    _pass "owner lock: fixed lock is the candidate hard link"
+  if [[ -L "$root/lifecycle.lock" ]]; then
+    _pass "owner lock: fixed lock is an atomic symbolic pointer"
   else
-    _fail "owner lock: fixed lock is the candidate hard link"
+    _fail "owner lock: fixed lock is an atomic symbolic pointer"
+  fi
+  if [[ $(readlink "$root/lifecycle.lock" 2>/dev/null) == "lock-candidates/${candidate##*/}" ]]; then
+    _pass "owner lock: fixed pointer names the exact candidate"
+  else
+    _fail "owner lock: fixed pointer names the exact candidate"
   fi
   _assert_contains "owner lock: records current pid" $'pid\t'"$$" "$content"
   _assert_contains "owner lock: records process start identity" \
     $'start\t' "$content"
   _assert_contains "owner lock: records random nonce" $'nonce\t' "$content"
   _assert_eq "owner lock: protects owner record" 600 \
-    "$(file_mode "$root/lifecycle.lock")"
+    "$(file_mode "$candidate")"
 
   fwdports_lock_release "$root" "$candidate"
   _assert_not_exists "owner lock: release removes fixed link" \
@@ -254,7 +258,7 @@ live_lock_case() {
   status=$?
   _assert_exit "owner lock: live owner keeps lock" 75 "$status"
   _assert_eq "owner lock: contender receives no candidate" "" "$second"
-  if [[ "$first" -ef "$root/lifecycle.lock" ]]; then
+  if [[ $(readlink "$root/lifecycle.lock" 2>/dev/null) == "lock-candidates/${first##*/}" ]]; then
     _pass "owner lock: contender leaves live lock unchanged"
   else
     _fail "owner lock: contender leaves live lock unchanged"
@@ -283,7 +287,7 @@ stale_lock_case() {
     $'pid\t99999999' \
     $'start\tlinux:1' >"$stale"
   chmod 0600 "$stale"
-  ln "$stale" "$root/lifecycle.lock"
+  ln -s "lock-candidates/${stale##*/}" "$root/lifecycle.lock"
 
   set +e
   candidate=$(fwdports_lock_acquire "$root" 2>"$error")
@@ -291,7 +295,7 @@ stale_lock_case() {
 
   _assert_exit "owner lock: stale owner is recovered" 0 "$status"
   _assert_not_exists "owner lock: stale candidate is collected" "$stale"
-  if [[ -f "$candidate" && "$candidate" -ef "$root/lifecycle.lock" ]]; then
+  if [[ -f "$candidate" && $(readlink "$root/lifecycle.lock" 2>/dev/null) == "lock-candidates/${candidate##*/}" ]]; then
     _pass "owner lock: recovered lock belongs to new candidate"
   else
     _fail "owner lock: recovered lock belongs to new candidate"
@@ -320,7 +324,7 @@ orphan_candidate_case() {
 
   candidate=$(fwdports_lock_acquire "$root")
   _assert_not_exists "owner lock: dead orphan candidate is collected" "$orphan"
-  if [[ "$candidate" -ef "$root/lifecycle.lock" ]]; then
+  if [[ $(readlink "$root/lifecycle.lock" 2>/dev/null) == "lock-candidates/${candidate##*/}" ]]; then
     _pass "owner lock: orphan collection does not impede acquisition"
   else
     _fail "owner lock: orphan collection does not impede acquisition"
@@ -365,12 +369,239 @@ concurrent_contenders_case() {
   else
     candidate=$(<"$out2")
   fi
-  if [[ "$candidate" -ef "$root/lifecycle.lock" ]]; then
+  if [[ $(readlink "$root/lifecycle.lock" 2>/dev/null) == "lock-candidates/${candidate##*/}" ]]; then
     _pass "owner lock: winning contender owns fixed link"
   else
     _fail "owner lock: winning contender owns fixed link"
   fi
   fwdports_lock_release "$root" "$candidate"
+}
+
+symlink_only_lock_filesystem_case() {
+  local tmp home state root fake_bin candidate error status real_ln
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  fake_bin=$tmp/bin
+  error=$tmp/error
+  mkdir -p "$home" "$state" "$fake_bin"
+  chmod 0700 "$home" "$state" "$fake_bin"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  real_ln=$(command -v ln) || return 1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ ${1:-} == -s ]] || exit 1' \
+    'exec "$REAL_LN" "$@"' \
+    >"$fake_bin/ln"
+  chmod 0700 "$fake_bin/ln"
+
+  set +e
+  candidate=$(PATH="$fake_bin:$PATH" REAL_LN=$real_ln \
+    fwdports_lock_acquire "$root" 2>"$error")
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: works without hard-link support" 0 "$status"
+  _assert_eq "owner lock: unsupported hard links emit no diagnostic" \
+    "" "$(<"$error")"
+  if [[ -L "$root/lifecycle.lock" &&
+    $(readlink "$root/lifecycle.lock") == "lock-candidates/${candidate##*/}" ]]; then
+    _pass "owner lock: publishes through the portable symbolic protocol"
+  else
+    _fail "owner lock: publishes through the portable symbolic protocol"
+  fi
+  fwdports_lock_release "$root" "$candidate"
+}
+
+lock_publication_failure_case() {
+  local tmp home state root fake_bin error status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  fake_bin=$tmp/bin
+  error=$tmp/error
+  mkdir -p "$home" "$state" "$fake_bin"
+  chmod 0700 "$home" "$state" "$fake_bin"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 93' >"$fake_bin/ln"
+  chmod 0700 "$fake_bin/ln"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    fwdports_lock_acquire "$root" >"$tmp/output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: publication capability failure is reported" \
+    1 "$status"
+  _assert_contains "owner lock: publication failure is actionable" \
+    "cannot publish lifecycle lock" "$(<"$error")"
+  _assert_not_contains "owner lock: publication failure is not contention" \
+    "already locked" "$(<"$error")"
+  _assert_not_exists "owner lock: publication failure leaves no pointer" \
+    "$root/lifecycle.lock"
+}
+
+candidate_directory_symlink_case() {
+  local tmp home state root outside error status leftovers
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  outside=$tmp/outside-candidates
+  error=$tmp/error
+  mkdir -p "$home" "$state" "$outside"
+  chmod 0700 "$home" "$state" "$outside"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  ln -s "$outside" "$root/lock-candidates"
+
+  set +e
+  fwdports_lock_acquire "$root" >"$tmp/output" 2>"$error"
+  status=$?
+  set -e
+  leftovers=$(compgen -G "$outside/candidate.*" || true)
+
+  _assert_exit "owner lock: symbolic candidate directory is rejected" \
+    1 "$status"
+  _assert_eq "owner lock: symbolic candidate directory receives no record" \
+    "" "$leftovers"
+  _assert_contains "owner lock: symbolic candidate directory is actionable" \
+    "candidate directory is untrusted" "$(<"$error")"
+}
+
+directory_pointer_publication_case() {
+  local tmp home state root candidate pointer_dir error status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  pointer_dir=$tmp/pointer-directory
+  error=$tmp/error
+  mkdir -p "$home" "$state" "$pointer_dir"
+  chmod 0700 "$home" "$state" "$pointer_dir"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  _fwdports_lock_prepare_candidates "$root" || return 1
+  candidate=$root/lock-candidates/candidate.directory0
+  _fwdports_lock_write_owner "$candidate" candidate.directory0
+  ln -s "$pointer_dir" "$root/lifecycle.lock"
+
+  set +e
+  _fwdports_lock_publish "$root" "$candidate" "$root/lifecycle.lock" \
+    2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: directory pointer is contention, not success" \
+    75 "$status"
+  _assert_not_exists "owner lock: directory pointer absorbs no child link" \
+    "$pointer_dir/${candidate##*/}"
+  _assert_eq "owner lock: directory pointer emits no tool diagnostic" \
+    "" "$(<"$error")"
+}
+
+newline_lock_pointer_case() {
+  local tmp home state root candidate output status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  output=$tmp/output
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  _fwdports_lock_prepare_candidates "$root" || return 1
+  candidate=$root/lock-candidates/candidate.newline0
+  _fwdports_lock_write_owner "$candidate" candidate.newline0
+  ln -s $'lock-candidates/candidate.newline0\n' "$root/lifecycle.lock"
+
+  set +e
+  _fwdports_lock_candidate_for "$root" "$root/lifecycle.lock" \
+    >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: newline-bearing pointer is rejected" 2 "$status"
+  _assert_eq "owner lock: newline-bearing pointer grants no authority" \
+    "" "$(<"$output")"
+  _assert_file "owner lock: newline target candidate remains untouched" \
+    "$candidate"
+}
+
+escaping_lock_pointer_case() {
+  local tmp home state root outside error status absolute mismatch
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  outside=$tmp/outside
+  error=$tmp/error
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  printf 'do not touch\n' >"$outside"
+  ln -s "../../outside" "$root/lifecycle.lock"
+
+  set +e
+  fwdports_lock_acquire "$root" >"$tmp/output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: escaping symbolic pointer is rejected" 74 \
+    "$status"
+  _assert_file "owner lock: escaping target remains untouched" "$outside"
+  _assert_contains "owner lock: escaping pointer is actionable" \
+    "ownership is invalid" "$(<"$error")"
+
+  rm -f -- "$root/lifecycle.lock"
+  absolute=$root/lock-candidates/candidate.absolute0
+  mkdir -p "$root/lock-candidates"
+  chmod 0700 "$root/lock-candidates"
+  _fwdports_lock_write_owner "$absolute" candidate.absolute0
+  ln -s "$absolute" "$root/lifecycle.lock"
+  set +e
+  fwdports_lock_acquire "$root" >"$tmp/output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "owner lock: absolute symbolic pointer is rejected" 74 \
+    "$status"
+  _assert_file "owner lock: absolute target remains untouched" "$absolute"
+
+  rm -f -- "$root/lifecycle.lock"
+  mismatch=$root/lock-candidates/candidate.pointer00
+  _fwdports_lock_write_owner "$mismatch" candidate.record000
+  ln -s "lock-candidates/${mismatch##*/}" "$root/lifecycle.lock"
+  set +e
+  fwdports_lock_acquire "$root" >"$tmp/output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "owner lock: mismatched pointer nonce is rejected" 74 \
+    "$status"
+  _assert_file "owner lock: mismatched owner record remains untouched" \
+    "$mismatch"
+}
+
+retargeted_lock_release_case() {
+  local tmp home state root first replacement error status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  error=$tmp/error
+  mkdir -p "$home" "$state"
+  chmod 0700 "$home" "$state"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init)
+  first=$(fwdports_lock_acquire "$root")
+  replacement=$root/lock-candidates/candidate.retarget0
+  _fwdports_lock_write_owner "$replacement" candidate.retarget0
+  rm -f -- "$root/lifecycle.lock"
+  ln -s "lock-candidates/${replacement##*/}" "$root/lifecycle.lock"
+
+  set +e
+  fwdports_lock_release "$root" "$first" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "owner lock: retargeted release is refused" 1 "$status"
+  _assert_file "owner lock: retargeted owner record is preserved" \
+    "$replacement"
+  _assert_contains "owner lock: retargeted release is actionable" \
+    "ownership no longer matches" "$(<"$error")"
+  rm -f -- "$root/lifecycle.lock" "$replacement" "$first"
 }
 
 immutable_manifest_case() {
@@ -495,7 +726,7 @@ mutable_control_case() {
 
 control_replacement_read_case() {
   local tmp fixture root generation digest control old replacement fake_bin
-  local output error status record
+  local output error status record real_stat real_mv identity_flag
   tmp=$(_tmpdir) || return 1
   fixture=$(pointer_fixture "$tmp") || return 1
   IFS=$'\t' read -r root generation digest <<<"$fixture"
@@ -511,21 +742,30 @@ control_replacement_read_case() {
   cp "$control" "$replacement"
   mv -f -- "$old" "$control"
   chmod 0600 "$control" "$replacement"
+  real_stat=$(command -v stat) || return 1
+  real_mv=$(command -v mv) || return 1
+  if "$real_stat" -c '%u:%a:%d:%i:%s:%Y' -- "$control" \
+    >/dev/null 2>&1; then
+    identity_flag=-c
+  else
+    identity_flag=-f
+  fi
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [[ ${1:-} == -c && ${2:-} == *:* && ${*: -1} == "$CONTROL" ]]; then' \
+    'if [[ ${1:-} == "$IDENTITY_FLAG" && ${2:-} == *:* && ${*: -1} == "$CONTROL" ]]; then' \
     '  count=0; [[ ! -f "$COUNT" ]] || count=$(<"$COUNT")' \
     '  count=$((count + 1)); printf "%s\\n" "$count" >"$COUNT"' \
-    '  if [[ $count -eq 2 ]]; then /bin/mv -f -- "$REPLACEMENT" "$CONTROL"; fi' \
+    '  if [[ $count -eq 2 ]]; then "$REAL_MV" -f -- "$REPLACEMENT" "$CONTROL"; fi' \
     'fi' \
-    'exec /usr/bin/stat "$@"' \
+    'exec "$REAL_STAT" "$@"' \
     >"$fake_bin/stat"
   chmod 0700 "$fake_bin/stat"
 
   set +e
-  PATH="$fake_bin:/usr/bin:/bin" CONTROL=$control REPLACEMENT=$replacement \
-    COUNT=$tmp/stat-count \
+  PATH="$fake_bin:$PATH" CONTROL=$control REPLACEMENT=$replacement \
+    COUNT=$tmp/stat-count REAL_STAT=$real_stat REAL_MV=$real_mv \
+    IDENTITY_FLAG=$identity_flag \
     fwdports_control_read "$generation" "$digest" >"$output" 2>"$error"
   status=$?
   record=
@@ -722,6 +962,13 @@ run_case live-lock live_lock_case
 run_case stale-lock stale_lock_case
 run_case orphan-candidate orphan_candidate_case
 run_case concurrent-contenders concurrent_contenders_case
+run_case symlink-only-lock-filesystem symlink_only_lock_filesystem_case
+run_case lock-publication-failure lock_publication_failure_case
+run_case candidate-directory-symlink candidate_directory_symlink_case
+run_case directory-pointer-publication directory_pointer_publication_case
+run_case newline-lock-pointer newline_lock_pointer_case
+run_case escaping-lock-pointer escaping_lock_pointer_case
+run_case retargeted-lock-release retargeted_lock_release_case
 run_case immutable-manifest immutable_manifest_case
 run_case mutable-control mutable_control_case
 run_case control-replacement-read control_replacement_read_case

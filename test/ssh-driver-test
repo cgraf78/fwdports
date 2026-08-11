@@ -301,6 +301,50 @@ remote_port_no_preflight_case() {
   _assert_eq "remote forward: no diagnostic" "" "$(<"$error")"
 }
 
+lsof_visibility_fallback_case() {
+  local tmp fake_bin argv_file error status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  argv_file=$tmp/argv
+  error=$tmp/error
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ -z ${FWDPORTS_TEST_LSOF_WARNING:-} ]] || printf "permission warning\\n" >&2' \
+    'exit "${FWDPORTS_TEST_LSOF_STATUS:-1}"' \
+    >"$fake_bin/lsof"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$fake_bin/nc"
+  chmod 0755 "$fake_bin/lsof" "$fake_bin/nc"
+  printf '%s\n' '-L' '127.0.0.1:8080:127.0.0.1:80' >"$argv_file"
+
+  set +e
+  PATH="$fake_bin:$PATH" \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "local port fallback: netcat detects a hidden listener" \
+    1 "$status"
+  _assert_contains "local port fallback: diagnostic identifies netcat" \
+    "listener details (nc)" "$(<"$error")"
+
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_LSOF_STATUS=0 \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "local port fallback: empty successful lsof is inconclusive" \
+    1 "$status"
+
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_LSOF_WARNING=1 \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "local port fallback: lsof warning is still inconclusive" \
+    1 "$status"
+}
+
 duplicate_profile_local_ports_case() {
   local tmp manifest error status
   tmp=$(_tmpdir) || return 1
@@ -348,5 +392,6 @@ run_case inherited-forward-rejected inherited_forward_rejected_case
 run_case retry-gate retry_gate_case
 run_case local-port-conflict local_port_conflict_case
 run_case remote-port-no-preflight remote_port_no_preflight_case
+run_case lsof-visibility-fallback lsof_visibility_fallback_case
 run_case duplicate-profile-local-ports duplicate_profile_local_ports_case
 _test_summary

@@ -5,6 +5,11 @@
 
 set -uo pipefail
 
+# CI runners and callers can inherit a permissive umask.  The fixtures contain
+# generated owner records and executable drivers, so make privacy the harness
+# default instead of relying on every test to remember a chmod immediately.
+umask 077
+
 PASS=0
 FAIL=0
 RUN=0
@@ -84,13 +89,25 @@ _assert_exit() {
 }
 
 _FWDPORTS_TEST_TMP_BASE=${TMPDIR:-/tmp}
+[[ -d "$_FWDPORTS_TEST_TMP_BASE" ]] || {
+  printf 'fwdports test: temporary base is not a directory: %s\n' \
+    "$_FWDPORTS_TEST_TMP_BASE" >&2
+  exit 1
+}
+# macOS exposes /var through a /private/var symlink, and TMPDIR commonly ends
+# in a slash.  Resolve that spelling once so production path normalization and
+# the harness agree about the same physical test root.
+_FWDPORTS_TEST_TMP_BASE=$(cd -P -- "$_FWDPORTS_TEST_TMP_BASE" && pwd -P) || {
+  printf 'fwdports test: cannot resolve temporary base\n' >&2
+  exit 1
+}
 _FWDPORTS_TEST_TMP_ROOT=$(mktemp -d \
-  "$_FWDPORTS_TEST_TMP_BASE/fwdports-test.XXXXXXXX") || {
+  "$_FWDPORTS_TEST_TMP_BASE/f.XXXXXX") || {
   printf 'fwdports test: cannot create temporary root\n' >&2
   exit 1
 }
 case "$_FWDPORTS_TEST_TMP_ROOT" in
-  "$_FWDPORTS_TEST_TMP_BASE"/fwdports-test.*) ;;
+  "$_FWDPORTS_TEST_TMP_BASE"/f.*) ;;
   *)
     printf 'fwdports test: unsafe temporary root: %s\n' \
       "$_FWDPORTS_TEST_TMP_ROOT" >&2
@@ -104,12 +121,15 @@ esac
 
 _tmpdir() {
   local path
-  path=$(mktemp -d "$_FWDPORTS_TEST_TMP_ROOT/suite.XXXXXXXX") || {
+  # tmux sockets use a small sockaddr path on macOS. Keep both random
+  # directory components short so physically canonical /private/var paths do
+  # not make otherwise valid lifecycle tests exceed that operating-system ABI.
+  path=$(mktemp -d "$_FWDPORTS_TEST_TMP_ROOT/s.XXXXXX") || {
     printf 'fwdports test: cannot create suite directory\n' >&2
     return 1
   }
   case "$path" in
-    "$_FWDPORTS_TEST_TMP_ROOT"/suite.*) ;;
+    "$_FWDPORTS_TEST_TMP_ROOT"/s.*) ;;
     *)
       printf 'fwdports test: unsafe suite directory: %s\n' "$path" >&2
       return 1
@@ -122,7 +142,7 @@ _cleanup_test_root() {
   local status=$?
   trap - EXIT HUP INT TERM
   case "$_FWDPORTS_TEST_TMP_ROOT" in
-    "$_FWDPORTS_TEST_TMP_BASE"/fwdports-test.*)
+    "$_FWDPORTS_TEST_TMP_BASE"/f.*)
       rm -rf -- "$_FWDPORTS_TEST_TMP_ROOT"
       ;;
   esac
@@ -131,7 +151,7 @@ _cleanup_test_root() {
 trap _cleanup_test_root EXIT HUP INT TERM
 
 run_case() {
-  local name=$1 function_name=$2
+  local name=$1 function_name=$2 callback_status
   if [[ -n "${TEST_CASE:-}" && "${TEST_CASE:-}" != "$name" ]]; then
     return 0
   fi
@@ -140,7 +160,21 @@ run_case() {
   # shellcheck disable=SC2034
   CURRENT_TEST_CASE=$name
   printf '=== %s ===\n' "$name"
+  # Do not invoke the callback as an `if` condition: Bash suppresses errexit
+  # throughout functions called from a conditional, which can let a failed
+  # setup command fall through to a later successful command. Start each case
+  # without inherited errexit, while allowing the callback to enable it when
+  # that is part of the case's own failure contract.
+  set +e
   "$function_name"
+  callback_status=$?
+  set +e
+  if [[ $callback_status -ne 0 ]]; then
+    # Setup helpers often return before reaching an explicit assertion. Treat
+    # that as a failed case so an unavailable tmux socket or fixture cannot
+    # produce a misleading all-green summary with zero useful coverage.
+    _fail "case callback failed: $name"
+  fi
 }
 
 _test_summary() {

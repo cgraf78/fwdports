@@ -94,18 +94,20 @@ fwdports_ssh_effective_digest() {
     }
     argv+=("$line")
   done <"$argv_file"
-  for ((index = 0; index < ${#argv[@]}; index++)); do
-    if [[ $skip -eq 1 ]]; then
-      skip=0
-      continue
-    fi
-    case ${argv[index]} in
-      -L | -R | -D)
-        skip=1
-        ;;
-      *) probe_argv+=("${argv[index]}") ;;
-    esac
-  done
+  if [[ -n ${argv[0]+set} ]]; then
+    for ((index = 0; index < ${#argv[@]}; index++)); do
+      if [[ $skip -eq 1 ]]; then
+        skip=0
+        continue
+      fi
+      case ${argv[index]} in
+        -L | -R | -D)
+          skip=1
+          ;;
+        *) probe_argv+=("${argv[index]}") ;;
+      esac
+    done
+  fi
   [[ $skip -eq 0 ]] || {
     printf 'fwdports: SSH argv ends inside a forwarding option\n' >&2
     return 1
@@ -287,7 +289,7 @@ fwdports_ssh_build_argv() {
       "$leg_name" >&2
     return 1
   }
-  if ((${#local_forwards[@]} == 0 && ${#remote_forwards[@]} == 0)); then
+  if [[ -z ${local_forwards[0]+set} && -z ${remote_forwards[0]+set} ]]; then
     printf 'fwdports: SSH leg requires a local or remote forward: %s\n' \
       "$leg_name" >&2
     return 1
@@ -320,10 +322,10 @@ fwdports_ssh_build_argv() {
     -o ExitOnForwardFailure=yes
     -o PermitLocalCommand=no
   )
-  for value in "${local_forwards[@]}"; do
+  for value in ${local_forwards[@]+"${local_forwards[@]}"}; do
     argv+=(-L "$value")
   done
-  for value in "${remote_forwards[@]}"; do
+  for value in ${remote_forwards[@]+"${remote_forwards[@]}"}; do
     argv+=(-R "$value")
   done
   [[ -z $identity_file ]] || argv+=(-i "$identity_file")
@@ -523,6 +525,20 @@ fwdports_ssh_preflight_local_ports() {
             "$port" >&2
           return 1
         }
+        # Android/Termux can deny lsof access to another app process even when
+        # both processes share the loopback network namespace.  A bounded
+        # connection probe closes that visibility gap; SSH remains the final
+        # authority through ExitOnForwardFailure if the probe itself fails.
+        if [[ ($status -eq 1 || -z $details) ]] &&
+          command -v nc >/dev/null 2>&1 &&
+          nc -z -w 1 127.0.0.1 "$port" >/dev/null 2>&1; then
+          printf 'fwdports: local forward port %s already has a listener\n' \
+            "$port" >&2
+          printf '%s\n' \
+            'fwdports: listener details (nc): loopback connection succeeded' \
+            >&2
+          return 1
+        fi
       elif command -v ss >/dev/null 2>&1; then
         details=$(LC_ALL=C ss -H -ltn "sport = :$port" 2>&1) || {
           printf 'fwdports: ss failed while checking local port %s\n' \

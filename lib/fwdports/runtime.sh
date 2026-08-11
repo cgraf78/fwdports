@@ -339,20 +339,141 @@ _fwdports_lock_write_owner() {
   fi
 }
 
+_fwdports_lock_validate_candidates() {
+  local root=$1 candidates
+
+  candidates=$root/lock-candidates
+  [[ -d "$root" && ! -L "$root" &&
+    -d "$candidates" && ! -L "$candidates" ]] || return 1
+  _fwdports_runtime_validate_node "$root" 'runtime root' \
+    >/dev/null 2>&1 || return 1
+  _fwdports_runtime_validate_node "$candidates" 'lock candidate directory' \
+    >/dev/null 2>&1 || return 1
+}
+
+_fwdports_lock_prepare_candidates() {
+  local root=$1 candidates old_umask
+
+  candidates=$root/lock-candidates
+  if [[ ! -e "$candidates" && ! -L "$candidates" ]]; then
+    old_umask=$(umask)
+    umask 077
+    if ! mkdir "$candidates" 2>/dev/null; then
+      umask "$old_umask"
+      # A cooperating contender may have won the mkdir race. The validation
+      # below decides whether that path is the expected private directory.
+      [[ -d "$candidates" && ! -L "$candidates" ]] || return 1
+    else
+      umask "$old_umask"
+    fi
+  fi
+  _fwdports_lock_validate_candidates "$root"
+}
+
+_fwdports_lock_read_pointer() {
+  local pointer=$1 raw read_status
+
+  # Command substitution normally strips every trailing newline, which would
+  # make a hostile newline-bearing symlink target indistinguishable from a
+  # valid target. Append a sentinel, remove readlink's one output delimiter,
+  # and only then reject any newline that was part of the raw target.
+  raw=$(
+    readlink "$pointer"
+    read_status=$?
+    printf '\001'
+    exit "$read_status"
+  ) || return 2
+  [[ $raw == *$'\001' ]] || return 2
+  raw=${raw%$'\001'}
+  [[ $raw == *$'\n' ]] || return 2
+  raw=${raw%$'\n'}
+  [[ -n $raw && $raw != *$'\n'* && $raw != *$'\r'* &&
+    $raw != *$'\t'* && $raw != *$'\001'* ]] || return 2
+  printf '%s\n' "$raw"
+}
+
 _fwdports_lock_candidate_for() {
-  local root=$1 owner_file=$2 record nonce uid pid start target candidate
-  record=$(_fwdports_lock_read_owner "$owner_file") || return 2
+  local root owner_file expected_kind pointer_target pointer_after
+  local record nonce uid pid start target candidate
+
+  root=$1
+  owner_file=$2
+  case "$owner_file" in
+    "$root/lifecycle.lock") expected_kind=candidate ;;
+    "$root/reclaim.lock") expected_kind=reclaim ;;
+    *) return 2 ;;
+  esac
+
+  # Android app filesystems can forbid hard links while still providing the
+  # atomic symlink creation POSIX shells need.  Accept only a one-component,
+  # relative pointer into our private candidate directory; absolute paths and
+  # traversal never become input to filesystem operations.
+  _fwdports_lock_validate_candidates "$root" || return 2
+  [[ -L "$owner_file" ]] || return 2
+  pointer_target=$(_fwdports_lock_read_pointer "$owner_file") || return 2
+  case "$expected_kind:$pointer_target" in
+    candidate:lock-candidates/candidate.* | \
+      reclaim:lock-candidates/reclaim.*) ;;
+    *) return 2 ;;
+  esac
+  [[ $pointer_target =~ ^lock-candidates/$expected_kind\.[A-Za-z0-9]+$ ]] ||
+    return 2
+  candidate=$root/$pointer_target
+  [[ -f "$candidate" && ! -L "$candidate" ]] || return 2
+
+  record=$(_fwdports_lock_read_owner "$candidate") || return 2
   IFS=$'\t' read -r nonce uid pid start target <<<"$record"
-  candidate=$root/lock-candidates/$nonce
-  [[ -f "$candidate" && ! -L "$candidate" &&
-    "$candidate" -ef "$owner_file" ]] || return 2
+  [[ $nonce == "${candidate##*/}" ]] || return 2
   _fwdports_runtime_validate_node "$candidate" 'lock owner' \
     >/dev/null 2>&1 || return 2
+  # Re-read after validating the candidate so a concurrent pointer change is
+  # never mistaken for authority over the file we just inspected.
+  pointer_after=$(_fwdports_lock_read_pointer "$owner_file") || return 2
+  [[ $pointer_after == "$pointer_target" ]] || return 2
   printf '%s\n' "$candidate"
+}
+
+_fwdports_lock_publish() {
+  local root=$1 candidate=$2 pointer=$3 kind target status current
+
+  case "$pointer" in
+    "$root/lifecycle.lock") kind=candidate ;;
+    "$root/reclaim.lock") kind=reclaim ;;
+    *) return 1 ;;
+  esac
+  [[ $candidate == "$root/lock-candidates/$kind."* &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  _fwdports_lock_validate_candidates "$root" || return 1
+  target=lock-candidates/${candidate##*/}
+  # `-n` is supported by the GNU, BSD, BusyBox, and Termux implementations in
+  # the compatibility matrix. It prevents a raced destination symlink to a
+  # directory from absorbing a child link while falsely reporting success.
+  if ln -s -n "$target" "$pointer" 2>/dev/null; then
+    current=$(_fwdports_lock_candidate_for "$root" "$pointer") || return 74
+    [[ $current == "$candidate" ]] || return 74
+    return 0
+  else
+    status=$?
+  fi
+  # An extant path is ordinary contention. If no path was published, report a
+  # filesystem capability failure instead of falsely claiming another live
+  # owner holds the lock.
+  [[ -e "$pointer" || -L "$pointer" ]] && return 75
+  return "$status"
+}
+
+_fwdports_lock_unpublish() {
+  local root=$1 pointer=$2 candidate=$3 current
+
+  current=$(_fwdports_lock_candidate_for "$root" "$pointer") || return 1
+  [[ $current == "$candidate" ]] || return 1
+  rm -f -- "$pointer" || return 1
+  rm -f -- "$candidate"
 }
 
 _fwdports_lock_gc_candidates() {
   local root=$1 candidates lock reclaim candidate state
+  local lock_candidate='' reclaim_candidate=''
 
   # Assign dependent paths only after `root` is local. Bash dynamic scoping can
   # otherwise resolve `$root` from a caller while evaluating one `local`
@@ -361,11 +482,20 @@ _fwdports_lock_gc_candidates() {
   lock=$root/lifecycle.lock
   reclaim=$root/reclaim.lock
 
+  if [[ -e "$lock" || -L "$lock" ]]; then
+    lock_candidate=$(_fwdports_lock_candidate_for "$root" "$lock" \
+      2>/dev/null) || lock_candidate=
+  fi
+  if [[ -e "$reclaim" || -L "$reclaim" ]]; then
+    reclaim_candidate=$(_fwdports_lock_candidate_for "$root" "$reclaim" \
+      2>/dev/null) || reclaim_candidate=
+  fi
+
   for candidate in "$candidates"/candidate.* "$candidates"/reclaim.*; do
     [[ -e "$candidate" || -L "$candidate" ]] || continue
     [[ -f "$candidate" && ! -L "$candidate" ]] || continue
-    if [[ -f "$lock" && "$candidate" -ef "$lock" ]] ||
-      [[ -f "$reclaim" && "$candidate" -ef "$reclaim" ]]; then
+    if [[ $candidate == "$lock_candidate" ||
+      $candidate == "$reclaim_candidate" ]]; then
       continue
     fi
     if _fwdports_lock_owner_state "$candidate"; then
@@ -383,6 +513,7 @@ _fwdports_lock_gc_candidates() {
 fwdports_lock_acquire() {
   local root=$1 candidates candidate lock nonce old_umask state
   local reclaim reclaim_candidate reclaim_nonce stale_candidate stale_nonce
+  local current publish_status
 
   [[ -d "$root" && ! -L "$root" ]] || {
     printf 'fwdports: runtime root is unavailable\n' >&2
@@ -392,13 +523,10 @@ fwdports_lock_acquire() {
   candidates=$root/lock-candidates
   lock=$root/lifecycle.lock
   reclaim=$root/reclaim.lock
-  old_umask=$(umask)
-  umask 077
-  if ! mkdir -p "$candidates" || ! chmod 0700 "$candidates"; then
-    umask "$old_umask"
+  if ! _fwdports_lock_prepare_candidates "$root"; then
+    printf 'fwdports: lock candidate directory is untrusted\n' >&2
     return 1
   fi
-  umask "$old_umask"
 
   # A crashed reclaimer leaves an owner-bearing record, never an ownerless
   # directory. Remove it only after proving its recorded process identity is
@@ -408,7 +536,7 @@ fwdports_lock_acquire() {
       printf 'fwdports: reclaim lock ownership is invalid\n' >&2
       return 74
     }
-    if _fwdports_lock_owner_state "$reclaim"; then
+    if _fwdports_lock_owner_state "$reclaim_candidate"; then
       state=0
     else
       state=$?
@@ -419,9 +547,8 @@ fwdports_lock_acquire() {
         return 75
         ;;
       1)
-        [[ "$reclaim" -ef "$reclaim_candidate" ]] || return 74
-        rm -f -- "$reclaim" || return 1
-        rm -f -- "$reclaim_candidate" || return 1
+        _fwdports_lock_unpublish "$root" "$reclaim" \
+          "$reclaim_candidate" || return 74
         ;;
       *)
         printf 'fwdports: reclaim lock owner cannot be verified\n' >&2
@@ -437,7 +564,7 @@ fwdports_lock_acquire() {
       printf 'fwdports: lifecycle lock ownership is invalid\n' >&2
       return 74
     }
-    if _fwdports_lock_owner_state "$lock"; then
+    if _fwdports_lock_owner_state "$stale_candidate"; then
       state=0
     else
       state=$?
@@ -462,20 +589,38 @@ fwdports_lock_acquire() {
           rm -f -- "$reclaim_candidate"
           return 1
         fi
-        if ! ln "$reclaim_candidate" "$reclaim" 2>/dev/null; then
-          rm -f -- "$reclaim_candidate"
-          printf 'fwdports: lifecycle recovery is already active\n' >&2
-          return 75
+        if _fwdports_lock_publish "$root" "$reclaim_candidate" \
+          "$reclaim"; then
+          publish_status=0
+        else
+          publish_status=$?
         fi
-        # Holding a live reclaimer link prevents another contender from
-        # entering the gap between stale-lock removal and the new hard link.
-        if [[ ! "$lock" -ef "$stale_candidate" ]]; then
-          rm -f -- "$reclaim" "$reclaim_candidate"
+        if [[ $publish_status -ne 0 ]]; then
+          if [[ $publish_status -eq 74 ]]; then
+            printf 'fwdports: lifecycle recovery publication is invalid\n' \
+              >&2
+            return 74
+          fi
+          rm -f -- "$reclaim_candidate"
+          if [[ $publish_status -eq 75 ]]; then
+            printf 'fwdports: lifecycle recovery is already active\n' >&2
+            return 75
+          fi
+          printf 'fwdports: cannot publish lifecycle recovery lock\n' >&2
+          return 1
+        fi
+        # Holding a live reclaimer pointer prevents another contender from
+        # entering the gap between stale-lock removal and the new pointer.
+        current=$(_fwdports_lock_candidate_for "$root" "$lock") || current=
+        if [[ $current != "$stale_candidate" ]]; then
+          _fwdports_lock_unpublish "$root" "$reclaim" \
+            "$reclaim_candidate" >/dev/null 2>&1 || true
           printf 'fwdports: lifecycle lock changed during recovery\n' >&2
           return 75
         fi
         rm -f -- "$lock" || {
-          rm -f -- "$reclaim" "$reclaim_candidate"
+          _fwdports_lock_unpublish "$root" "$reclaim" \
+            "$reclaim_candidate" >/dev/null 2>&1 || true
           return 1
         }
         ;;
@@ -492,32 +637,68 @@ fwdports_lock_acquire() {
   umask 077
   candidate=$(mktemp "$candidates/candidate.XXXXXXXX") || {
     umask "$old_umask"
-    [[ -z $reclaim_candidate ]] || rm -f -- "$reclaim" "$reclaim_candidate"
+    if [[ -n $reclaim_candidate ]] &&
+      ! _fwdports_lock_unpublish "$root" "$reclaim" \
+        "$reclaim_candidate"; then
+      printf 'fwdports: lifecycle recovery ownership changed\n' >&2
+      return 74
+    fi
     return 1
   }
   umask "$old_umask"
   nonce=${candidate##*/}
   # The candidate is not a lock. Write and protect the complete owner record
-  # first; only the subsequent hard link atomically makes it authoritative.
+  # first; only the subsequent relative symlink atomically makes it
+  # authoritative.
   if ! _fwdports_lock_write_owner "$candidate" "$nonce"; then
     rm -f -- "$candidate"
-    [[ -z $reclaim_candidate ]] || rm -f -- "$reclaim" "$reclaim_candidate"
+    if [[ -n $reclaim_candidate ]] &&
+      ! _fwdports_lock_unpublish "$root" "$reclaim" \
+        "$reclaim_candidate"; then
+      printf 'fwdports: lifecycle recovery ownership changed\n' >&2
+      return 74
+    fi
     return 1
   fi
-  if ! ln "$candidate" "$lock" 2>/dev/null; then
+  if _fwdports_lock_publish "$root" "$candidate" "$lock"; then
+    publish_status=0
+  else
+    publish_status=$?
+  fi
+  if [[ $publish_status -ne 0 ]]; then
+    if [[ $publish_status -eq 74 ]]; then
+      printf 'fwdports: lifecycle lock publication is invalid\n' >&2
+      return 74
+    fi
     rm -f -- "$candidate"
-    [[ -z $reclaim_candidate ]] || rm -f -- "$reclaim" "$reclaim_candidate"
-    printf 'fwdports: lifecycle operation is already locked\n' >&2
-    return 75
+    if [[ -n $reclaim_candidate ]] &&
+      ! _fwdports_lock_unpublish "$root" "$reclaim" \
+        "$reclaim_candidate"; then
+      printf 'fwdports: lifecycle recovery ownership changed\n' >&2
+      return 74
+    fi
+    if [[ $publish_status -eq 75 ]]; then
+      printf 'fwdports: lifecycle operation is already locked\n' >&2
+      return 75
+    fi
+    printf 'fwdports: cannot publish lifecycle lock\n' >&2
+    return 1
   fi
   if [[ -n $reclaim_candidate ]]; then
-    rm -f -- "$reclaim" "$reclaim_candidate" "$stale_candidate"
+    if ! _fwdports_lock_unpublish "$root" "$reclaim" \
+      "$reclaim_candidate"; then
+      _fwdports_lock_unpublish "$root" "$lock" "$candidate" \
+        >/dev/null 2>&1 || true
+      printf 'fwdports: lifecycle recovery ownership changed\n' >&2
+      return 74
+    fi
+    rm -f -- "$stale_candidate"
   fi
   printf '%s\n' "$candidate"
 }
 
 fwdports_lock_release() {
-  local root=$1 candidate=$2 lock
+  local root=$1 candidate=$2 lock current
 
   lock=$root/lifecycle.lock
 
@@ -528,13 +709,13 @@ fwdports_lock_release() {
       return 1
       ;;
   esac
+  current=$(_fwdports_lock_candidate_for "$root" "$lock") || current=
   [[ -f "$candidate" && ! -L "$candidate" &&
-    -f "$lock" && ! -L "$lock" && "$candidate" -ef "$lock" ]] || {
+    $current == "$candidate" ]] || {
     printf 'fwdports: lifecycle lock ownership no longer matches\n' >&2
     return 1
   }
-  rm -f -- "$lock" || return 1
-  rm -f -- "$candidate"
+  _fwdports_lock_unpublish "$root" "$lock" "$candidate"
 }
 
 _fwdports_runtime_sha256_file() {

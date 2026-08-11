@@ -155,7 +155,7 @@ _fwdports_start_generation() {
     legs+=("$leg")
     drivers+=("$driver")
   done <"$resolved"
-  [[ ${#legs[@]} -gt 0 ]] || {
+  [[ -n ${legs[0]+set} ]] || {
     printf 'fwdports: selected profile has no legs\n' >&2
     return 1
   }
@@ -262,7 +262,9 @@ _fwdports_start_generation() {
       return 1
     fi
   done
-  : "${prepared[*]}"
+  # An all-built-in profile legitimately prepares no external driver. Avoid
+  # expanding that empty array under nounset on Bash 3.2.
+  [[ -z ${prepared[0]+set} ]] || : "${prepared[*]}"
 }
 
 _fwdports_start_controller() {

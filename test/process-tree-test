@@ -122,6 +122,9 @@ termination_fixture() {
   fwdports_tmux_record_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_SESSION" \
     "$PROC_PANE" "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" ||
     return 1
+  record=$(_fwdports_pane_evidence_read "$PROC_GENERATION" "$PROC_DIGEST" \
+    "$PROC_EVIDENCE") || return 1
+  IFS=$'\t' read -r _ _ _ _ _ _ PROC_PGID _ _ <<<"$record"
   start=$(_fwdports_process_start_identity "$$")
   fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" running running \
     "$$" "$start" none || return 1
@@ -198,7 +201,7 @@ pane_identity_case() {
 }
 
 term_owned_group_case() {
-  local tmp output error status
+  local tmp output error status group_status
   tmp=$(_tmpdir) || return 1
   termination_fixture "$tmp" term || return 1
   output=$tmp/output
@@ -217,18 +220,23 @@ term_owned_group_case() {
     "term" "$(<"$PROC_LEADER_MARKER")"
   _assert_eq "process cleanup TERM: child receives group signal" \
     "term" "$(<"$PROC_CHILD_MARKER")"
-  if ! kill -0 "$PROC_LEADER" 2>/dev/null &&
-    ! kill -0 "$PROC_CHILD" 2>/dev/null; then
+  if _fwdports_process_group_live_records "$PROC_PGID" \
+    >/dev/null 2>&1; then
+    group_status=0
+  else
+    group_status=$?
+  fi
+  if [[ $group_status -eq 1 ]]; then
     _pass "process cleanup TERM: leaves no live group member"
   else
-    _fail "process cleanup TERM: leaves no live group member"
+    _fail "process cleanup TERM: leaves no live group member (inspection status $group_status)"
   fi
   _assert_eq "process cleanup TERM: has no diagnostic" "" "$(<"$error")"
   kill_test_server "$PROC_SOCKET"
 }
 
 kill_escalation_case() {
-  local tmp output error status
+  local tmp output error status group_status
   tmp=$(_tmpdir) || return 1
   termination_fixture "$tmp" stubborn || return 1
   output=$tmp/output
@@ -243,11 +251,16 @@ kill_escalation_case() {
   _assert_exit "process cleanup KILL: escalation succeeds" 0 "$status"
   _assert_eq "process cleanup KILL: reports escalation" \
     "kill" "$(<"$output")"
-  if ! kill -0 "$PROC_LEADER" 2>/dev/null &&
-    ! kill -0 "$PROC_CHILD" 2>/dev/null; then
+  if _fwdports_process_group_live_records "$PROC_PGID" \
+    >/dev/null 2>&1; then
+    group_status=0
+  else
+    group_status=$?
+  fi
+  if [[ $group_status -eq 1 ]]; then
     _pass "process cleanup KILL: leaves no live group member"
   else
-    _fail "process cleanup KILL: leaves no live group member"
+    _fail "process cleanup KILL: leaves no live group member (inspection status $group_status)"
   fi
   _assert_eq "process cleanup KILL: has no diagnostic" "" "$(<"$error")"
   kill_test_server "$PROC_SOCKET"
@@ -325,6 +338,52 @@ malformed_process_enumeration_case() {
     "" "$(<"$output")"
 }
 
+zombie_only_process_group_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "4242 4242 4242 ? Z\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_live_records 4242 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "zombie-only process group: is already empty" 1 "$status"
+  _assert_eq "zombie-only process group: publishes no live members" \
+    "" "$(<"$output")"
+}
+
+mixed_live_process_group_case() {
+  local tmp fake_bin output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "4242 4242 4242 ? Z\n4243 4242 4242 ? S\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_live_records 4242 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "mixed process group: remains live" 0 "$status"
+  _assert_eq "mixed process group: retains the live member only" \
+    $'4243\t4242\t?\tS' "$(<"$output")"
+}
+
 list_panes_failure_case() {
   local tmp fake_tmux output error status
   tmp=$(_tmpdir) || return 1
@@ -368,5 +427,7 @@ run_case kill-escalation kill_escalation_case
 run_case leader-missing leader_missing_case
 run_case failed-process-enumeration failed_process_enumeration_case
 run_case malformed-process-enumeration malformed_process_enumeration_case
+run_case zombie-only-process-group zombie_only_process_group_case
+run_case mixed-live-process-group mixed_live_process_group_case
 run_case list-panes-failure list_panes_failure_case
 _test_summary

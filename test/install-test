@@ -22,8 +22,8 @@ fixture_checkout() {
     cp "$ROOT/bin/fwdports" "$destination/bin/fwdports"
     chmod +x "$destination/bin/fwdports"
   fi
-  for library in config.sh controller.sh drivers.sh runtime.sh ssh-gate.sh \
-    tmux.sh; do
+  for library in builtin-runner.sh config.sh controller.sh core.sh \
+    driver-api.sh drivers.sh health.sh runtime.sh ssh-gate.sh tmux.sh; do
     if [[ -f "$ROOT/lib/fwdports/$library" ]]; then
       cp "$ROOT/lib/fwdports/$library" \
         "$destination/lib/fwdports/$library"
@@ -231,7 +231,7 @@ provider_header_and_lock_case() {
   [[ -f "$ROOT/install.sh" ]] && installer=$(<"$ROOT/install.sh")
 
   _assert_eq "installer provider: reviewed Actions lock" \
-    "5c320ad3c24fc5f57e9402c588381ffb1dfe554e" "$lock"
+    "464468328f050e43299298fc0eac8b971ddd38b7" "$lock"
   _assert_contains "installer provider: consumer repository is fwdports" \
     "CHECKOUT_INSTALLER_REPO=cgraf78/fwdports" "$config"
   _assert_contains "installer provider: generated ownership header" \

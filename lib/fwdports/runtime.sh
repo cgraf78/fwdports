@@ -182,11 +182,12 @@ fwdports_validate_trusted_path() {
 
 fwdports_snapshot_trusted_file() {
   local source=$1 destination=$2 anchor=$3 kind=${4:-executable}
+  local allowed_target_root=${5:-$anchor}
   local canonical_before canonical_after identity_before identity_after
   local destination_parent old_umask tmp
 
   canonical_before=$(fwdports_validate_trusted_path "$source" "$kind" \
-    "$anchor") || return 1
+    "$anchor" "$allowed_target_root") || return 1
   identity_before=$(_fwdports_runtime_identity "$canonical_before") || {
     printf 'fwdports: cannot identify source before copy\n' >&2
     return 1
@@ -226,7 +227,7 @@ fwdports_snapshot_trusted_file() {
   }
 
   canonical_after=$(fwdports_validate_trusted_path "$source" "$kind" \
-    "$anchor") || {
+    "$anchor" "$allowed_target_root") || {
     rm -f -- "$tmp"
     return 1
   }
@@ -579,6 +580,7 @@ _fwdports_generation_source_record() {
 
 fwdports_generation_create() {
   local root=$1 source=$2 generations generation nonce manifest_tmp
+  local target_override=${3:-}
   local old_umask line first=1 records=0
 
   [[ -d "$root" && ! -L "$root" ]] || {
@@ -591,6 +593,12 @@ fwdports_generation_create() {
     return 1
   }
   _fwdports_runtime_validate_node "$source" 'resolved profile' || return 1
+  [[ -z $target_override ||
+    ($target_override != -* &&
+      $target_override =~ ^[][A-Za-z0-9._:@%+,=-]+$) ]] || {
+    printf 'fwdports: target override is unsafe\n' >&2
+    return 1
+  }
 
   generations=$root/generations
   old_umask=$(umask)
@@ -627,6 +635,10 @@ fwdports_generation_create() {
   if ! (
     printf 'version\t1\n'
     printf 'generation\t%s\n' "$nonce"
+    # Target is immutable desired state and is therefore recorded in the
+    # manifest rather than passed through environment or tmux metadata.  The
+    # explicit `none` value distinguishes omission from a truncated record.
+    printf 'target\t%s\n' "${target_override:-none}"
     while IFS= read -r line || [[ -n $line ]]; do
       if [[ $first -eq 1 ]]; then
         first=0

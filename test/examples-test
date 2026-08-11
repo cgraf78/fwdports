@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Checked-in examples are executable interface contracts.
+# shellcheck disable=SC2329
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+EXAMPLES=$ROOT/examples
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/config.sh
+source "$ROOT/lib/fwdports/config.sh"
+
+reserved_data_case() {
+  local content
+  content=$(<"$EXAMPLES/tunnels.conf")
+  _assert_contains "examples: use the reserved example domain" \
+    "shell.example.com" "$content"
+  _assert_not_contains "examples: contain no private transport reference" \
+    "private" "$content"
+  _assert_not_contains "examples: contain no work overlay terminology" \
+    "work" "$content"
+}
+
+executable_case() {
+  local tmp profile output status version
+  tmp=$(_tmpdir) || return 1
+  for profile in ssh-default ssh-resilient executable-driver; do
+    output=$tmp/$profile
+    status=0
+    fwdports_config_resolve "$EXAMPLES/tunnels.conf" "$profile" "$output" ||
+      status=$?
+    _assert_exit "examples: production parser loads $profile" 0 "$status"
+  done
+  version=$("$EXAMPLES/drivers.d/example" api-version)
+  _assert_eq "examples: driver declares API v1" 1 "$version"
+  "$EXAMPLES/drivers.d/example" validate "$tmp/executable-driver" \
+    demonstration "$tmp" || status=$?
+  _assert_exit "examples: driver validate operation executes" 0 "$status"
+}
+
+run_case reserved-data reserved_data_case
+run_case executable executable_case
+_test_summary

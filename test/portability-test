@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Named adapters for GNU/Linux and stock macOS command differences.
+# shellcheck disable=SC2329,SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/drivers.sh
+source "$ROOT/lib/fwdports/drivers.sh"
+
+bsd_stat_case() {
+  local tmp fake_bin log output
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  log=$tmp/stat.log
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_STAT_LOG"' \
+    'if [[ ${1:-} == -c ]]; then exit 1; fi' \
+    '[[ ${1:-} == -f && ${3:-} != -- ]] || exit 2' \
+    'printf "1000 755 1 2 3 4\n"' >"$fake_bin/stat"
+  chmod 0700 "$fake_bin/stat"
+  output=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_STAT_LOG=$log \
+    _fwdports_stat_identity /tmp/example) || true
+  _assert_eq "portability: BSD stat identity is parsed" \
+    "1000 755 1 2 3 4" "$output"
+  _assert_not_contains "portability: BSD stat receives no GNU terminator" \
+    "-f %u %Lp %d %i %z %m --" "$(<"$log")"
+}
+
+canonicalization_case() {
+  local tmp real link result
+  tmp=$(_tmpdir) || return 1
+  real=$tmp/real
+  link=$tmp/link
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$real"
+  chmod 0700 "$real"
+  ln -s real "$link"
+  result=$(_fwdports_canonical_executable "$link") || true
+  _assert_eq "portability: canonicalization needs no readlink -f" \
+    "$real" "$result"
+}
+
+run_case bsd-stat bsd_stat_case
+run_case canonicalization canonicalization_case
+_test_summary

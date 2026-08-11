@@ -23,9 +23,13 @@ fi
 # should require an installer review, and unrelated files under lib/ must never
 # become an accidental part of the published contract.
 LIBRARY_SOURCES=(
+  "$ROOT/lib/fwdports/builtin-runner.sh"
   "$ROOT/lib/fwdports/config.sh"
   "$ROOT/lib/fwdports/controller.sh"
+  "$ROOT/lib/fwdports/core.sh"
+  "$ROOT/lib/fwdports/driver-api.sh"
   "$ROOT/lib/fwdports/drivers.sh"
+  "$ROOT/lib/fwdports/health.sh"
   "$ROOT/lib/fwdports/runtime.sh"
   "$ROOT/lib/fwdports/ssh-gate.sh"
   "$ROOT/lib/fwdports/tmux.sh"
@@ -33,6 +37,19 @@ LIBRARY_SOURCES=(
 for source in "${LIBRARY_SOURCES[@]}"; do
   if [[ ! -f "$source" ]]; then
     printf 'fwdports: library source is missing: %s\n' "$source" >&2
+    exit 1
+  fi
+done
+
+EXECUTABLE_SOURCES=(
+  "$ROOT/lib/fwdports/builtin-runner.sh"
+  "$ROOT/lib/fwdports/controller.sh"
+  "$ROOT/lib/fwdports/driver-api.sh"
+  "$ROOT/lib/fwdports/ssh-gate.sh"
+)
+for source in "${EXECUTABLE_SOURCES[@]}"; do
+  if [[ ! -x "$source" ]]; then
+    printf 'fwdports: runtime helper is not executable: %s\n' "$source" >&2
     exit 1
   fi
 done

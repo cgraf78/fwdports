@@ -16,13 +16,15 @@ source "$TEST_DIR/lib/test.sh"
 source "$ROOT/lib/fwdports/runtime.sh"
 # shellcheck source=../lib/fwdports/tmux.sh
 source "$ROOT/lib/fwdports/tmux.sh"
+# shellcheck source=../lib/fwdports/driver-api.sh
+source "$ROOT/lib/fwdports/driver-api.sh"
 # shellcheck source=../lib/fwdports/controller.sh
 source "$ROOT/lib/fwdports/controller.sh"
 
 TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
 
 controller_fixture() {
-  local tmp=$1 home state source root generation digest
+  local tmp=$1 driver=${2:-ssh} home state source root generation digest
   home=$tmp/home
   state=$tmp/state
   source=$tmp/resolved-profile
@@ -31,7 +33,7 @@ controller_fixture() {
   printf '%s\n' \
     $'version\t1' \
     $'profile\tdemo' \
-    $'leg\tweb\tssh' \
+    $'leg\tweb\t'"$driver" \
     $'set\tweb\thost\tshell.example.com' \
     $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
     >"$source"
@@ -44,6 +46,21 @@ controller_fixture() {
   fwdports_pointer_publish "$root" pending "$generation" "$digest" ||
     return 1
   printf '%s\t%s\t%s\n' "$root" "$generation" "$digest"
+}
+
+write_status_driver() {
+  local path=$1 result=$2
+  mkdir -p "${path%/*}"
+  chmod 0700 "${path%/*}"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+    printf 'case "${1:-}" in\n'
+    printf '  is-live) printf "%%s\\n" "$2|$3|$4|$5" >"$4/is-live-call"; exit %s ;;\n' \
+      "$result"
+    printf '  *) exit 64 ;;\n'
+    printf 'esac\n'
+  } >"$path"
+  chmod 0700 "$path"
 }
 
 wait_for_ready() {
@@ -273,6 +290,48 @@ status_down_case() {
     "" "$(<"$error")"
 }
 
+status_external_driver_liveness_case() {
+  local tmp fixture root generation digest output error status start
+  local driver call
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  start_status_pane "$tmp" "$generation" "$digest" || return 1
+  start=$(_fwdports_process_start_identity "$$")
+  fwdports_control_write "$generation" "$digest" running running \
+    "$$" "$start" 0 0 none
+  fwdports_pointer_publish "$root" active "$generation" "$digest"
+  driver=$generation/drivers/example
+  write_status_driver "$driver" 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_status "$root" "$TMUX_BIN" "$STATUS_SOCKET" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+  set -e
+  call=$(<"$generation/legs/web/is-live-call")
+
+  _assert_exit "external liveness: status observation succeeds" 0 "$status"
+  _assert_eq "external liveness: driver can report a dead transport" \
+    down "$(<"$output")"
+  _assert_eq "external liveness: receives the fixed ABI paths" \
+    "$generation/manifest|web|$generation/legs/web|$STATUS_PANE" "$call"
+  _assert_eq "external liveness: expected death has no diagnostic" \
+    "" "$(<"$error")"
+
+  write_status_driver "$driver" 2
+  fwdports_status "$root" "$TMUX_BIN" "$STATUS_SOCKET" fwdports \
+    >"$output" 2>"$error"
+  status=$?
+  _assert_exit "external liveness fallback: status succeeds" 0 "$status"
+  _assert_eq "external liveness fallback: verified pane remains live" \
+    "live/unverified" "$(<"$output")"
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
 unowned_session_case() {
   local tmp socket fixture release record output error status
   tmp=$(_tmpdir) || return 1
@@ -492,6 +551,7 @@ run_case controller-after-publish controller_after_publish_case
 run_case status-starting status_starting_case
 run_case status-live-unverified status_live_unverified_case
 run_case status-down status_down_case
+run_case status-external-driver-liveness status_external_driver_liveness_case
 run_case unowned-session unowned_session_case
 run_case crash-before-active crash_before_active_case
 run_case crash-after-active crash_after_active_case

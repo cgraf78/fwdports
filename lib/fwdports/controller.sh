@@ -121,11 +121,104 @@ fwdports_controller_wait_for_activation() {
   done
 }
 
+_fwdports_controller_publish_probe() {
+  local root=$1 generation=$2 digest=$3 probe=$4
+  local candidate pointer control_record phase desired controller_pid
+  local controller_start failures backoff current_start status=0
+
+  candidate=$(fwdports_lock_acquire "$root" 2>/dev/null) || return 75
+  pointer=$(fwdports_pointer_read "$root" active) || status=$?
+  if [[ $status -eq 0 &&
+    $pointer != "$generation"$'\t'"$digest" ]]; then
+    status=74
+  fi
+  if [[ $status -eq 0 ]]; then
+    control_record=$(fwdports_control_read "$generation" "$digest") ||
+      status=$?
+  fi
+  if [[ $status -eq 0 ]]; then
+    IFS=$'\t' read -r phase desired controller_pid controller_start \
+      failures backoff _ <<<"$control_record"
+    current_start=$(_fwdports_process_start_identity "$$") || status=$?
+  fi
+  if [[ $status -eq 0 && ($phase != running || $desired != running ||
+    $controller_pid != "$$" || $controller_start != "$current_start") ]];
+  then
+    status=74
+  fi
+  if [[ $status -eq 0 ]]; then
+    fwdports_control_write "$generation" "$digest" running running \
+      "$controller_pid" "$controller_start" "$failures" "$backoff" \
+      "$probe" || status=$?
+  fi
+  fwdports_lock_release "$root" "$candidate" >/dev/null 2>&1 || {
+    [[ $status -ne 0 ]] || status=74
+  }
+  return "$status"
+}
+
+fwdports_controller_run() {
+  local root=$1 generation=$2 digest=$3 tick_seconds interval grace ticks=0
+  local pointer control_record phase desired controller_pid controller_start
+  local failures backoff probe_result probe_status current_start
+
+  tick_seconds=${FWDPORTS_CONTROLLER_TICK_SECONDS:-1}
+  interval=${FWDPORTS_HEALTH_INTERVAL_TICKS:-30}
+  grace=${FWDPORTS_HEALTH_STARTUP_GRACE_TICKS:-5}
+  [[ $interval =~ ^[1-9][0-9]*$ && $grace =~ ^[0-9]+$ ]] || return 64
+  fwdports_controller_wait_for_activation "$root" "$generation" "$digest" ||
+    return $?
+  current_start=$(_fwdports_process_start_identity "$$") || return 1
+
+  while :; do
+    pointer=$(fwdports_pointer_read "$root" active) || return 0
+    [[ $pointer == "$generation"$'\t'"$digest" ]] || return 0
+    control_record=$(fwdports_control_read "$generation" "$digest") ||
+      return 0
+    IFS=$'\t' read -r phase desired controller_pid controller_start \
+      failures backoff _ <<<"$control_record"
+    [[ $phase == running && $desired == running ]] || return 0
+    [[ $controller_pid == "$$" && $controller_start == "$current_start" ]] ||
+      return 74
+
+    ticks=$((ticks + 1))
+    if [[ $ticks -ge $grace && $(((ticks - grace) % interval)) -eq 0 ]]; then
+      probe_result=$(fwdports_health_probe "$generation/manifest")
+      probe_status=$?
+      case "$probe_status:$probe_result" in
+        0:passing | 1:failing | 2:none) ;;
+        *) return 74 ;;
+      esac
+      # A foreground user operation may briefly own the lifecycle lock.  A
+      # health observation can wait for the next tick; it must never interfere
+      # with start/stop merely to publish telemetry.
+      _fwdports_controller_publish_probe "$root" "$generation" "$digest" \
+        "$probe_result"
+      probe_status=$?
+      [[ $probe_status -eq 0 || $probe_status -eq 75 ]] || return 74
+    fi
+    sleep "$tick_seconds"
+  done
+}
+
+_fwdports_manifest_driver_for_leg() {
+  local manifest=$1 wanted_leg=$2 kind leg driver _
+
+  while IFS=$'\t' read -r kind leg driver _ || [[ -n ${kind:-} ]]; do
+    if [[ $kind == leg && $leg == "$wanted_leg" ]]; then
+      printf '%s\n' "$driver"
+      return 0
+    fi
+  done <"$manifest"
+  return 1
+}
+
 fwdports_status() {
   local root=$1 tmux_path=$2 socket=$3 session_name=$4 pointer generation digest
   local control_record phase desired controller_pid controller_start failures
   local backoff probe current_start evidence found=0 verify_status all_live=1
-  local controller_live=0
+  local controller_live=0 runtime leg driver snapshot record pane_id
+  local driver_status
 
   if [[ -d "$root" && ! -L "$root" &&
     (-e "$root/active" || -L "$root/active") ]]; then
@@ -165,7 +258,42 @@ fwdports_status() {
         verify_status=$?
       fi
       case "$verify_status" in
-        0) ;;
+        0)
+          runtime=${evidence%/pane}
+          leg=${runtime##*/}
+          driver=$(_fwdports_manifest_driver_for_leg \
+            "$generation/manifest" "$leg") || return 74
+          case "$driver" in
+            ssh | autossh) ;;
+            *)
+              snapshot=$generation/drivers/$driver
+              record=$(_fwdports_pane_evidence_read "$generation" \
+                "$digest" "$evidence") || return 74
+              IFS=$'\t' read -r _ pane_id _ <<<"$record"
+              # Tmux/process evidence proves that core still owns the pane,
+              # not that a driver-specific transport inside it is usable.
+              # ABI status 2 deliberately asks core to use that conservative
+              # fallback; status 1 lets a driver report a dead transport
+              # without granting the driver any signalling authority.
+              if fwdports_driver_operation "$snapshot" is-live \
+                "$generation/manifest" "$leg" "$runtime" "$pane_id";
+              then
+                driver_status=0
+              else
+                driver_status=$?
+              fi
+              case "$driver_status" in
+                0 | 2) ;;
+                1) all_live=0 ;;
+                *)
+                  printf 'fwdports: driver liveness check failed for %s\n' \
+                    "$leg" >&2
+                  return 74
+                  ;;
+              esac
+              ;;
+          esac
+          ;;
         1) all_live=0 ;;
         *)
           printf 'fwdports: pane ownership cannot be verified\n' >&2
@@ -217,6 +345,46 @@ fwdports_status() {
   printf 'stopped\n'
 }
 
+_fwdports_cleanup_generation_drivers() {
+  local generation=$1 digest=$2 kind leg driver _ runtime snapshot evidence
+  local record pane_id='' index
+  local -a legs=() drivers=()
+
+  while IFS=$'\t' read -r kind leg driver _ || [[ -n ${kind:-} ]]; do
+    [[ $kind == leg ]] || continue
+    legs+=("$leg")
+    drivers+=("$driver")
+  done <"$generation/manifest"
+  # Cleanup unwinds preparation order.  Drivers may deliberately layer one
+  # transport over another, so reversing declaration order is the only
+  # predictable contract and mirrors ordinary stack unwinding.
+  for ((index = ${#legs[@]} - 1; index >= 0; index--)); do
+    leg=${legs[index]}
+    driver=${drivers[index]}
+    case "$driver" in ssh | autossh) continue ;; esac
+    runtime=$generation/legs/$leg
+    snapshot=$generation/drivers/$driver
+    [[ -x $snapshot && -f $snapshot && ! -L $snapshot &&
+      -d $runtime && ! -L $runtime ]] || continue
+    evidence=$runtime/pane
+    pane_id=
+    if [[ -f $evidence && ! -L $evidence ]]; then
+      record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+        "$evidence") || record=
+      [[ -z $record ]] || {
+        record=${record#*$'\t'}
+        pane_id=${record%%$'\t'*}
+      }
+    fi
+    # Driver cleanup is advisory and never confers signal authority.  Process
+    # ownership was already handled by core; a broken cleanup hook must not
+    # strand an otherwise safely stoppable generation.
+    fwdports_driver_operation "$snapshot" cleanup \
+      "$generation/manifest" "$leg" "$runtime" "$pane_id" ||
+      printf 'fwdports: driver cleanup failed for %s\n' "$leg" >&2
+  done
+}
+
 _fwdports_stop_generation_locked() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 session_name=$7 attempts=$8 delay=$9
@@ -264,6 +432,7 @@ _fwdports_stop_generation_locked() {
       *) return 74 ;;
     esac
   done
+  _fwdports_cleanup_generation_drivers "$generation" "$digest"
   fwdports_tmux_remove_generation_session "$tmux_path" "$socket" \
     "$generation" "$digest" "$session_name" || return 74
   fwdports_pointer_remove "$root" "$pointer_kind" "$generation" "$digest" ||
@@ -362,6 +531,12 @@ _fwdports_controller_main() {
   # a computed module path, while the inventory checks runtime.sh separately.
   # shellcheck disable=SC1091
   source "$script_dir/runtime.sh"
+  # shellcheck disable=SC1091
+  source "$script_dir/tmux.sh"
+  # shellcheck disable=SC1091
+  source "$script_dir/driver-api.sh"
+  # shellcheck disable=SC1091
+  source "$script_dir/health.sh"
   case "$command" in
     wait-for-activation)
       [[ $# -eq 3 ]] || {
@@ -370,6 +545,13 @@ _fwdports_controller_main() {
         return 64
       }
       fwdports_controller_wait_for_activation "$1" "$2" "$3"
+      ;;
+    run)
+      [[ $# -eq 3 ]] || {
+        printf 'usage: controller.sh run ROOT GENERATION DIGEST\n' >&2
+        return 64
+      }
+      fwdports_controller_run "$1" "$2" "$3"
       ;;
     *)
       printf 'fwdports: unknown controller operation\n' >&2

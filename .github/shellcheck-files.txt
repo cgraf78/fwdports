@@ -1,23 +1,35 @@
 # type<TAB>repository-relative path
 # `fixture` records are discovered but intentionally excluded from ShellCheck.
 program	bin/fwdports
+program	examples/drivers.d/example
 program	install.sh
+program	lib/fwdports/builtin-runner.sh
 program	lib/fwdports/config.sh
 program	lib/fwdports/controller.sh
+program	lib/fwdports/core.sh
+program	lib/fwdports/driver-api.sh
 program	lib/fwdports/drivers.sh
+program	lib/fwdports/health.sh
 program	lib/fwdports/runtime.sh
 program	lib/fwdports/ssh-gate.sh
 program	lib/fwdports/tmux.sh
 program	scripts/checkout-installer.conf
 program	support/install-checkout.sh
+program	test/autossh-driver-test
+program	test/builtin-runner-test
+program	test/cli-integration-test
 program	test/cli-test
 program	test/config-test
 program	test/controller-test
+program	test/driver-api-test
+program	test/examples-test
 program	test/harness-test
+program	test/health-test
 program	test/install-test
 program	test/lib/test.sh
 program	test/license-test
 program	test/process-tree-test
+program	test/portability-test
 program	test/runtime-security-test
 program	test/run
 program	test/ssh-driver-test

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    # main is the only maintained branch. Keep this aligned with the protected
+    # default branch when the remote repository is eventually created.
+    branches: [main]
+  pull_request:
+  schedule:
+    # Stagger sibling repositories so their full matrices do not all contend
+    # for runner capacity at the top of the hour.
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@464468328f050e43299298fc0eac8b971ddd38b7
+    with:
+      # Process groups, Bash 3.2, tmux direct argv, and BSD command adapters
+      # materially differ on macOS, Linux, and Termux, so every PR gets the
+      # full shared matrix rather than deferring compatibility to a schedule.
+      matrix-set: full
+      profiles: base,python,tmux,openssh-netcat-lsof,procps
+      shellcheck-inventory-path: .github/shellcheck-files.txt
+      test-command: bash test/run
+      termux-profiles: runtime,python,tmux,openssh-netcat-lsof,procps
+
+  actions-sync:
+    name: cgraf78/actions sync
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Workflow `uses:` refs must be literals. This gate proves those literals
+      # still match the repository's one reviewed actions dependency lock.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@464468328f050e43299298fc0eac8b971ddd38b7

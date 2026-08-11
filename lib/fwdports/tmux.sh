@@ -100,6 +100,54 @@ fwdports_tmux_create_session() {
   printf '%s\t%s\n' "$session_id" "$pane_id"
 }
 
+fwdports_tmux_abort_created_session() {
+  local tmux_path=$1 socket=$2 session_id=$3 nonce=$4 recorded_nonce
+
+  [[ $session_id =~ ^\$[0-9]+$ &&
+    $nonce =~ ^generation\.[A-Za-z0-9]+$ ]] || return 1
+  if ! _fwdports_tmux_call "$tmux_path" "$socket" has-session \
+    -t "$session_id" 2>/dev/null; then
+    return 0
+  fi
+  recorded_nonce=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    show-environment -t "$session_id" FWDPORTS_GENERATION 2>/dev/null) ||
+    return 1
+  [[ $recorded_nonce == "FWDPORTS_GENERATION=$nonce" ]] || {
+    printf 'fwdports: refusing to abort a tmux session with another nonce\n' \
+      >&2
+    return 1
+  }
+  # This helper is only for the narrow gap after `new-session` returned its
+  # exact ID but before durable pane evidence could be written.  Past that
+  # point normal cleanup requires the stronger process evidence path.
+  _fwdports_tmux_call "$tmux_path" "$socket" kill-session -t "$session_id"
+}
+
+fwdports_tmux_split_pane() {
+  local tmux_path=$1 socket=$2 session_id=$3 nonce=$4 start_directory=$5
+  local recorded_nonce pane_id recorded_session
+  shift 5
+
+  [[ $session_id =~ ^\$[0-9]+$ &&
+    $nonce =~ ^generation\.[A-Za-z0-9]+$ && $# -gt 0 ]] || return 1
+  recorded_nonce=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    show-environment -t "$session_id" FWDPORTS_GENERATION) || return 1
+  [[ $recorded_nonce == "FWDPORTS_GENERATION=$nonce" ]] || {
+    printf 'fwdports: tmux session nonce changed before pane creation\n' >&2
+    return 1
+  }
+  pane_id=$(_fwdports_tmux_call "$tmux_path" "$socket" split-window \
+    -d -P -F '#{pane_id}' -t "$session_id" -c "$start_directory" -- \
+    "$@") || return 1
+  [[ $pane_id =~ ^%[0-9]+$ ]] || return 1
+  recorded_session=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$pane_id" '#{session_id}') || return 1
+  [[ $recorded_session == "$session_id" ]] || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -p \
+    -t "$pane_id" remain-on-exit on >/dev/null || return 1
+  printf '%s\n' "$pane_id"
+}
+
 _fwdports_process_snapshot() {
   local pid=$1 line observed_pid parent_pid pgid sid tty stat extra
 
@@ -139,12 +187,16 @@ fwdports_tmux_record_pane() {
     printf 'fwdports: tmux pane identifiers are invalid\n' >&2
     return 1
   }
-  relative=${output#"$generation/legs/"}
-  [[ $output == "$generation/legs/$relative" &&
-    $relative =~ ^[A-Za-z][A-Za-z0-9_-]*/pane$ ]] || {
-    printf 'fwdports: pane evidence path escapes its generation\n' >&2
-    return 1
-  }
+  if [[ $output == "$generation/controller.pane" ]]; then
+    relative=controller.pane
+  else
+    relative=${output#"$generation/legs/"}
+    [[ $output == "$generation/legs/$relative" &&
+      $relative =~ ^[A-Za-z][A-Za-z0-9_-]*/pane$ ]] || {
+      printf 'fwdports: pane evidence path escapes its generation\n' >&2
+      return 1
+    }
+  fi
   parent=${output%/*}
   [[ -d "$parent" && ! -L "$parent" ]] || {
     printf 'fwdports: pane evidence parent is unavailable\n' >&2
@@ -243,7 +295,8 @@ _fwdports_pane_evidence_read() {
   local version='' nonce='' digest='' session_id='' pane_id='' leader_pid=''
   local leader_start='' tty='' sid='' pgid='' parent_pid='' process_state=''
 
-  [[ $evidence == "$generation"/legs/*/pane &&
+  [[ ($evidence == "$generation"/legs/*/pane ||
+      $evidence == "$generation/controller.pane") &&
     -f "$evidence" && ! -L "$evidence" ]] || {
     printf 'fwdports: pane evidence is unavailable\n' >&2
     return 2

@@ -10,7 +10,8 @@ _fwdports_stat_identity() {
     printf '%s\n' "$output"
     return 0
   fi
-  if output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' -- "$path" 2>/dev/null); then
+  # BSD stat treats `--` as a pathname rather than an option terminator.
+  if output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' "$path" 2>/dev/null); then
     printf '%s\n' "$output"
     return 0
   fi
@@ -570,6 +571,85 @@ fwdports_ssh_resolve() {
     return 1
   }
   if ! mv -f -- "$tmp" "$output"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+fwdports_autossh_resolve() {
+  local requested=$1 output=$2 path stat_record owner mode _rest
+  local version_text old_umask tmp
+
+  path=$(_fwdports_canonical_executable "$requested") || {
+    printf 'fwdports: autossh is not available\n' >&2
+    return 1
+  }
+  stat_record=$(_fwdports_stat_identity "$path") || return 1
+  read -r owner mode _rest <<<"$stat_record"
+  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+    (((8#$mode & 022) != 0)); then
+    printf 'fwdports: autossh executable has untrusted metadata\n' >&2
+    return 1
+  fi
+  version_text=$(LC_ALL=C "$path" -V 2>&1) || {
+    printf 'fwdports: cannot query autossh version\n' >&2
+    return 1
+  }
+  [[ $version_text == *autossh* ]] || {
+    printf 'fwdports: unrecognized autossh version output\n' >&2
+    return 1
+  }
+  old_umask=$(umask)
+  umask 077
+  tmp=$(mktemp "${output}.tmp.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  umask "$old_umask"
+  if ! {
+    printf 'path\t%s\n' "$path"
+    printf 'version\t%s\n' "$version_text"
+  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output";
+  then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+fwdports_builtin_prepare() {
+  local manifest=$1 leg=$2 driver=$3 runtime=$4 target_override=$5
+  local identity=$runtime/ssh-source argv_file=$runtime/ssh-argv
+  local target=$runtime/ssh-target digest=$runtime/ssh-effective-digest
+  local kind_file=$runtime/driver-kind tmp old_umask
+
+  [[ $driver == ssh || $driver == autossh ]] || return 1
+  [[ -d "$runtime" && ! -L "$runtime" ]] || return 1
+  fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" "$identity" ||
+    return 1
+  fwdports_ssh_build_argv "$manifest" "$leg" "$target_override" \
+    "$argv_file" \
+    "$target" || return 1
+  fwdports_ssh_preflight_local_ports "$argv_file" || return 1
+  local ssh_path
+  ssh_path=$(LC_ALL=C sed -n 's/^path\t//p' "$identity") || return 1
+  [[ -n $ssh_path ]] || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$(<"$target")" "$argv_file" \
+    "$digest" || return 1
+  fwdports_ssh_prepare_gate "$runtime" "$identity" "$digest" || return 1
+  if [[ $driver == autossh ]]; then
+    fwdports_autossh_resolve "${FWDPORTS_AUTOSSH_COMMAND:-autossh}" \
+      "$runtime/autossh-source" || return 1
+  fi
+
+  old_umask=$(umask)
+  umask 077
+  tmp=$(mktemp "$runtime/.driver-kind.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  umask "$old_umask"
+  if ! printf '%s\n' "$driver" >"$tmp" || ! chmod 0600 "$tmp" ||
+    ! mv -f -- "$tmp" "$kind_file"; then
     rm -f -- "$tmp"
     return 1
   fi

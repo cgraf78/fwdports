@@ -16,7 +16,7 @@ gate_stat_identity() {
   local path=$1 output _owner mode device inode size mtime
 
   if output=$(LC_ALL=C stat -c '%u %a %d %i %s %Y' -- "$path" 2>/dev/null) ||
-    output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' -- "$path" 2>/dev/null); then
+    output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' "$path" 2>/dev/null); then
     read -r _owner mode device inode size mtime <<<"$output"
     printf '%s:%s:%s:%s:%s\n' "$device" "$inode" "$mode" "$size" "$mtime"
     return 0

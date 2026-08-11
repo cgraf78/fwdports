@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Explicit autossh resolution and launch-environment tests.
+# shellcheck disable=SC2329,SC2016
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+RUNNER=$ROOT/lib/fwdports/builtin-runner.sh
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/drivers.sh
+source "$ROOT/lib/fwdports/drivers.sh"
+
+explicit_only_case() {
+  local tmp empty_path output status
+  tmp=$(_tmpdir) || return 1
+  empty_path=$tmp/bin
+  output=$tmp/identity
+  mkdir -p "$empty_path"
+  set +e
+  PATH=$empty_path fwdports_autossh_resolve autossh "$output" \
+    >/dev/null 2>&1
+  status=$?
+  _assert_exit "autossh: selected dependency must exist" 1 "$status"
+  _assert_not_exists "autossh: failed resolution publishes nothing" "$output"
+}
+
+sanitized_environment_case() {
+  local tmp runtime fake output status content
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  fake=$tmp/autossh
+  output=$tmp/output
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' autossh >"$runtime/driver-kind"
+  printf '%s\n' shell.example.com >"$runtime/ssh-target"
+  printf '%s\n' -N -T >"$runtime/ssh-argv"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$runtime/ssh-gate"
+  chmod 0700 "$runtime/ssh-gate"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "gate=%s port=%s path=%s\n" "$AUTOSSH_GATETIME" "$AUTOSSH_PORT" "$AUTOSSH_PATH"' \
+    'printf "maxstart=%s pidfile=%s debug=%s\n" "${AUTOSSH_MAXSTART-unset}" "${AUTOSSH_PIDFILE-unset}" "${AUTOSSH_DEBUG-unset}"' \
+    'printf "argv"; printf " <%s>" "$@"; printf "\n"' >"$fake"
+  chmod 0700 "$fake"
+  printf 'path\t%s\nversion\tautossh test\n' "$fake" \
+    >"$runtime/autossh-source"
+
+  set +e
+  AUTOSSH_MAXSTART=9 AUTOSSH_PIDFILE=$tmp/pid AUTOSSH_DEBUG=1 \
+    "$RUNNER" "$runtime" >"$output" 2>&1
+  status=$?
+  content=$(<"$output")
+  _assert_exit "autossh: foreground launcher succeeds" 0 "$status"
+  _assert_contains "autossh: disables startup gate and monitor port" \
+    "gate=0 port=0" "$content"
+  _assert_contains "autossh: routes every child through SSH gate" \
+    "path=$runtime/ssh-gate" "$content"
+  _assert_contains "autossh: removes ambient retry controls" \
+    "maxstart=unset pidfile=unset debug=unset" "$content"
+  _assert_contains "autossh: launches in foreground with distinct argv" \
+    "argv <-M> <0> <-N> <-T> <shell.example.com>" "$content"
+}
+
+run_case explicit-only explicit_only_case
+run_case sanitized-environment sanitized_environment_case
+_test_summary

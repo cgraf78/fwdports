@@ -9,6 +9,8 @@ Core validates and copies the exact executable into the stable generation
 before invoking it. The generation continues to use that immutable snapshot if
 the configured source later changes or disappears. Sibling files are not
 copied; a driver with ambient dependencies must validate them explicitly.
+Several legs may select the same driver; they share one immutable executable
+snapshot but receive separate runtime directories and separate operation calls.
 
 ## Operations
 
@@ -30,7 +32,8 @@ DRIVER cleanup MANIFEST LEG RUNTIME_DIR [PANE_ID]
 - `run` is the foreground lifetime process. It must not daemonize or escape the
   pane process group. A wrapper owns, stops, and reaps every helper it creates.
 - `is-live` returns zero for driver-proven liveness, one for not live, and two
-  to request verified pane-process liveness only. It must not mutate.
+  to request verified pane-process liveness only. Core consults it only after
+  authenticating the pane, and it must not mutate.
 - `cleanup` is bounded and idempotent before or after pane creation. It may
   remove driver-owned state, but process signalling authority always remains
   with core ownership checks.
@@ -40,8 +43,10 @@ through environment variables, tmux metadata, shell command strings, or process
 titles. The immutable manifest uses a versioned tab-delimited schema whose
 values cannot contain tabs or newlines.
 
-`validate`, `is-live`, and `cleanup` must return synchronously without surviving
-descendants. All validation completes before any prepare call. Preparation or
-start failure invokes cleanup in reverse order.
+`validate`, `is-live`, and `cleanup` must bound their own work and return
+synchronously without surviving descendants. Drivers are trusted code, so core
+does not attempt to sandbox these calls or guess how to kill descendants it did
+not create. All validation completes before any prepare call. Preparation or
+start failure invokes cleanup in reverse leg order.
 
 See `examples/drivers.d/example` for a harmless executable contract example.

@@ -590,6 +590,166 @@ dead_pane_process_inspection_failure_case() {
   kill_test_server "$STATUS_SOCKET"
 }
 
+external_cleanup_order_case() {
+  local tmp fixture root generation digest events status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+
+  # Isolate the lifecycle ordering from tmux mechanics already covered by the
+  # termination tests. The hook must get a chance to release authenticated
+  # remote state before core tears down the owned process group, then run once
+  # more after termination to finalize any remaining local state.
+  fwdports_tmux_verify_pane() { return 0; }
+  _fwdports_verify_owned_group() { printf '1\n'; }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 1 0 >/dev/null 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "external cleanup ordering: stop succeeds" 0 "$status"
+  _assert_eq "external cleanup ordering: preserves live then final cleanup" \
+    $'cleanup\nterminate\ncleanup\nremove-session' "$(<"$events")"
+}
+
+precleanup_all_panes_validated_case() {
+  local tmp fixture root generation digest events status evidence
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  for evidence in a-valid z-ambiguous; do
+    mkdir -p "$generation/legs/$evidence"
+    chmod 0700 "$generation/legs" "$generation/legs/$evidence"
+    : >"$generation/legs/$evidence/pane"
+  done
+
+  fwdports_tmux_verify_pane() { return 0; }
+  _fwdports_verify_owned_group() {
+    case "$3" in
+      */z-ambiguous/pane) return 74 ;;
+      *) printf '1\n' ;;
+    esac
+  }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 1 0 >/dev/null 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "precleanup validation: ambiguous later pane fails closed" \
+    74 "$status"
+  _assert_not_exists "precleanup validation: invokes no hook or signal" "$events"
+  _assert_file "precleanup validation: preserves generation" \
+    "$generation/manifest"
+  _assert_file "precleanup validation: preserves pointer" "$root/pending"
+}
+
+precleanup_stops_pane_case() {
+  local tmp fixture root generation digest events status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+  FWDPORTS_TEST_PANE_LIVE=1
+
+  fwdports_tmux_verify_pane() {
+    [[ $FWDPORTS_TEST_PANE_LIVE -eq 1 ]]
+  }
+  _fwdports_verify_owned_group() { printf '1\n'; }
+  _fwdports_pane_evidence_read() {
+    printf 'session\t%%1\t101\t1\ttty\t101\t101\t1\trunning\n'
+  }
+  _fwdports_process_group_live_records() { return 1; }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+    FWDPORTS_TEST_PANE_LIVE=0
+  }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 1 0 >/dev/null 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "precleanup exit: stop succeeds" 0 "$status"
+  _assert_eq "precleanup exit: reclassifies instead of signalling stale pane" \
+    $'cleanup\ncleanup\nremove-session' "$(<"$events")"
+}
+
+precleanup_revalidation_ambiguity_case() {
+  local tmp fixture root generation digest events status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+  FWDPORTS_TEST_PANE_AMBIGUOUS=0
+
+  fwdports_tmux_verify_pane() {
+    [[ $FWDPORTS_TEST_PANE_AMBIGUOUS -eq 0 ]] || return 2
+  }
+  _fwdports_verify_owned_group() { printf '1\n'; }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+    FWDPORTS_TEST_PANE_AMBIGUOUS=1
+  }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 1 0 >/dev/null 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "precleanup revalidation: hook-induced ambiguity fails closed" \
+    74 "$status"
+  _assert_eq "precleanup revalidation: sends no signal after ambiguity" \
+    cleanup "$(<"$events")"
+  _assert_file "precleanup revalidation: preserves generation" \
+    "$generation/manifest"
+  _assert_file "precleanup revalidation: preserves pointer" "$root/pending"
+}
+
 run_case controller-ready controller_ready_case
 run_case controller-before-publish controller_before_publish_case
 run_case controller-after-publish controller_after_publish_case
@@ -607,4 +767,9 @@ run_case crash-after-kill crash_after_kill_case
 run_case force-between-generations force_between_generations_case
 run_case dead-pane-process-inspection-failure \
   dead_pane_process_inspection_failure_case
+run_case external-cleanup-order external_cleanup_order_case
+run_case precleanup-all-panes-validated precleanup_all_panes_validated_case
+run_case precleanup-stops-pane precleanup_stops_pane_case
+run_case precleanup-revalidation-ambiguity \
+  precleanup_revalidation_ambiguity_case
 _test_summary

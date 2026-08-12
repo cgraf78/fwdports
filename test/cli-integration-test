@@ -78,11 +78,24 @@ case "${1:-}" in
   validate) printf 'validated\n' >>"$4/events" ;;
   prepare) printf 'prepared\n' >>"$4/events" ;;
   run)
-    trap 'exit 0' HUP INT TERM
+    leg=$3
+    printf '%s\n' "$$" >"$FWDPORTS_TEST_EXTERNAL_STATE/$leg.pid"
+    : >"$FWDPORTS_TEST_EXTERNAL_STATE/$leg.listener"
+    trap 'printf "term-%s\n" "$leg" >>"$FWDPORTS_TEST_EXTERNAL_ORDER"; exit 0' HUP INT TERM
     while :; do sleep 1; done
     ;;
   is-live) exit 2 ;;
-  cleanup) : ;;
+  cleanup)
+    leg=$3
+    pid_file=$FWDPORTS_TEST_EXTERNAL_STATE/$leg.pid
+    phase=dead
+    if [[ -s $pid_file ]] && kill -0 "$(<"$pid_file")" 2>/dev/null; then
+      phase=live
+      rm -f -- "$FWDPORTS_TEST_EXTERNAL_STATE/$leg.listener"
+    fi
+    printf 'cleanup-%s-%s\n' "$phase" "$leg" \
+      >>"$FWDPORTS_TEST_EXTERNAL_ORDER"
+    ;;
   *) exit 64 ;;
 esac
 DRIVER
@@ -91,10 +104,15 @@ DRIVER
 
 shared_external_driver_case() {
   local tmp config output generation driver_count first_events second_events
+  local lifecycle_state lifecycle_order cleanup_order first_pid second_pid
+  local tick=0
   tmp=$(_tmpdir) || return 1
   setup_case_root "$tmp"
   config=$CASE_CONFIG/fwdports/tunnels.conf
   output=$tmp/output
+  lifecycle_state=$tmp/external-state
+  lifecycle_order=$tmp/external-order
+  mkdir -m 0700 "$lifecycle_state"
   write_external_driver "$CASE_CONFIG/fwdports/drivers.d/example"
   printf '%s\n' \
     'profile default' \
@@ -102,7 +120,9 @@ shared_external_driver_case() {
     'leg second example' >"$config"
   chmod 0600 "$config"
 
-  run_fwdports "$output" start
+  FWDPORTS_TEST_EXTERNAL_STATE=$lifecycle_state \
+    FWDPORTS_TEST_EXTERNAL_ORDER=$lifecycle_order \
+    run_fwdports "$output" start
   _assert_exit "external driver reuse: two legs start" 0 "$COMMAND_STATUS"
   generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
   driver_count=$(printf '%s\n' "$generation/drivers"/example | wc -l |
@@ -116,13 +136,52 @@ shared_external_driver_case() {
   _assert_eq "external driver reuse: prepares second leg" \
     $'validated\nprepared' "$second_events"
 
+  while [[ $tick -lt 200 ]]; do
+    if [[ -s $lifecycle_state/first.pid &&
+      -s $lifecycle_state/second.pid &&
+      -e $lifecycle_state/first.listener &&
+      -e $lifecycle_state/second.listener ]]; then
+      first_pid=$(<"$lifecycle_state/first.pid")
+      second_pid=$(<"$lifecycle_state/second.pid")
+      if kill -0 "$first_pid" 2>/dev/null &&
+        kill -0 "$second_pid" 2>/dev/null; then
+        break
+      fi
+    fi
+    sleep 0.01
+    tick=$((tick + 1))
+  done
+  if [[ $tick -lt 200 ]]; then
+    _pass "external driver cleanup: both run processes and listeners are live"
+  else
+    _fail "external driver cleanup: both run processes and listeners are live"
+    first_pid=${first_pid:-0}
+    second_pid=${second_pid:-0}
+  fi
+
   run_fwdports "$output" status
   _assert_exit "external driver reuse: status succeeds" 0 "$COMMAND_STATUS"
   _assert_eq "external driver reuse: both panes remain live" \
     live/unverified "$COMMAND_OUTPUT"
-  run_fwdports "$output" stop
+  FWDPORTS_TEST_EXTERNAL_STATE=$lifecycle_state \
+    FWDPORTS_TEST_EXTERNAL_ORDER=$lifecycle_order \
+    run_fwdports "$output" stop
   _assert_exit "external driver reuse: authenticated stop succeeds" \
     0 "$COMMAND_STATUS"
+  cleanup_order=$(awk '/^(cleanup|term)-/ { print }' "$lifecycle_order")
+  _assert_eq "external driver cleanup: live hooks precede TERM and final hooks" \
+    $'cleanup-live-second\ncleanup-live-first\nterm-first\nterm-second\ncleanup-dead-second\ncleanup-dead-first' \
+    "$cleanup_order"
+  _assert_not_exists "external driver cleanup: first listener is retired" \
+    "$lifecycle_state/first.listener"
+  _assert_not_exists "external driver cleanup: second listener is retired" \
+    "$lifecycle_state/second.listener"
+  if ! kill -0 "$first_pid" 2>/dev/null &&
+    ! kill -0 "$second_pid" 2>/dev/null; then
+    _pass "external driver cleanup: all run processes exit"
+  else
+    _fail "external driver cleanup: all run processes exit"
+  fi
 }
 
 setup_case_root() {

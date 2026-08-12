@@ -378,20 +378,63 @@ _fwdports_cleanup_generation_drivers() {
         pane_id=${record%%$'\t'*}
       }
     fi
-    # Driver cleanup is advisory and never confers signal authority.  Process
-    # ownership was already handled by core; a broken cleanup hook must not
-    # strand an otherwise safely stoppable generation.
+    # Driver cleanup is advisory and never confers signal authority.  Core
+    # retains that authority after its full prevalidation; a broken cleanup
+    # hook must not strand an otherwise safely stoppable generation.
     fwdports_driver_operation "$snapshot" cleanup \
       "$generation/manifest" "$leg" "$runtime" "$pane_id" ||
       printf 'fwdports: driver cleanup failed for %s\n' "$leg" >&2
   done
 }
 
+_fwdports_stop_pane_state() {
+  local tmux_path=$1 socket=$2 generation=$3 digest=$4 evidence=$5
+  local verify_status record pgid group_status
+
+  if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
+    "$digest" "$evidence"; then
+    # A valid pane leader alone is insufficient authority for a live cleanup
+    # opportunity: an unexpected same-PGID member could make later teardown
+    # ambiguous. Authenticate the complete owned group before any hook runs.
+    _fwdports_verify_owned_group "$generation" "$digest" "$evidence" \
+      >/dev/null || return 74
+    printf 'live\n'
+    return 0
+  else
+    verify_status=$?
+  fi
+  case "$verify_status" in
+    1)
+      # A dead pane is safe to finish only when its recorded group is also
+      # empty. If a survivor remains after its leader disappeared, ownership
+      # is incomplete and automatic recovery must stop.
+      record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+        "$evidence") || return 74
+      IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$record"
+      if _fwdports_process_group_live_records "$pgid" \
+        >/dev/null 2>&1; then
+        printf 'fwdports: recorded leader is gone but its group remains\n' \
+          >&2
+        return 74
+      else
+        group_status=$?
+      fi
+      if [[ $group_status -ne 1 ]]; then
+        printf 'fwdports: cannot inspect the recorded process group\n' >&2
+        return 74
+      fi
+      printf 'dead\n'
+      ;;
+    *) return 74 ;;
+  esac
+}
+
 _fwdports_stop_generation_locked() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 session_name=$7 attempts=$8 delay=$9
   local control_record phase desired controller_pid controller_start
-  local probe evidence verify_status record pgid group_status
+  local probe evidence pane_state
+  local -a pane_evidence=()
 
   control_record=$(fwdports_control_read "$generation" "$digest") || return 74
   IFS=$'\t' read -r phase desired controller_pid controller_start probe \
@@ -404,39 +447,36 @@ _fwdports_stop_generation_locked() {
       "$controller_pid" "$controller_start" "$probe" || return 74
   fi
 
+  # External drivers can hold an authenticated transport that is required to
+  # retire remote resources gracefully. The later process-group TERM also
+  # reaches that transport, so a cleanup hook invoked only afterward is too
+  # late. Authenticate every recorded pane before granting the advisory hook
+  # any lifecycle opportunity, and retain the exact evidence paths so a hook
+  # cannot make a pane disappear from the second pass by removing its record.
   for evidence in "$generation"/legs/*/pane; do
     [[ -e "$evidence" || -L "$evidence" ]] || continue
-    if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
-      "$digest" "$evidence"; then
-      verify_status=0
-    else
-      verify_status=$?
-    fi
-    case "$verify_status" in
-      0)
+    pane_evidence+=("$evidence")
+    _fwdports_stop_pane_state "$tmux_path" "$socket" "$generation" \
+      "$digest" "$evidence" >/dev/null || return 74
+  done
+
+  # Cleanup is deliberately idempotent in the driver contract. The live pass
+  # lets a driver use its already-authenticated channel; the final pass below
+  # removes local residue after core has stopped every owned process. A crash
+  # between them is safe because committed stop intent makes recovery repeat
+  # both passes.
+  _fwdports_cleanup_generation_drivers "$generation" "$digest"
+
+  for evidence in ${pane_evidence[@]+"${pane_evidence[@]}"}; do
+    pane_state=$(_fwdports_stop_pane_state "$tmux_path" "$socket" \
+      "$generation" "$digest" "$evidence") || return 74
+    case "$pane_state" in
+      live)
         fwdports_tmux_terminate_pane "$tmux_path" "$socket" "$root" \
           "$pointer_kind" "$generation" "$digest" "$evidence" \
           "$attempts" "$delay" >/dev/null || return 74
         ;;
-      1)
-        # A dead pane is safe to finish only when its recorded group is also
-        # empty. If a survivor remains after its leader disappeared, ownership
-        # is incomplete and automatic recovery must stop.
-        record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
-          "$evidence") || return 74
-        IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$record"
-        if _fwdports_process_group_live_records "$pgid" \
-          >/dev/null 2>&1; then
-          printf 'fwdports: recorded leader is gone but its group remains\n' >&2
-          return 74
-        else
-          group_status=$?
-        fi
-        if [[ $group_status -ne 1 ]]; then
-          printf 'fwdports: cannot inspect the recorded process group\n' >&2
-          return 74
-        fi
-        ;;
+      dead) ;;
       *) return 74 ;;
     esac
   done

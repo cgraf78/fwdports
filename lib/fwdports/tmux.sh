@@ -523,9 +523,30 @@ _fwdports_wait_group_empty() {
   done
 }
 
+_fwdports_recorded_group_is_empty() {
+  local generation=$1 digest=$2 evidence=$3 record pgid status
+
+  # A driver cleanup hook can make its pane exit asynchronously.  Once tmux
+  # has conclusively reported that exact pane dead, the immutable evidence is
+  # still useful for proving that its recorded process group has no survivor.
+  # Return 0 only for a complete, unambiguous absence; live or uninspectable
+  # groups remain distinct so callers can fail closed without sending a signal.
+  record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$evidence") || return 2
+  IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$record"
+  if _fwdports_process_group_live_records "$pgid" >/dev/null 2>&1; then
+    return 1
+  else
+    status=$?
+  fi
+  [[ $status -eq 1 ]] || return 2
+  return 0
+}
+
 fwdports_tmux_terminate_pane() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 evidence=$7 attempts=$8 delay=$9 verify_status pgid
+  local group_status
 
   [[ $attempts =~ ^[1-9][0-9]*$ &&
     $delay =~ ^(0|0\.[0-9]+|[1-9][0-9]*(\.[0-9]+)?)$ ]] || {
@@ -544,9 +565,30 @@ fwdports_tmux_terminate_pane() {
     verify_status=$?
   fi
   if [[ $verify_status -ne 0 ]]; then
+    if [[ $verify_status -eq 1 ]]; then
+      if _fwdports_recorded_group_is_empty "$generation" "$digest" \
+        "$evidence"; then
+        # Graceful driver cleanup won the race with core's TERM.  No signal is
+        # needed, but recheck committed stop authority before accepting the
+        # transition and allowing the generation to be removed.
+        _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+          "$generation" "$digest" || return 74
+        printf 'gone\n'
+        return 0
+      else
+        group_status=$?
+      fi
+      if [[ $group_status -eq 2 ]]; then
+        printf 'fwdports: cannot inspect the recorded process group\n' >&2
+        return 74
+      fi
+    fi
     # Even a conclusively dead tmux pane is not permission to signal a
-    # survivor found by stale PID/PGID evidence. Retain it for diagnosis.
-    printf 'fwdports: recorded leader is no longer live\n' >&2
+    # survivor found by stale PID/PGID evidence. Retain it for diagnosis. The
+    # same rule covers ownership ambiguity reported by tmux or the process
+    # snapshot: absence is accepted only through the complete check above.
+    printf 'fwdports: recorded leader is no longer live; its group remains\n' \
+      >&2
     return 74
   fi
   pgid=$(_fwdports_verify_owned_group "$generation" "$digest" "$evidence") ||
@@ -574,11 +616,35 @@ fwdports_tmux_terminate_pane() {
   # refuses to guess that the survivor is still ours.
   _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
     "$generation" "$digest" || return 74
-  fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
-    "$digest" "$evidence" || {
+  if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
+    "$digest" "$evidence"; then
+    verify_status=0
+  else
+    verify_status=$?
+  fi
+  if [[ $verify_status -ne 0 ]]; then
+    if [[ $verify_status -eq 1 ]]; then
+      if _fwdports_recorded_group_is_empty "$generation" "$digest" \
+        "$evidence"; then
+        # TERM completed just after the last bounded poll.  Treat that as the
+        # graceful outcome it is instead of escalating—or reporting failure
+        # merely because process exit and observation crossed in flight.
+        _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+          "$generation" "$digest" || return 74
+        printf 'term\n'
+        return 0
+      else
+        group_status=$?
+      fi
+      if [[ $group_status -eq 2 ]]; then
+        printf 'fwdports: cannot inspect the recorded process group before KILL\n' \
+          >&2
+        return 74
+      fi
+    fi
     printf 'fwdports: pane ownership changed before KILL\n' >&2
     return 74
-  }
+  fi
   pgid=$(_fwdports_verify_owned_group "$generation" "$digest" "$evidence") ||
     return 74
   kill -KILL -- "-$pgid" 2>/dev/null || true

@@ -34,9 +34,16 @@ DRIVER cleanup MANIFEST LEG RUNTIME_DIR [PANE_ID]
 - `is-live` returns zero for driver-proven liveness, one for not live, and two
   to request verified pane-process liveness only. Core consults it only after
   authenticating the pane, and it must not mutate.
-- `cleanup` is bounded and idempotent before or after pane creation. It may
-  remove driver-owned state, but process signalling authority always remains
-  with core ownership checks.
+- `cleanup` is bounded and idempotent before or after pane creation. During an
+  authenticated stop, core may invoke it while the `run` process is still live
+  and again after core-owned processes have exited. Crash recovery can repeat
+  either invocation. The live invocation lets a driver gracefully retire
+  remote resources through an authenticated channel that process-group
+  termination would otherwise close; a later invocation removes remaining
+  local state. The driver must coordinate access to its own runtime state, must
+  not modify core-owned pane evidence, and must return without surviving
+  descendants. It may remove driver-owned state, but process signalling
+  authority always remains with core ownership checks.
 
 All operations receive fixed argv paths. Secrets and options are never passed
 through environment variables, tmux metadata, shell command strings, or process

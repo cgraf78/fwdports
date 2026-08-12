@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+# Stock Eternal Terminal v7 driver validation and generation-gate tests.
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2016,SC2329,SC2034
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/driver-api.sh
+source "$ROOT/lib/fwdports/driver-api.sh"
+# shellcheck source=../lib/fwdports/drivers.sh
+source "$ROOT/lib/fwdports/drivers.sh"
+
+write_fake_et() {
+  local path=$1 version=${2:-7.0.0} omit_capability=${3:-}
+  local capability
+
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+    printf 'if [[ ${1:-} == --version ]]; then printf "et version %s\\n"; exit 0; fi\n' \
+      "$version"
+    printf 'if [[ ${1:-} == --help ]]; then\n'
+    for capability in --port --tunnel --reversetunnel --logdir \
+      --logtostdout --no-terminal --telemetry; do
+      [[ $capability == "$omit_capability" ]] ||
+        printf '  printf "  %s\\n"\n' "$capability"
+    done
+    printf '%s\n' '  exit 0' 'fi'
+    printf '%s\n' \
+      '{' \
+      '  printf "TERM=%s\nTMPDIR=%s\nTMP=%s\nTEMP=%s\n" "${TERM:-}" "${TMPDIR:-}" "${TMP:-}" "${TEMP:-}"' \
+      '  printf "ARG=%s\n" "$@"' \
+      '} >"${FWDPORTS_TEST_ET_LOG:-/dev/null}"' \
+      '[[ -z ${FWDPORTS_TEST_ET_STATUS:-} ]] || exit "$FWDPORTS_TEST_ET_STATUS"' \
+      'trap "exit 0" HUP INT TERM' \
+      'while :; do sleep 1; done'
+  } >"$path"
+  chmod 0700 "$path"
+}
+
+write_fake_ssh() {
+  local path=$1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == -G ]]; then cat "$FWDPORTS_TEST_SSH_CONFIG"; exit 0; fi' \
+    'printf "%s\n" "$@" >"${FWDPORTS_TEST_SSH_LOG:-/dev/null}"' \
+    'exit 0' >"$path"
+  chmod 0700 "$path"
+}
+
+write_et_manifest() {
+  local path=$1
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\tgeneration.test' \
+    $'target\tnone' \
+    $'profile\tdemo' \
+    $'leg\tedge\tet' \
+    $'set\tedge\thost\tshell.example.com' \
+    $'set\tedge\tport\t2202' \
+    $'set\tedge\tlocal-forward\t127.0.0.1:18080:127.0.0.1:8080' \
+    $'set\tedge\tremote-forward\t127.0.0.1:19090:127.0.0.1:9090' \
+    $'check\tedge\tloopback\t127.0.0.1\t18080\tedge' >"$path"
+  chmod 0600 "$path"
+}
+
+resolve_case() {
+  local tmp fake output error status content expected_digest
+  tmp=$(_tmpdir) || return 1
+  fake=$tmp/et
+  output=$tmp/source
+  error=$tmp/error
+  write_fake_et "$fake"
+
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  content=
+  [[ ! -f $output ]] || content=$(<"$output")
+  expected_digest=$(_fwdports_sha256_file "$fake")
+
+  _assert_exit "stock ET executable: supported v7 resolves" 0 "$status"
+  _assert_contains "stock ET executable: records canonical path" \
+    $'path\t'"$fake" "$content"
+  _assert_contains "stock ET executable: records exact version" \
+    $'version\t7.0.0' "$content"
+  _assert_contains "stock ET executable: records immutable digest" \
+    $'digest\t'"$expected_digest" "$content"
+  _assert_contains "stock ET executable: records file identity" \
+    $'identity\t' "$content"
+  _assert_eq "stock ET executable: supported binary emits no diagnostic" \
+    "" "$(<"$error")"
+}
+
+compatibility_rejected_case() {
+  local tmp fake output error status
+  tmp=$(_tmpdir) || return 1
+  fake=$tmp/et
+  output=$tmp/source
+  error=$tmp/error
+
+  write_fake_et "$fake" 6.2.9
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: pre-v7 is rejected" 1 "$status"
+  _assert_contains "stock ET compatibility: minimum is actionable" \
+    "ET 7.0.0 is required" "$(<"$error")"
+  _assert_not_exists "stock ET compatibility: old version publishes nothing" \
+    "$output"
+
+  write_fake_et "$fake" 8.0.0
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: future major fails closed" 1 "$status"
+  _assert_contains "stock ET compatibility: future major is actionable" \
+    "ET 7.0.0 is required" "$(<"$error")"
+
+  write_fake_et "$fake" 7.0.1
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: unreviewed v7 patch fails closed" \
+    1 "$status"
+  _assert_contains "stock ET compatibility: reviewed release is named" \
+    "ET 7.0.0 is required" "$(<"$error")"
+
+  write_fake_et "$fake" 7.0.0.1
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: version suffix fails closed" \
+    1 "$status"
+  _assert_contains "stock ET compatibility: suffixed version is unrecognized" \
+    "unrecognized Eternal Terminal version" "$(<"$error")"
+
+  write_fake_et "$fake" 7.0.0 --telemetry
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: missing capability is rejected" \
+    1 "$status"
+  _assert_contains "stock ET compatibility: missing flag is named" \
+    "--telemetry" "$(<"$error")"
+}
+
+argv_case() {
+  local tmp manifest argv_file target_file log_dir error status expected
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  target_file=$tmp/target
+  log_dir=$tmp/runtime/log
+  error=$tmp/error
+  mkdir -p "$tmp/runtime"
+  chmod 0700 "$tmp/runtime"
+  write_et_manifest "$manifest"
+
+  set +e
+  fwdports_et_build_argv "$manifest" edge replacement.example.com \
+    "$argv_file" "$target_file" "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  expected=$(printf '%s\n' \
+    --no-terminal \
+    --logdir "$log_dir" \
+    --logtostdout \
+    --telemetry=false \
+    --port 2202 \
+    --tunnel 127.0.0.1:18080:127.0.0.1:8080 \
+    --reversetunnel 127.0.0.1:19090:127.0.0.1:9090)
+
+  _assert_exit "stock ET argv: valid direct-host profile builds" 0 "$status"
+  _assert_eq "stock ET argv: fixed safe options and forwards are exact" \
+    "$expected" "$(<"$argv_file")"
+  _assert_eq "stock ET argv: target override remains separate" \
+    replacement.example.com "$(<"$target_file")"
+  if [[ -d $log_dir && ! -L $log_dir ]]; then
+    _pass "stock ET argv: private log directory is real"
+  else
+    _fail "stock ET argv: private log directory is real"
+  fi
+  _assert_eq "stock ET argv: valid profile emits no diagnostic" \
+    "" "$(<"$error")"
+}
+
+invalid_records_case() {
+  local tmp manifest argv_file target_file log_dir error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  target_file=$tmp/target
+  log_dir=$tmp/log
+  error=$tmp/error
+  write_et_manifest "$manifest"
+
+  printf '%s\n' \
+    $'set\tedge\tlocal-forward\t127.0.0.1:18081:127.0.0.1:8081' \
+    >>"$manifest"
+  set +e
+  fwdports_et_build_argv "$manifest" edge '' "$argv_file" "$target_file" \
+    "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET records: repeated local forward is rejected" 1 \
+    "$status"
+  _assert_contains "stock ET records: repeat limit is actionable" \
+    "at most one local-forward" "$(<"$error")"
+
+  write_et_manifest "$manifest"
+  printf '%s\n' $'set\tedge\tidentity-file\t/tmp/id' >>"$manifest"
+  set +e
+  fwdports_et_build_argv "$manifest" edge '' "$argv_file" "$target_file" \
+    "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET records: SSH-only key is rejected" 1 "$status"
+  _assert_contains "stock ET records: unknown key is named" \
+    "unknown ET key" "$(<"$error")"
+
+  write_et_manifest "$manifest"
+  sed 's/shell\.example\.com/shell.example.com:2022/' "$manifest" \
+    >"$tmp/host-port"
+  set +e
+  fwdports_et_build_argv "$tmp/host-port" edge '' "$argv_file" \
+    "$target_file" "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET records: host port shorthand is rejected" 1 "$status"
+  _assert_contains "stock ET records: separate port key is named" \
+    "separate port key" "$(<"$error")"
+
+  write_et_manifest "$manifest"
+  sed 's/127\.0\.0\.1:19090:127\.0\.0\.1:9090/19090:9090/' \
+    "$manifest" >"$tmp/two-part"
+  set +e
+  fwdports_et_build_argv "$tmp/two-part" edge '' "$argv_file" \
+    "$target_file" "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET records: driver-specific shorthand is rejected" \
+    1 "$status"
+  _assert_contains "stock ET records: four-part syntax is required" \
+    "four-part" "$(<"$error")"
+
+  write_et_manifest "$manifest"
+  sed '/^check/d' "$manifest" >"$tmp/no-check"
+  set +e
+  fwdports_et_build_argv "$tmp/no-check" edge '' "$argv_file" \
+    "$target_file" "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET records: unchecked local tunnel is rejected" 1 \
+    "$status"
+  _assert_contains "stock ET records: health requirement is actionable" \
+    "requires a matching check" "$(<"$error")"
+}
+
+overflow_records_case() {
+  local tmp manifest argv_file target_file log_dir error status huge
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  target_file=$tmp/target
+  log_dir=$tmp/log
+  error=$tmp/error
+  huge=18446744073709551617
+
+  write_et_manifest "$tmp/base"
+  sed "s/2202/$huge/" "$tmp/base" >"$manifest"
+  set +e
+  fwdports_et_build_argv "$manifest" edge '' "$argv_file" "$target_file" \
+    "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET port bounds: huge server port is rejected" 1 \
+    "$status"
+  _assert_contains "stock ET port bounds: server diagnostic is actionable" \
+    "ET port is invalid" "$(<"$error")"
+
+  write_et_manifest "$tmp/base"
+  sed "s/18080/$huge/g" "$tmp/base" >"$manifest"
+  set +e
+  fwdports_et_build_argv "$manifest" edge '' "$argv_file" "$target_file" \
+    "$log_dir" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET port bounds: huge forward port is rejected" 1 \
+    "$status"
+  _assert_contains "stock ET port bounds: forward diagnostic is actionable" \
+    "four-part network syntax" "$(<"$error")"
+}
+
+target_grammar_case() {
+  local status
+
+  status=0
+  _fwdports_et_safe_target shell.example.com || status=$?
+  _assert_exit "stock ET target: hostname is accepted" 0 "$status"
+  status=0
+  _fwdports_et_safe_target example@shell.example.com || status=$?
+  _assert_exit "stock ET target: user and SSH alias are accepted" 0 "$status"
+
+  set +e
+  _fwdports_et_safe_target 2001:db8::1
+  status=$?
+  set -e
+  _assert_exit "stock ET target: literal IPv6 is conservatively deferred" \
+    1 "$status"
+  set +e
+  _fwdports_et_safe_target \
+    2001:0db8:0000:0000:0000:0000:0000:0001:2022
+  status=$?
+  set -e
+  _assert_exit "stock ET target: inline IPv6 port cannot bypass port key" \
+    1 "$status"
+}
+
+publication_rollback_case() {
+  local tmp manifest argv_file target_file log_dir fake_bin real_mv error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  target_file=$tmp/target
+  log_dir=$tmp/log
+  fake_bin=$tmp/bin
+  real_mv=$(type -P mv) || return 1
+  error=$tmp/error
+  mkdir -p "$fake_bin"
+  write_et_manifest "$manifest"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'count=0' \
+    '[[ ! -f $FWDPORTS_TEST_MV_COUNT ]] || count=$(<"$FWDPORTS_TEST_MV_COUNT")' \
+    'count=$((count + 1))' \
+    'printf "%s\n" "$count" >"$FWDPORTS_TEST_MV_COUNT"' \
+    '[[ $count -ne 1 ]] || exec "$FWDPORTS_TEST_REAL_MV" "$@"' \
+    'printf "%s\n" "simulated argv rename failure" >&2' \
+    'exit 73' >"$fake_bin/mv"
+  chmod 0700 "$fake_bin/mv"
+
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_REAL_MV=$real_mv \
+    FWDPORTS_TEST_MV_COUNT=$tmp/mv-count \
+    fwdports_et_build_argv "$manifest" edge '' "$argv_file" "$target_file" \
+    "$log_dir" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "stock ET publication: argv rename failure is preserved" \
+    1 "$status"
+  _assert_not_exists "stock ET publication: incomplete argv is absent" \
+    "$argv_file"
+  _assert_not_exists "stock ET publication: published target is rolled back" \
+    "$target_file"
+}
+
+ambient_policy_case() {
+  local tmp fake config argv_file output error line label status
+  tmp=$(_tmpdir) || return 1
+  fake=$tmp/ssh
+  config=$tmp/config
+  argv_file=$tmp/argv
+  output=$tmp/digest
+  error=$tmp/error
+  : >"$argv_file"
+  write_fake_ssh "$fake"
+
+  while IFS=$'\t' read -r label line; do
+    printf '%s\n' 'hostname shell.example.com' 'user example' "$line" \
+      >"$config"
+    set +e
+    FWDPORTS_TEST_SSH_CONFIG=$config \
+      fwdports_ssh_effective_digest "$fake" shell.example.com "$argv_file" \
+      "$output" et 2>"$error"
+    status=$?
+    set -e
+    _assert_exit "stock ET ambient policy: $label is rejected" 1 "$status"
+    _assert_not_exists "stock ET ambient policy: $label publishes no digest" \
+      "$output"
+  done <<'EOF'
+local forward	localforward 127.0.0.1:9000 127.0.0.1:80
+remote forward	remoteforward 127.0.0.1:9001 127.0.0.1:81
+dynamic forward	dynamicforward 127.0.0.1:9002
+remote command	remotecommand echo-unmanaged
+agent forwarding	forwardagent yes
+environment forwarding	setenv SAMPLE=value
+proxy jump	proxyjump jump.example.com
+proxy command	proxycommand exec route-helper
+EOF
+  _assert_not_contains "stock ET ambient policy: diagnostics omit endpoint data" \
+    "jump.example.com" "$(<"$error")"
+}
+
+generation_gates_case() {
+  local tmp manifest runtime fake_et fake_ssh config et_log ssh_log error status
+  local before after
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_et=$tmp/et
+  fake_ssh=$tmp/ssh
+  config=$tmp/ssh-config
+  et_log=$tmp/et.log
+  ssh_log=$tmp/ssh.log
+  error=$tmp/error
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  write_et_manifest "$tmp/full-manifest"
+  sed -e '/local-forward/d' -e '/^check/d' "$tmp/full-manifest" >"$manifest"
+  chmod 0600 "$manifest"
+  write_fake_et "$fake_et"
+  write_fake_ssh "$fake_ssh"
+  printf '%s\n' \
+    'hostname shell.example.com' \
+    'user example' \
+    'port 22' \
+    'forwardagent no' >"$config"
+
+  set +e
+  FWDPORTS_ET_COMMAND=$fake_et FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_SSH_CONFIG=$config \
+    fwdports_builtin_prepare "$manifest" edge et "$runtime" '' 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "stock ET generation: built-in prepare succeeds" 0 "$status"
+  _assert_eq "stock ET generation: publishes driver kind last" et \
+    "$(<"$runtime/driver-kind")"
+  _assert_file "stock ET generation: ET launch gate is immutable" \
+    "$runtime/et-gate"
+  _assert_file "stock ET generation: private SSH shim is immutable" \
+    "$runtime/et-bin/ssh"
+  _assert_file "stock ET generation: ambient SSH gate exists" \
+    "$runtime/et-ssh-ambient/ssh-gate"
+  _assert_file "stock ET generation: hardened SSH gate exists" \
+    "$runtime/et-ssh-bootstrap/ssh-gate"
+  if [[ -d $runtime/et-tmp && ! -L $runtime/et-tmp ]]; then
+    _pass "stock ET generation: private temporary directory exists"
+  else
+    _fail "stock ET generation: private temporary directory exists"
+  fi
+
+  set +e
+  FWDPORTS_TEST_SSH_CONFIG=$config FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" example@shell.example.com \
+    "echo safe-bootstrap" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET SSH shim: matching generation launches" 0 "$status"
+  _assert_contains "stock ET SSH shim: disables inherited forwards" \
+    "ClearAllForwardings=yes" "$(<"$ssh_log")"
+  _assert_contains "stock ET SSH shim: disables connection multiplexing" \
+    "ControlMaster=no" "$(<"$ssh_log")"
+  _assert_contains "stock ET SSH shim: preserves ET destination argv" \
+    "example@shell.example.com" "$(<"$ssh_log")"
+  _assert_contains "stock ET SSH shim: preserves bound ET bootstrap command" \
+    "echo safe-bootstrap" "$(<"$ssh_log")"
+  before=$(<"$ssh_log")
+
+  printf '%s\n' \
+    'hostname shell.example.com' \
+    'user example' \
+    'port 22' \
+    'forwardagent no' \
+    'localforward 127.0.0.1:9000 127.0.0.1:80' >"$config"
+  set +e
+  FWDPORTS_TEST_SSH_CONFIG=$config FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" example@shell.example.com \
+    "echo safe-bootstrap" 2>"$error"
+  status=$?
+  set -e
+  after=$(<"$ssh_log")
+  _assert_exit "stock ET SSH shim: ambient drift refuses bootstrap" 78 "$status"
+  _assert_eq "stock ET SSH shim: ambient drift launches no SSH" \
+    "$before" "$after"
+
+  printf '%s\n' \
+    'hostname shell.example.com' \
+    'user example' \
+    'port 22' \
+    'forwardagent no' >"$config"
+  set +e
+  FWDPORTS_TEST_SSH_CONFIG=$config FWDPORTS_TEST_ET_LOG=$et_log \
+    FWDPORTS_TEST_ET_STATUS=23 TERM="unsafe' value" TMPDIR=/tmp \
+    "$runtime/et-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET gate: foreground status is preserved" 23 "$status"
+  _assert_contains "stock ET gate: TERM is fixed before ET interpolation" \
+    "TERM=xterm-256color" "$(<"$et_log")"
+  _assert_not_contains "stock ET gate: hostile TERM never reaches ET" \
+    "unsafe" "$(<"$et_log")"
+  _assert_contains "stock ET gate: TMPDIR is generation-private" \
+    "TMPDIR=$runtime/et-tmp" "$(<"$et_log")"
+  _assert_contains "stock ET gate: telemetry is disabled" \
+    "ARG=--telemetry=false" "$(<"$et_log")"
+  before=$(<"$et_log")
+
+  printf '\n# changed after prepare\n' >>"$fake_et"
+  set +e
+  FWDPORTS_TEST_SSH_CONFIG=$config FWDPORTS_TEST_ET_LOG=$et_log \
+    FWDPORTS_TEST_ET_STATUS=0 "$runtime/et-gate" 2>"$error"
+  status=$?
+  set -e
+  after=$(<"$et_log")
+  _assert_exit "stock ET gate: binary drift fails closed" 78 "$status"
+  _assert_eq "stock ET gate: binary drift launches no ET" "$before" "$after"
+}
+
+local_port_conflict_case() {
+  local tmp manifest fake_bin error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  fake_bin=$tmp/bin
+  error=$tmp/error
+  mkdir -p "$fake_bin"
+  write_et_manifest "$manifest"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "fixture 1 user 3u IPv4 TCP 127.0.0.1:18080 (LISTEN)\n"' \
+    'exit 0' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    fwdports_et_preflight_local_ports "$manifest" edge 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "stock ET local preflight: occupied port is rejected" 1 \
+    "$status"
+  _assert_contains "stock ET local preflight: diagnostic names the port" \
+    "18080" "$(<"$error")"
+  _assert_contains "stock ET local preflight: owner evidence is retained" \
+    "listener details" "$(<"$error")"
+}
+
+run_case resolve resolve_case
+run_case compatibility-rejected compatibility_rejected_case
+run_case argv argv_case
+run_case invalid-records invalid_records_case
+run_case overflow-records overflow_records_case
+run_case target-grammar target_grammar_case
+run_case publication-rollback publication_rollback_case
+run_case ambient-policy ambient_policy_case
+run_case generation-gates generation_gates_case
+run_case local-port-conflict local_port_conflict_case
+_test_summary

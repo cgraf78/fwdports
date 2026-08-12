@@ -8,6 +8,16 @@
 # executable so a later dotfiles update cannot change a running generation's
 # behavior halfway through its lifetime.
 
+fwdports_driver_is_builtin() {
+  # Keep the reserved-name and lifecycle decisions on one list. A built-in
+  # omitted from discovery, cleanup, liveness, or launch would be mistaken for
+  # an external executable and cross the wrong trust boundary.
+  case "$1" in
+    ssh | autossh | et) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _fwdports_driver_identifier() {
   [[ $1 =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]]
 }
@@ -20,14 +30,12 @@ fwdports_driver_discover() {
     printf 'fwdports: invalid driver name: %s\n' "$name" >&2
     return 1
   }
-  case "$name" in
-    ssh | autossh)
-      # Built-ins carry additional executable/config drift protections.  A
-      # same-named drop-in must never silently replace that security model.
-      printf 'fwdports: built-in driver name is reserved: %s\n' "$name" >&2
-      return 1
-      ;;
-  esac
+  if fwdports_driver_is_builtin "$name"; then
+    # Built-ins carry additional executable/config drift protections.  A
+    # same-named drop-in must never silently replace that security model.
+    printf 'fwdports: built-in driver name is reserved: %s\n' "$name" >&2
+    return 1
+  fi
   [[ $config_root == /* && -d "$config_root" && ! -L "$config_root" ]] || {
     printf 'fwdports: driver configuration root is unavailable\n' >&2
     return 1

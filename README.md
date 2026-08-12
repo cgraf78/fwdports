@@ -5,10 +5,11 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Termux-lightgrey.svg)](#)
 
-`fwdports` keeps a declared set of SSH port forwards alive in one inspectable
-tmux session. It uses ordinary foreground OpenSSH by default, supports autossh
-when explicitly selected, and lets trusted local executables provide other
-transport drivers without putting consumer policy in the core.
+`fwdports` keeps a declared set of port forwards alive in one inspectable tmux
+session. It uses ordinary foreground OpenSSH by default, supports autossh when
+explicitly selected, supports stock Eternal Terminal 7.0.0 for resilient
+direct-host tunnels, and lets trusted local executables provide other transport
+drivers without putting consumer policy in the core.
 
 ## Install
 
@@ -47,7 +48,8 @@ check web loopback 8080 web
 ```
 
 Configuration is parsed as records, never evaluated as shell. Omitted drivers
-mean `ssh`; select `autossh` explicitly when its monitor semantics are wanted.
+mean `ssh`; select `autossh` explicitly when its monitor semantics are wanted,
+or select `et` for an Eternal Terminal 7.0.0-compatible direct connection.
 See [the design contract](docs/design.md) and the directly tested
 [examples](examples/README.md) for the complete grammar.
 
@@ -87,7 +89,12 @@ stop before starting the replacement. Two generations never overlap.
 
 ## Drivers
 
-Built-in `ssh` and `autossh` share the same validated forwarding model.
+Built-in `ssh`, `autossh`, and `et` share the standard forward record names.
+ET uses an explicit four-part network form and is deliberately direct-host only
+in its first version; its SSH bootstrap rejects ambient proxy routing and
+other configuration that ET would turn into undeclared forwarding behavior.
+Literal IPv6 targets are deferred; use an SSH alias for an IPv6 host. See the
+exact ET limits in [the design contract](docs/design.md).
 Additional drivers are trusted, single-file executables under
 `${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/drivers.d/`. Their versioned argv
 protocol is documented in [docs/drivers.md](docs/drivers.md).
@@ -109,6 +116,7 @@ name, port, or a stale PID. See [docs/security.md](docs/security.md).
 - netcat
 - `lsof` or `ss` for local-listener diagnostics
 - autossh only for profiles that select it
+- Eternal Terminal 7.0.0 only for profiles that select `et`
 
 Numeric minimums are claimed only for versions exercised by CI. Current
 platform results and intentional limitations are kept in the design document.

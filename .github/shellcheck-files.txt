@@ -9,12 +9,15 @@ program	lib/fwdports/controller.sh
 program	lib/fwdports/core.sh
 program	lib/fwdports/driver-api.sh
 program	lib/fwdports/drivers.sh
+program	lib/fwdports/et-gate.sh
+program	lib/fwdports/et-ssh-wrapper.sh
 program	lib/fwdports/health.sh
 program	lib/fwdports/runtime.sh
 program	lib/fwdports/ssh-gate.sh
 program	lib/fwdports/tmux.sh
 program	scripts/checkout-installer.conf
 program	support/install-checkout.sh
+program	support/verify-stock-et-contract.sh
 program	test/autossh-driver-test
 program	test/builtin-runner-test
 program	test/cli-integration-test
@@ -22,6 +25,7 @@ program	test/cli-test
 program	test/config-test
 program	test/controller-test
 program	test/driver-api-test
+program	test/et-driver-test
 program	test/examples-test
 program	test/harness-test
 program	test/health-test

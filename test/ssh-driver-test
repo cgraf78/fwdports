@@ -12,6 +12,8 @@ TEST_CASE=${1:-}
 
 # shellcheck source=lib/test.sh
 source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/driver-api.sh
+source "$ROOT/lib/fwdports/driver-api.sh"
 # shellcheck source=../lib/fwdports/drivers.sh
 source "$ROOT/lib/fwdports/drivers.sh"
 
@@ -46,6 +48,33 @@ resolve_executable_case() {
   _assert_contains "ssh executable: records file identity" \
     $'identity\t' "$content"
   _assert_eq "ssh executable: no diagnostics" "" "$(<"$error")"
+}
+
+untrusted_executable_parent_case() {
+  local tmp fake_bin output error status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/writable-bin
+  output=$tmp/identity
+  error=$tmp/error
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "OpenSSH_9.9p1 test" >&2' \
+    'exit 0' >"$fake_bin/ssh"
+  chmod 0755 "$fake_bin/ssh"
+  chmod 0777 "$fake_bin"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    fwdports_ssh_resolve ssh "$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ssh executable: writable parent is rejected" 1 "$status"
+  _assert_not_exists "ssh executable: unsafe path publishes no identity" \
+    "$output"
+  _assert_contains "ssh executable: unsafe parent diagnostic is actionable" \
+    "untrusted parent" "$(<"$error")"
 }
 
 effective_digest_case() {
@@ -123,6 +152,40 @@ lifecycle_options_case() {
   _assert_not_contains "ssh argv: never backgrounds itself" "-f" "$argv"
   _assert_eq "ssh argv: target is separate" \
     "shell.example.com" "$(<"$target_file")"
+}
+
+three_part_forward_case() {
+  local tmp manifest argv_file target_file error status parsed
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  target_file=$tmp/target
+  error=$tmp/error
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tweb\tssh' \
+    $'set\tweb\thost\tshell.example.com' \
+    $'set\tweb\tlocal-forward\t8080:127.0.0.1:80' >"$manifest"
+
+  set +e
+  fwdports_ssh_build_argv "$manifest" web '' "$argv_file" \
+    "$target_file" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ssh argv compatibility: three-part forward still builds" \
+    0 "$status"
+  _assert_contains "ssh argv compatibility: three-part value is unchanged" \
+    "8080:127.0.0.1:80" "$(<"$argv_file")"
+
+  set +e
+  parsed=$(_fwdports_local_forward_port \
+    18446744073709551617:127.0.0.1:80)
+  status=$?
+  set -e
+  _assert_exit "ssh local port: wrapping decimal is rejected" 1 "$status"
+  _assert_eq "ssh local port: rejected decimal publishes nothing" "" "$parsed"
 }
 
 inherited_forward_rejected_case() {
@@ -379,15 +442,27 @@ duplicate_profile_local_ports_case() {
   status=$?
   set -e
 
-  _assert_exit "profile local ports: duplicate built-in bind is rejected" \
+  _assert_exit "profile local ports: SSH-family duplicate is rejected" \
     1 "$status"
-  _assert_contains "profile local ports: diagnostic names the duplicate" \
+  _assert_contains "profile local ports: SSH-family diagnostic names duplicate" \
+    "local forward port 8080 is claimed more than once" "$(<"$error")"
+
+  sed $'s/second\tautossh/second\tet/' "$manifest" >"$tmp/et-manifest"
+  set +e
+  fwdports_builtin_validate_profile_ports "$tmp/et-manifest" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "profile local ports: SSH/ET duplicate is rejected" 1 \
+    "$status"
+  _assert_contains "profile local ports: SSH/ET diagnostic names duplicate" \
     "local forward port 8080 is claimed more than once" "$(<"$error")"
 }
 
 run_case resolve-executable resolve_executable_case
+run_case untrusted-executable-parent untrusted_executable_parent_case
 run_case effective-digest effective_digest_case
 run_case lifecycle-options lifecycle_options_case
+run_case three-part-forward three_part_forward_case
 run_case inherited-forward-rejected inherited_forward_rejected_case
 run_case retry-gate retry_gate_case
 run_case local-port-conflict local_port_conflict_case

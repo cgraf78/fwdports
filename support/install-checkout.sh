@@ -29,6 +29,8 @@ LIBRARY_SOURCES=(
   "$ROOT/lib/fwdports/core.sh"
   "$ROOT/lib/fwdports/driver-api.sh"
   "$ROOT/lib/fwdports/drivers.sh"
+  "$ROOT/lib/fwdports/et-gate.sh"
+  "$ROOT/lib/fwdports/et-ssh-wrapper.sh"
   "$ROOT/lib/fwdports/health.sh"
   "$ROOT/lib/fwdports/runtime.sh"
   "$ROOT/lib/fwdports/ssh-gate.sh"
@@ -45,6 +47,8 @@ EXECUTABLE_SOURCES=(
   "$ROOT/lib/fwdports/builtin-runner.sh"
   "$ROOT/lib/fwdports/controller.sh"
   "$ROOT/lib/fwdports/driver-api.sh"
+  "$ROOT/lib/fwdports/et-gate.sh"
+  "$ROOT/lib/fwdports/et-ssh-wrapper.sh"
   "$ROOT/lib/fwdports/ssh-gate.sh"
 )
 for source in "${EXECUTABLE_SOURCES[@]}"; do

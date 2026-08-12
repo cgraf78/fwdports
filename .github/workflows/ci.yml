@@ -61,27 +61,65 @@ jobs:
           "$install_prefix/bin/fwdports" --version
 
           for suite in autossh-driver builtin-runner cli config driver-api \
-            examples install portability ssh-driver; do
+            et-driver examples install portability ssh-driver; do
             /bin/bash "test/$suite-test"
           done
+
+  stock-et-contract:
+    name: Stock ET 7.0.0 contract
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the publisher's pinned arm64 artifact
+        shell: bash
+        run: |-
+          set -euo pipefail
+          asset="$RUNNER_TEMP/et_7.0.0-stable1_arm64.deb"
+          curl -fL --retry 3 \
+            https://github.com/MisterTea/EternalTerminal/releases/download/et-v7.0.0/et_7.0.0-stable1_arm64.deb \
+            -o "$asset"
+          printf '%s  %s\n' \
+            db31e467c879d8aae24e83a69e9e168e374e6f15ce7e28f64f8b5f53dacab742 \
+            "$asset" | sha256sum -c -
+          dpkg-deb -x "$asset" "$RUNNER_TEMP/stock-et"
+
+      - name: Install publisher artifact runtime libraries
+        shell: bash
+        run: |-
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libbrotli1 libprotobuf32t64 libsodium23 libssl3t64 libunwind8 \
+            libutempter0 zlib1g
+
+      - name: Verify the real ET client contract
+        shell: bash
+        run: |-
+          bash support/verify-stock-et-contract.sh \
+            "$RUNNER_TEMP/stock-et/usr/bin/et"
 
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, macos-bash32]
+    needs: [shell, macos-bash32, stock-et-contract]
     runs-on: ubuntu-24.04
     env:
       SHELL_RESULT: ${{ needs.shell.result }}
       BASH32_RESULT: ${{ needs.macos-bash32.result }}
+      STOCK_ET_RESULT: ${{ needs.stock-et-contract.result }}
     steps:
       - name: Require all fwdports compatibility checks
         shell: bash
         run: |-
           printf 'Shared shell CI: %s\n' "$SHELL_RESULT"
           printf 'Stock macOS Bash 3.2: %s\n' "$BASH32_RESULT"
+          printf 'Stock ET 7.0.0 contract: %s\n' "$STOCK_ET_RESULT"
 
           test "$SHELL_RESULT" = success
           test "$BASH32_RESULT" = success
+          test "$STOCK_ET_RESULT" = success
 
   actions-sync:
     name: cgraf78/actions sync

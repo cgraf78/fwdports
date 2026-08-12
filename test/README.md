@@ -21,6 +21,18 @@ parallel load weakens their timing and ownership evidence. Fakes are used at
 external executable boundaries, while real tmux/process/autossh integration
 tests prove the behavior those fakes cannot establish.
 
+`et-driver-test` binds its fixtures to the public ET 7.0.0 command surface and
+exercises executable/config drift gates, environment sanitization, and the
+private SSH shim. `cli-integration-test` also runs an ET leg through a real
+isolated tmux server. The suite does not use a machine-specific ET build as
+proof of upstream behavior.
+
+CI separately downloads the publisher's checksummed ET 7.0.0 arm64 package and
+runs `support/verify-stock-et-contract.sh` against the real client. That gate
+proves the required CLI flags, PATH-based two-argument SSH bootstrap, both
+tunnel option forms, configured ET port, and bounded TERM behavior rather than
+letting the hermetic fakes define the upstream contract.
+
 Runtime tests deliberately force atomic-replacement races and crash seams.
 They distinguish a complete old/new control record—which readers may retry—
 from malformed ownership evidence, which must fail closed. Cleanup cases place

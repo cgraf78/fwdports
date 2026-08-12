@@ -52,6 +52,13 @@ publish_drift() {
   exit 78
 }
 
+check_only=0
+if [[ ${1:-} == --check-only ]]; then
+  check_only=1
+  shift
+fi
+[[ $# -gt 0 ]] || exit 64
+
 ssh_path=
 expected_identity=
 while IFS=$'\t' read -r kind value || [[ -n ${kind:-} ]]; do
@@ -92,4 +99,7 @@ rm -f -- "$raw" "$normalized"
   publish_drift ssh-config-drift
 
 rm -f -- "$DRIFT_FILE"
+if [[ $check_only -eq 1 ]]; then
+  exit 0
+fi
 exec "$ssh_path" "$@"

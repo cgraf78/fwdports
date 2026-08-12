@@ -50,6 +50,48 @@ canonicalization_case() {
     "$real" "$result"
 }
 
+termux_prefix_anchor_case() {
+  local tmp outer prefix fake output error status
+  tmp=$(_tmpdir) || return 1
+  outer=$tmp/android-platform
+  prefix=$outer/usr
+  fake=$prefix/bin/ssh
+  output=$tmp/identity
+  error=$tmp/error
+  mkdir -p "$prefix/bin"
+  chmod 0777 "$outer"
+  chmod 0700 "$prefix" "$prefix/bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "OpenSSH_9.9p1 test" >&2' \
+    'exit 0' >"$fake"
+  chmod 0700 "$fake"
+
+  set +e
+  PREFIX=$prefix PATH=$prefix/bin:/usr/bin:/bin \
+    fwdports_ssh_resolve ssh "$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "portability: generic PREFIX cannot excuse unsafe ancestor" \
+    1 "$status"
+  _assert_not_exists "portability: unsafe generic PREFIX publishes nothing" \
+    "$output"
+
+  status=0
+  OSTYPE=linux-android PREFIX=/data/data/com.termux/files/usr \
+    _fwdports_termux_prefix_anchor || status=$?
+  _assert_exit "portability: real Termux PREFIX shape is recognized" 0 \
+    "$status"
+  set +e
+  OSTYPE=linux-gnu PREFIX=/data/data/com.termux/files/usr \
+    _fwdports_termux_prefix_anchor
+  status=$?
+  set -e
+  _assert_exit "portability: path alone cannot impersonate Termux" 1 \
+    "$status"
+}
+
 stock_macos_bash_ci_case() {
   local workflow
   workflow=$ROOT/.github/workflows/ci.yml
@@ -68,7 +110,9 @@ stock_macos_bash_ci_case() {
   _assert_contains "portability CI: exercises the installed entrypoint" \
     '"$install_prefix/bin/fwdports" --version' "$(<"$workflow")"
   _assert_contains "portability CI: required gate includes Bash 3.2" \
-    'needs: [shell, macos-bash32]' "$(<"$workflow")"
+    'needs: [shell, macos-bash32, stock-et-contract]' "$(<"$workflow")"
+  _assert_contains "portability CI: required gate includes stock ET" \
+    'test "$STOCK_ET_RESULT" = success' "$(<"$workflow")"
 }
 
 bsd_ps_session_keyword_case() {
@@ -106,6 +150,7 @@ bsd_ps_session_keyword_case() {
 
 run_case bsd-stat bsd_stat_case
 run_case canonicalization canonicalization_case
+run_case termux-prefix-anchor termux_prefix_anchor_case
 run_case stock-macos-bash-ci stock_macos_bash_ci_case
 run_case bsd-ps-session-keyword bsd_ps_session_keyword_case
 _test_summary

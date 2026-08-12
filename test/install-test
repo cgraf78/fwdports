@@ -23,7 +23,8 @@ fixture_checkout() {
     chmod +x "$destination/bin/fwdports"
   fi
   for library in builtin-runner.sh config.sh controller.sh core.sh \
-    driver-api.sh drivers.sh health.sh runtime.sh ssh-gate.sh tmux.sh; do
+    driver-api.sh drivers.sh et-gate.sh et-ssh-wrapper.sh health.sh \
+    runtime.sh ssh-gate.sh tmux.sh; do
     if [[ -f "$ROOT/lib/fwdports/$library" ]]; then
       cp "$ROOT/lib/fwdports/$library" \
         "$destination/lib/fwdports/$library"

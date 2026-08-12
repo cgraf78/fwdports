@@ -82,6 +82,73 @@ drift_case() {
   _assert_eq "built-in SSH: drift is never retried" 1 "$calls"
 }
 
+et_no_retry_case() {
+  local tmp runtime calls status count
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  calls=$tmp/calls
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' et >"$runtime/driver-kind"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "call\n" >>"$FWDPORTS_TEST_CALLS"' \
+    'exit 23' >"$runtime/et-gate"
+  chmod 0700 "$runtime/et-gate"
+
+  set +e
+  FWDPORTS_TEST_CALLS=$calls "$RUNNER" "$runtime"
+  status=$?
+  set -e
+  count=$(wc -l <"$calls" | tr -d ' ')
+
+  _assert_exit "built-in ET: foreground status is preserved" 23 "$status"
+  _assert_eq "built-in ET: fwdports adds no retry loop" 1 "$count"
+}
+
+et_signal_case() {
+  local tmp runtime pid_file term_marker runner_pid child_pid='' status index=0
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  pid_file=$tmp/et.pid
+  term_marker=$tmp/et.term
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' et >"$runtime/driver-kind"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$$" >"$FWDPORTS_TEST_ET_PID"' \
+    'trap '\''printf "term\n" >"$FWDPORTS_TEST_ET_TERM"; exit 0'\'' TERM' \
+    'trap "exit 0" HUP INT' \
+    'while :; do sleep 0.02; done' >"$runtime/et-gate"
+  chmod 0700 "$runtime/et-gate"
+
+  FWDPORTS_TEST_ET_PID=$pid_file FWDPORTS_TEST_ET_TERM=$term_marker \
+    "$RUNNER" "$runtime" &
+  runner_pid=$!
+  while [[ ! -s $pid_file && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  [[ ! -s $pid_file ]] || child_pid=$(<"$pid_file")
+  kill -HUP "$runner_pid" 2>/dev/null || true
+  set +e
+  wait "$runner_pid"
+  status=$?
+  set -e
+
+  _assert_exit "built-in ET: tmux HUP preserves wrapper status" 129 "$status"
+  _assert_file "built-in ET: tmux HUP becomes child TERM" "$term_marker"
+  if [[ -n $child_pid ]] && ! kill -0 "$child_pid" 2>/dev/null; then
+    _pass "built-in ET: signalled child is reaped"
+  else
+    _fail "built-in ET: signalled child is reaped"
+    [[ -z $child_pid ]] || kill -KILL "$child_pid" 2>/dev/null || true
+  fi
+}
+
 run_case retry retry_case
 run_case drift drift_case
+run_case et-no-retry et_no_retry_case
+run_case et-signal et_signal_case
 _test_summary

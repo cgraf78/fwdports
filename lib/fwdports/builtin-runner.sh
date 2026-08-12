@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Generation-owned launcher for the built-in SSH transports.  The controller
-# passes only stable file paths; this runner reconstructs argv one record at a
-# time and then disappears via exec so tmux observes the actual lifetime
-# process (ssh or autossh), not an extra supervisory shell.
+# Generation-owned launcher for built-in transports. The controller passes
+# only stable file paths; this wrapper owns one direct child so tmux HUP can be
+# converted into a catchable TERM and the transport is always reaped.
 
 set -u
 
@@ -10,15 +9,29 @@ runtime=${1:-}
 [[ $runtime == /* && -d $runtime && ! -L $runtime ]] || exit 64
 
 kind=$(<"$runtime/driver-kind") || exit 70
-target=$(<"$runtime/ssh-target") || exit 70
 argv=()
-while IFS= read -r element || [[ -n $element ]]; do
-  [[ -n $element && $element != *$'\t'* && $element != *$'\r'* ]] || exit 70
-  argv+=("$element")
-done <"$runtime/ssh-argv"
-[[ -n ${argv[0]+set} ]] || exit 70
+target=
+case "$kind" in
+  ssh | autossh)
+    target=$(<"$runtime/ssh-target") || exit 70
+    while IFS= read -r element || [[ -n $element ]]; do
+      [[ -n $element && $element != *$'\t'* && $element != *$'\r'* ]] ||
+        exit 70
+      argv+=("$element")
+    done <"$runtime/ssh-argv"
+    [[ -n ${argv[0]+set} ]] || exit 70
+    ;;
+  et)
+    [[ -f $runtime/et-gate && -x $runtime/et-gate &&
+      ! -L $runtime/et-gate ]] || exit 70
+    ;;
+  *)
+    printf 'fwdports: invalid built-in driver snapshot\n' >&2
+    exit 70
+    ;;
+esac
 
-# Keep one foreground supervisor for both built-in transports. tmux tears a
+# Keep one foreground supervisor for every built-in transport. tmux tears a
 # pane down with HUP, but autossh may deliberately ignore HUP while its SSH
 # child remains alive. Converting every catchable shutdown to TERM and reaping
 # the direct child prevents a failed startup rollback from orphaning a tunnel.
@@ -110,8 +123,17 @@ case "$kind" in
     [[ $signal_status -eq 0 ]] || exit "$signal_status"
     exit "$status"
     ;;
-  *)
-    printf 'fwdports: invalid built-in driver snapshot\n' >&2
-    exit 70
+  et)
+    # ET owns reconnect behavior inside one foreground process. Adding the
+    # direct-SSH retry loop here would create competing policies and could
+    # repeatedly prompt for authentication after a deterministic ET failure.
+    "$runtime/et-gate" &
+    child=$!
+    wait "$child"
+    status=$?
+    wait "$child" 2>/dev/null || true
+    child=
+    [[ $signal_status -eq 0 ]] || exit "$signal_status"
+    exit "$status"
     ;;
 esac

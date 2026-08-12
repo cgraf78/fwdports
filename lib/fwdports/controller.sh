@@ -267,35 +267,32 @@ fwdports_status() {
           leg=${runtime##*/}
           driver=$(_fwdports_manifest_driver_for_leg \
             "$generation/manifest" "$leg") || return 74
-          case "$driver" in
-            ssh | autossh) ;;
-            *)
-              snapshot=$generation/drivers/$driver
-              record=$(_fwdports_pane_evidence_read "$generation" \
-                "$digest" "$evidence") || return 74
-              IFS=$'\t' read -r _ pane_id _ <<<"$record"
-              # Tmux/process evidence proves that core still owns the pane,
-              # not that a driver-specific transport inside it is usable.
-              # ABI status 2 deliberately asks core to use that conservative
-              # fallback; status 1 lets a driver report a dead transport
-              # without granting the driver any signalling authority.
-              if fwdports_driver_operation "$snapshot" is-live \
-                "$generation/manifest" "$leg" "$runtime" "$pane_id"; then
-                driver_status=0
-              else
-                driver_status=$?
-              fi
-              case "$driver_status" in
-                0 | 2) ;;
-                1) all_live=0 ;;
-                *)
-                  printf 'fwdports: driver liveness check failed for %s\n' \
-                    "$leg" >&2
-                  return 74
-                  ;;
-              esac
-              ;;
-          esac
+          if ! fwdports_driver_is_builtin "$driver"; then
+            snapshot=$generation/drivers/$driver
+            record=$(_fwdports_pane_evidence_read "$generation" \
+              "$digest" "$evidence") || return 74
+            IFS=$'\t' read -r _ pane_id _ <<<"$record"
+            # Tmux/process evidence proves that core still owns the pane,
+            # not that a driver-specific transport inside it is usable.
+            # ABI status 2 deliberately asks core to use that conservative
+            # fallback; status 1 lets a driver report a dead transport
+            # without granting the driver any signalling authority.
+            if fwdports_driver_operation "$snapshot" is-live \
+              "$generation/manifest" "$leg" "$runtime" "$pane_id"; then
+              driver_status=0
+            else
+              driver_status=$?
+            fi
+            case "$driver_status" in
+              0 | 2) ;;
+              1) all_live=0 ;;
+              *)
+                printf 'fwdports: driver liveness check failed for %s\n' \
+                  "$leg" >&2
+                return 74
+                ;;
+            esac
+          fi
           ;;
         1) all_live=0 ;;
         *)
@@ -363,7 +360,7 @@ _fwdports_cleanup_generation_drivers() {
   for ((index = ${#legs[@]} - 1; index >= 0; index--)); do
     leg=${legs[index]}
     driver=${drivers[index]}
-    case "$driver" in ssh | autossh) continue ;; esac
+    fwdports_driver_is_builtin "$driver" && continue
     runtime=$generation/legs/$leg
     snapshot=$generation/drivers/$driver
     [[ -x $snapshot && -f $snapshot && ! -L $snapshot &&

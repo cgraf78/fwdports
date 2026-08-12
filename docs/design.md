@@ -4,13 +4,14 @@
 
 `fwdports` supervises one selected profile in one owned tmux session. Profiles
 are alternative desired states, not concurrent instances. The public core owns
-configuration, lifecycle, observation, repair, and built-in SSH behavior;
+configuration, lifecycle, observation, repair, and built-in transport behavior;
 consumer-specific policy belongs in profile data or a trusted executable
 driver.
 
-The v1 built-ins are `ssh` and explicit `autossh`. The executable driver API is
-the only extension mechanism. There are no sourced plug-ins, raw shell command
-options, or evaluated configuration fragments.
+The built-ins are `ssh`, explicit `autossh`, and explicit stock Eternal
+Terminal (`et`). The executable driver API is the only extension mechanism.
+There are no sourced plug-ins, raw shell command options, or evaluated
+configuration fragments.
 
 ## Commands
 
@@ -56,7 +57,7 @@ through inheritance.
 
 ## Built-in SSH records
 
-Both built-ins understand:
+The two SSH-family built-ins understand:
 
 ```text
 host
@@ -79,6 +80,43 @@ Built-in legs must use distinct local bind ports across the complete resolved
 profile so one successful leg cannot mask another leg's deterministic bind
 failure.
 
+## Built-in Eternal Terminal records
+
+The `et` built-in understands:
+
+```text
+host
+port
+local-forward
+remote-forward
+```
+
+`port` is the ET server port and is deliberately separate from `host`; it
+defaults to ET's standard 2022 when omitted. SSH bootstrap ports still come
+from SSH configuration, and the remote host must run a compatible `etserver`.
+The initial implementation
+supports at most one local and one remote forward per leg because ET 7.0.0
+accepts one value for each option and does not correctly combine multiple
+four-part values. ET forwards therefore use the explicit
+`BIND_HOST:BIND_PORT:DESTINATION_HOST:DESTINATION_PORT` network form with
+numeric, nonzero ports; its range, socket, and two-part forms are outside the
+shared configuration surface. A local forward must have a matching `loopback`
+or `tcp` check for its bind host and port. ET can remain alive after a local
+bind error, so requiring that check prevents process liveness from being
+mistaken for endpoint health.
+
+The driver is implemented and tested against the public tagged ET 7.0.0
+contract. Later releases fail closed until their internal SSH launch behavior
+is reviewed as well. It runs with no terminal, disables telemetry, sends logs
+to the owned tmux pane, and keeps temporary state under the private generation.
+Hostnames, IPv4 addresses, SSH aliases, users, and an optional ET server `port`
+are supported. Raw IPv6 literals are deliberately deferred; an SSH alias may
+resolve to IPv6 without exposing ET's ambiguous literal parsing to the
+configuration surface. Ambient `ProxyJump`, `ProxyCommand`, forwarding, remote
+commands, agent forwarding, and `SetEnv` are rejected: ET consumes those itself,
+outside the manifest. Jump-host support is deferred until both ET SSH bootstrap
+calls can be bound and tested independently.
+
 ## Status vocabulary
 
 - `starting`: a verified pending generation has not become active.
@@ -97,7 +135,8 @@ Process or monitor liveness is never reported as endpoint health.
 Each foreground transport owns reconnect behavior while its tmux pane remains
 alive. Direct SSH retries with a 1, 2, 4, 8, 16, 30-second cap and resets its
 backoff after stable operation. Autossh owns child retries while its monitor is
-live; an external driver owns retry policy inside its foreground `run` process.
+live; ET owns reconnects inside its single foreground process; an external
+driver owns retry policy inside its foreground `run` process.
 
 The controller observes configured service checks and publishes status; it does
 not mutate transport panes in the background. An explicit matching `start`

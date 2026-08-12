@@ -99,9 +99,7 @@ _fwdports_manifest_matches_desired() {
   # immutable generation snapshot; otherwise require explicit replacement.
   while IFS=$'\t' read -r kind leg driver _ || [[ -n ${kind:-} ]]; do
     [[ $kind == leg ]] || continue
-    case "$driver" in
-      ssh | autossh) continue ;;
-    esac
+    fwdports_driver_is_builtin "$driver" && continue
     expected=$(<"$generation/drivers/$driver.digest") || return 1
     source=$(fwdports_driver_discover "$config_root" "$driver" \
       "$allowed_root") || return 1
@@ -230,45 +228,39 @@ _fwdports_start_generation() {
     mkdir -p "$runtime" || return 1
     chmod 0700 "$runtime" || return 1
     runtimes+=("$runtime")
-    case "$driver" in
-      ssh | autossh)
-        fwdports_builtin_prepare "$generation/manifest" "$leg" "$driver" \
-          "$runtime" "$target_override" || return 1
-        snapshots+=("")
-        ;;
-      *)
-        driver_snapshot=
-        # The snapshot is keyed by driver executable, not by leg. Reusing one
-        # immutable copy lets a generic driver serve several independent legs
-        # without introducing a second mutable code path into the generation.
-        # Validation and preparation still run once per leg below.
-        for ((prior = 0; prior < index; prior++)); do
-          if [[ ${drivers[prior]} == "$driver" ]]; then
-            driver_snapshot=${snapshots[prior]}
-            break
-          fi
-        done
-        if [[ -z $driver_snapshot ]]; then
-          driver_snapshot=$(fwdports_driver_snapshot "$config_root" \
-            "$driver" "$generation" "$allowed_root") || return 1
+    if fwdports_driver_is_builtin "$driver"; then
+      fwdports_builtin_prepare "$generation/manifest" "$leg" "$driver" \
+        "$runtime" "$target_override" || return 1
+      snapshots+=("")
+    else
+      driver_snapshot=
+      # The snapshot is keyed by driver executable, not by leg. Reusing one
+      # immutable copy lets a generic driver serve several independent legs
+      # without introducing a second mutable code path into the generation.
+      # Validation and preparation still run once per leg below.
+      for ((prior = 0; prior < index; prior++)); do
+        if [[ ${drivers[prior]} == "$driver" ]]; then
+          driver_snapshot=${snapshots[prior]}
+          break
         fi
-        snapshots+=("$driver_snapshot")
-        fwdports_driver_operation "$driver_snapshot" validate \
-          "$generation/manifest" "$leg" "$runtime" || return 1
-        ;;
-    esac
+      done
+      if [[ -z $driver_snapshot ]]; then
+        driver_snapshot=$(fwdports_driver_snapshot "$config_root" \
+          "$driver" "$generation" "$allowed_root") || return 1
+      fi
+      snapshots+=("$driver_snapshot")
+      fwdports_driver_operation "$driver_snapshot" validate \
+        "$generation/manifest" "$leg" "$runtime" || return 1
+    fi
   done
   for ((index = 0; index < ${#legs[@]}; index++)); do
     driver=${drivers[index]}
-    case "$driver" in
-      ssh | autossh) ;;
-      *)
-        fwdports_driver_operation "${snapshots[index]}" prepare \
-          "$generation/manifest" "${legs[index]}" "${runtimes[index]}" ||
-          return 1
-        prepared+=("${snapshots[index]}")
-        ;;
-    esac
+    if ! fwdports_driver_is_builtin "$driver"; then
+      fwdports_driver_operation "${snapshots[index]}" prepare \
+        "$generation/manifest" "${legs[index]}" "${runtimes[index]}" ||
+        return 1
+      prepared+=("${snapshots[index]}")
+    fi
   done
 
   for ((index = 0; index < ${#legs[@]}; index++)); do
@@ -276,39 +268,33 @@ _fwdports_start_generation() {
     driver=${drivers[index]}
     runtime=${runtimes[index]}
     if [[ -z $session ]]; then
-      case "$driver" in
-        ssh | autossh)
-          record=$(fwdports_tmux_create_session "$tmux_path" "$socket" \
-            "$FWDPORTS_SESSION_NAME" "${generation##*/}" "$runtime" \
-            "$FWDPORTS_MODULE_DIR/builtin-runner.sh" "$runtime") ||
-            launch_failed=1
-          ;;
-        *)
-          record=$(fwdports_tmux_create_session "$tmux_path" "$socket" \
-            "$FWDPORTS_SESSION_NAME" "${generation##*/}" "$runtime" \
-            "$FWDPORTS_MODULE_DIR/driver-api.sh" run \
-            "${snapshots[index]}" "$generation/manifest" "$leg" \
-            "$runtime") || launch_failed=1
-          ;;
-      esac
+      if fwdports_driver_is_builtin "$driver"; then
+        record=$(fwdports_tmux_create_session "$tmux_path" "$socket" \
+          "$FWDPORTS_SESSION_NAME" "${generation##*/}" "$runtime" \
+          "$FWDPORTS_MODULE_DIR/builtin-runner.sh" "$runtime") ||
+          launch_failed=1
+      else
+        record=$(fwdports_tmux_create_session "$tmux_path" "$socket" \
+          "$FWDPORTS_SESSION_NAME" "${generation##*/}" "$runtime" \
+          "$FWDPORTS_MODULE_DIR/driver-api.sh" run \
+          "${snapshots[index]}" "$generation/manifest" "$leg" \
+          "$runtime") || launch_failed=1
+      fi
       [[ $launch_failed -eq 0 ]] || return 1
       IFS=$'\t' read -r session pane <<<"$record"
     else
-      case "$driver" in
-        ssh | autossh)
-          pane=$(fwdports_tmux_split_pane "$tmux_path" "$socket" "$session" \
-            "${generation##*/}" "$runtime" \
-            "$FWDPORTS_MODULE_DIR/builtin-runner.sh" "$runtime") ||
-            launch_failed=1
-          ;;
-        *)
-          pane=$(fwdports_tmux_split_pane "$tmux_path" "$socket" "$session" \
-            "${generation##*/}" "$runtime" \
-            "$FWDPORTS_MODULE_DIR/driver-api.sh" run \
-            "${snapshots[index]}" "$generation/manifest" "$leg" \
-            "$runtime") || launch_failed=1
-          ;;
-      esac
+      if fwdports_driver_is_builtin "$driver"; then
+        pane=$(fwdports_tmux_split_pane "$tmux_path" "$socket" "$session" \
+          "${generation##*/}" "$runtime" \
+          "$FWDPORTS_MODULE_DIR/builtin-runner.sh" "$runtime") ||
+          launch_failed=1
+      else
+        pane=$(fwdports_tmux_split_pane "$tmux_path" "$socket" "$session" \
+          "${generation##*/}" "$runtime" \
+          "$FWDPORTS_MODULE_DIR/driver-api.sh" run \
+          "${snapshots[index]}" "$generation/manifest" "$leg" \
+          "$runtime") || launch_failed=1
+      fi
       if [[ $launch_failed -ne 0 ]]; then
         fwdports_tmux_abort_created_session "$tmux_path" "$socket" "$session" \
           "${generation##*/}" >/dev/null 2>&1 || true

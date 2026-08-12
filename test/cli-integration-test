@@ -21,6 +21,9 @@ run_fwdports() {
     XDG_RUNTIME_DIR=$CASE_RUNTIME FWDPORTS_TMUX_SOCKET=$CASE_SOCKET \
     FWDPORTS_SSH_COMMAND=$CASE_SSH FWDPORTS_TEST_SSH_LOG=$CASE_SSH_LOG \
     FWDPORTS_AUTOSSH_COMMAND=$CASE_AUTOSSH \
+    FWDPORTS_ET_COMMAND=$CASE_ET \
+    FWDPORTS_TEST_ET_LOG=${FWDPORTS_TEST_ET_LOG:-} \
+    FWDPORTS_TEST_SSH_ONESHOT=${FWDPORTS_TEST_SSH_ONESHOT:-} \
     FWDPORTS_CONTROLLER_TICK_SECONDS=${FWDPORTS_CONTROLLER_TICK_SECONDS:-1} \
     FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=${FWDPORTS_HEALTH_STARTUP_GRACE_TICKS:-5} \
     FWDPORTS_HEALTH_INTERVAL_TICKS=${FWDPORTS_HEALTH_INTERVAL_TICKS:-30} \
@@ -211,6 +214,7 @@ setup_case_root() {
   CASE_SOCKET=$CASE_RUNTIME/fwdports.sock
   CASE_SSH=$tmp/bin/ssh
   CASE_AUTOSSH=$tmp/bin/autossh
+  CASE_ET=$tmp/bin/et
   CASE_SSH_LOG=$tmp/ssh.log
   mkdir -p "$CASE_HOME" "$CASE_CONFIG/fwdports" "$CASE_STATE" \
     "$CASE_RUNTIME" "$tmp/bin"
@@ -220,14 +224,78 @@ setup_case_root() {
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
     'if [[ ${1:-} == -G ]]; then' \
-    '  target=${!#}' \
-    '  printf "hostname %s\nuser example\nport 22\n" "$target"' \
+    '  printf "hostname shell.example.com\nuser example\nport 22\nforwardagent no\n"' \
     '  exit 0' \
     'fi' \
     'printf "%s\n" "$@" >"$FWDPORTS_TEST_SSH_LOG"' \
+    '[[ -z ${FWDPORTS_TEST_SSH_ONESHOT:-} ]] || { printf "IDPASSKEY:XXXXXXXXXXXXXXXX/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"; exit 0; }' \
     'trap "exit 0" INT TERM HUP' \
     'while :; do sleep 1; done' >"$CASE_SSH"
   chmod 0700 "$CASE_SSH"
+}
+
+stock_et_lifecycle_case() {
+  local tmp config output et_log index=0 generation
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  et_log=$tmp/et.log
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "%s\n" --port --tunnel --reversetunnel --logdir --logtostdout --no-terminal --telemetry' \
+    '  exit 0' \
+    'fi' \
+    '{' \
+    '  printf "TERM=%s\nTMPDIR=%s\n" "${TERM:-}" "${TMPDIR:-}"' \
+    '  printf "ARG=%s\n" "$@"' \
+    '} >"$FWDPORTS_TEST_ET_LOG"' \
+    'target=${!#}' \
+    'ssh "$target" "echo safe-bootstrap" >/dev/null' \
+    'trap "exit 0" HUP INT TERM' \
+    'while :; do sleep 0.02; done' >"$CASE_ET"
+  chmod 0700 "$CASE_ET"
+  printf '%s\n' \
+    'profile default' \
+    'leg shell et' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19090:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_SSH_ONESHOT=1 \
+    run_fwdports "$output" start
+  _assert_exit "stock ET lifecycle: profile starts" 0 "$COMMAND_STATUS"
+  _assert_eq "stock ET lifecycle: summary names ET and the exact forward" \
+    $'fwdports: started profile default\nfwdports: forwards\n  shell [et] remote 127.0.0.1:19090:127.0.0.1:9090' \
+    "$COMMAND_OUTPUT"
+  while [[ ! -s $et_log && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_contains "stock ET lifecycle: runs without a terminal" \
+    "ARG=--no-terminal" "$(<"$et_log")"
+  _assert_contains "stock ET lifecycle: disables telemetry" \
+    "ARG=--telemetry=false" "$(<"$et_log")"
+  _assert_contains "stock ET lifecycle: receives the reverse tunnel" \
+    "ARG=127.0.0.1:19090:127.0.0.1:9090" "$(<"$et_log")"
+  _assert_contains "stock ET lifecycle: receives fixed TERM" \
+    "TERM=xterm-256color" "$(<"$et_log")"
+  _assert_contains "stock ET lifecycle: SSH bootstrap is hardened" \
+    "ClearAllForwardings=yes" "$(<"$CASE_SSH_LOG")"
+  generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
+  _assert_contains "stock ET lifecycle: temp state stays in the generation" \
+    "TMPDIR=$generation/legs/shell/et-tmp" "$(<"$et_log")"
+
+  run_fwdports "$output" status
+  _assert_exit "stock ET lifecycle: status succeeds" 0 "$COMMAND_STATUS"
+  _assert_eq "stock ET lifecycle: live pane is observable" live/unverified \
+    "$COMMAND_OUTPUT"
+  run_fwdports "$output" stop
+  _assert_exit "stock ET lifecycle: authenticated stop succeeds" 0 \
+    "$COMMAND_STATUS"
 }
 
 symlink_config_target_override_case() {
@@ -384,6 +452,7 @@ default_ssh_lifecycle_case() {
 }
 
 run_case default-ssh-lifecycle default_ssh_lifecycle_case
+run_case stock-et-lifecycle stock_et_lifecycle_case
 run_case configured-health configured_health_case
 run_case shared-external-driver shared_external_driver_case
 run_case symlink-config-target-override symlink_config_target_override_case

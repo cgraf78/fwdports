@@ -71,11 +71,13 @@ trusted_discovery_case() {
     _pass "driver discovery: rejects a writable executable"
   fi
 
-  if fwdports_driver_discover "$config_root" ssh >/dev/null 2>&1; then
-    _fail "driver discovery: built-in names cannot be shadowed"
-  else
-    _pass "driver discovery: built-in names cannot be shadowed"
-  fi
+  for source in ssh autossh et; do
+    if fwdports_driver_discover "$config_root" "$source" >/dev/null 2>&1; then
+      _fail "driver discovery: built-in $source cannot be shadowed"
+    else
+      _pass "driver discovery: built-in $source cannot be shadowed"
+    fi
+  done
 }
 
 managed_symlink_snapshot_case() {

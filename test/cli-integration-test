@@ -130,13 +130,18 @@ shared_external_driver_case() {
   printf '%s\n' \
     'profile default' \
     'leg first example' \
-    'leg second example' >"$config"
+    'set first local-forward 127.0.0.1:18080:127.0.0.1:8080' \
+    'leg second example' \
+    'set second remote-forward 127.0.0.1:19090:127.0.0.1:9090' >"$config"
   chmod 0600 "$config"
 
   FWDPORTS_TEST_EXTERNAL_STATE=$lifecycle_state \
     FWDPORTS_TEST_EXTERNAL_ORDER=$lifecycle_order \
     run_fwdports "$output" start
   _assert_exit "external driver reuse: two legs start" 0 "$COMMAND_STATUS"
+  _assert_eq "start summary: preserves manifest order and driver names" \
+    $'fwdports: started profile default\nfwdports: forwards\n  first [example] local 127.0.0.1:18080:127.0.0.1:8080\n  second [example] remote 127.0.0.1:19090:127.0.0.1:9090' \
+    "$COMMAND_OUTPUT"
   generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
   driver_count=$(printf '%s\n' "$generation/drivers"/example | wc -l |
     tr -d '[:space:]')
@@ -337,13 +342,17 @@ default_ssh_lifecycle_case() {
 
   run_fwdports "$output" start
   _assert_exit "CLI lifecycle: default SSH starts" 0 "$COMMAND_STATUS"
-  _assert_contains "CLI lifecycle: start names profile" \
-    "started profile default" "$COMMAND_OUTPUT"
+  _assert_eq "CLI lifecycle: start reports the exact active forwards" \
+    $'fwdports: started profile default\nfwdports: forwards\n  shell [ssh] remote 127.0.0.1:19090:127.0.0.1:9090' \
+    "$COMMAND_OUTPUT"
 
   generation_before=$(basename "$CASE_STATE/fwdports/generations"/*)
   run_fwdports "$output" start --force
   _assert_exit "CLI lifecycle: repeated matching start succeeds" 0 \
     "$COMMAND_STATUS"
+  _assert_eq "CLI lifecycle: no-churn start reports exact active forwards" \
+    $'fwdports: profile default is already running (live/unverified)\nfwdports: forwards\n  shell [ssh] remote 127.0.0.1:19090:127.0.0.1:9090' \
+    "$COMMAND_OUTPUT"
   generation_after=$(basename "$CASE_STATE/fwdports/generations"/*)
   _assert_eq "CLI lifecycle: matching --force does not churn generation" \
     "$generation_before" "$generation_after"

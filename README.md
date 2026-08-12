@@ -62,6 +62,22 @@ fwdports attach
 fwdports stop
 ```
 
+After a successful start, `fwdports` prints the normalized standard forward
+records from the immutable generation manifest, without guessing at endpoint
+direction beyond the declared `local` or `remote` kind:
+
+```text
+fwdports: started profile local-dev
+fwdports: forwards
+  web [ssh] local 127.0.0.1:8080:127.0.0.1:8080
+```
+
+The same compact summary is printed when a matching start is a no-churn
+success, so it still describes the active generation. `fwdports status`
+remains a single machine-friendly state token. A profile with no standard
+forward records says so explicitly; an executable driver may still implement
+additional behavior through its own manifest keys.
+
 One owned tmux session is supported. Repeating `start` with the same desired
 state is a no-churn success while the generation is live and its checks pass.
 A dead generation, dead controller, or restart-policy health failure is

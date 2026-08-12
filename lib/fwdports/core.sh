@@ -111,6 +111,66 @@ _fwdports_manifest_matches_desired() {
   done <"$resolved"
 }
 
+_fwdports_manifest_forward_summary() {
+  local generation=$1 expected_digest=$2 snapshot=$3 manifest actual_digest
+  local kind leg field value _ driver direction index count=0
+  local -a leg_names=() leg_drivers=()
+
+  manifest=$generation/manifest
+  # Snapshot before rendering, then authenticate the exact copied bytes. The
+  # lifecycle lock excludes cooperating fwdports commands but not arbitrary
+  # same-UID mutation, so merely checking the source before and after parsing
+  # would leave an avoidable read race. The private snapshot also means the
+  # user never sees partial output if authentication fails.
+  fwdports_snapshot_trusted_file "$manifest" "$snapshot" "$generation" \
+    file "$generation" || return 74
+  actual_digest=$(_fwdports_runtime_sha256_file "$snapshot") || return 74
+  if [[ $actual_digest != "$expected_digest" ]]; then
+    printf 'fwdports: generation manifest changed before summary\n' >&2
+    return 74
+  fi
+
+  # Render immutable desired state rather than the source config so the
+  # summary describes the forwards the running panes actually received. Keep
+  # endpoint values in their normalized raw form: local and remote forwarding
+  # have different SSH bind semantics, and an invented arrow notation would
+  # be easier to misread than the source data.
+  printf 'fwdports: forwards\n'
+  while IFS=$'\t' read -r kind leg field value _ || [[ -n ${kind:-} ]]; do
+    case "$kind" in
+      leg)
+        leg_names+=("$leg")
+        leg_drivers+=("$field")
+        ;;
+      set)
+        case "$field" in
+          local-forward | remote-forward) ;;
+          *) continue ;;
+        esac
+        driver=
+        for ((index = 0; index < ${#leg_names[@]}; index++)); do
+          if [[ ${leg_names[index]} == "$leg" ]]; then
+            driver=${leg_drivers[index]}
+            break
+          fi
+        done
+        [[ -n $driver ]] || {
+          printf 'fwdports: forward refers to an unknown leg\n' >&2
+          return 74
+        }
+        direction=${field%-forward}
+        printf '  %s [%s] %s %s\n' "$leg" "$driver" "$direction" "$value"
+        count=$((count + 1))
+        ;;
+    esac
+  done <"$snapshot"
+  if [[ $count -eq 0 ]]; then
+    # An executable driver may use its own manifest keys, so make the scope of
+    # this statement explicit instead of claiming the driver has no forwards.
+    printf '  no standard forwards declared\n'
+  fi
+}
+
 _fwdports_all_legs_preserve_degraded() {
   local resolved=$1 kind leg _ policy scan_kind scan_leg scan_policy
   local found=0
@@ -318,6 +378,7 @@ fwdports_start() {
   local candidate='' active generation digest result status release_status
   local controller_record controller_pid=none controller_start=none
   local session_record session_id='' observed_state return_existing=0
+  local forward_summary=''
 
   config_root=$(_fwdports_config_root) || {
     printf 'fwdports: HOME or XDG_CONFIG_HOME must be absolute\n' >&2
@@ -415,10 +476,16 @@ fwdports_start() {
     if [[ $status -eq 0 && $return_existing -eq 1 ]]; then
       # Matching desired state is intentionally a no-churn success, including
       # when --force was supplied.  Full teardown remains explicit stop/start.
+      forward_summary=$(_fwdports_manifest_forward_summary \
+        "$generation" "$digest" "$workspace/forward-summary.manifest") ||
+        status=$?
       fwdports_lock_release "$root" "$candidate"
       release_status=$?
       rm -rf -- "$workspace"
-      return "$release_status"
+      [[ $status -eq 0 ]] || return "$status"
+      [[ $release_status -eq 0 ]] || return "$release_status"
+      printf '%s\n' "$forward_summary"
+      return 0
     fi
   fi
 
@@ -473,6 +540,11 @@ fwdports_start() {
       "$controller_pid" "$controller_start" unknown || status=$?
   fi
   if [[ $status -eq 0 ]]; then
+    forward_summary=$(_fwdports_manifest_forward_summary \
+      "$generation" "$digest" "$workspace/forward-summary.manifest") ||
+      status=$?
+  fi
+  if [[ $status -eq 0 ]]; then
     fwdports_pointer_publish "$root" active "$generation" "$digest" ||
       status=$?
   fi
@@ -492,6 +564,7 @@ fwdports_start() {
   [[ $status -ne 0 ]] && return "$status"
   [[ $release_status -eq 0 ]] || return "$release_status"
   printf 'fwdports: started profile %s\n' "$profile"
+  printf '%s\n' "$forward_summary"
 }
 
 fwdports_stop() {

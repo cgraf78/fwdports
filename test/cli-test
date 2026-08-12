@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Case callbacks are passed by name to the shared harness.
-# shellcheck disable=SC2329
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2034
 
 set -u
 
@@ -11,6 +11,10 @@ TEST_CASE=${1:-}
 
 # shellcheck source=lib/test.sh
 source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
+# shellcheck source=../lib/fwdports/core.sh
+source "$ROOT/lib/fwdports/core.sh"
 
 run_cli() {
   local output_file=$1
@@ -40,5 +44,57 @@ help_version_case() {
   _assert_eq "cli: driver API is v1" 1 "$CLI_OUTPUT"
 }
 
+summary_authentication_case() {
+  local tmp home state workspace source root generation digest output error
+  local status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  state=$tmp/state
+  workspace=$tmp/workspace
+  source=$tmp/resolved-profile
+  error=$tmp/error
+  mkdir -p "$home" "$state" "$workspace"
+  chmod 0700 "$home" "$state" "$workspace"
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\tdemonstration\texample' \
+    $'set\tdemonstration\thost\tshell.example.com' \
+    >"$source"
+  chmod 0600 "$source"
+  root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init) || return 1
+  generation=$(fwdports_generation_create "$root" "$source") || return 1
+  digest=$(fwdports_generation_manifest_digest "$generation") || return 1
+
+  output=$(_fwdports_manifest_forward_summary "$generation" "$digest" \
+    "$workspace/summary.manifest")
+  status=$?
+  _assert_exit "start summary: authentic manifest renders" 0 "$status"
+  _assert_eq "start summary: scopes an empty standard surface honestly" \
+    $'fwdports: forwards\n  no standard forwards declared' "$output"
+
+  printf '%s\n' \
+    $'set\tdemonstration\tremote-forward\t127.0.0.1:19090:127.0.0.1:9090' \
+    >>"$generation/manifest"
+  set +e
+  output=$(_fwdports_manifest_forward_summary "$generation" "$digest" \
+    "$workspace/tampered.manifest" 2>"$error")
+  status=$?
+  _assert_exit "start summary: rejects manifest bytes outside the digest" \
+    74 "$status"
+  _assert_eq "start summary: publishes no unauthenticated output" "" "$output"
+  _assert_contains "start summary: tampering diagnostic is actionable" \
+    "manifest changed before summary" "$(<"$error")"
+
+  mv "$generation/manifest" "$generation/manifest.unavailable"
+  set +e
+  output=$(_fwdports_manifest_forward_summary "$generation" "$digest" \
+    "$workspace/unavailable.manifest" 2>"$error")
+  status=$?
+  _assert_exit "start summary: unavailable manifest is rejected" 74 "$status"
+  _assert_eq "start summary: read failure publishes no output" "" "$output"
+}
+
 run_case help-version help_version_case
+run_case summary-authentication summary_authentication_case
 _test_summary

@@ -80,17 +80,30 @@ case "${1:-}" in
   run)
     leg=$3
     printf '%s\n' "$$" >"$FWDPORTS_TEST_EXTERNAL_STATE/$leg.pid"
+    # Record that the driver's TERM trap ran instead of inferring that state
+    # from kill -0. On Linux, an exited pane can remain as an unreaped zombie
+    # for a moment; kill -0 still succeeds for that zombie even though fwdports
+    # correctly treats it as stopped.
+    on_term() {
+      : >"$FWDPORTS_TEST_EXTERNAL_STATE/$leg.terminated"
+      printf 'term-%s\n' "$leg" >>"$FWDPORTS_TEST_EXTERNAL_ORDER"
+      exit 0
+    }
+    trap on_term HUP INT TERM
+    # Publish the simulated listener only after signals are safe to handle.
+    # The test treats this file as readiness evidence before requesting stop.
     : >"$FWDPORTS_TEST_EXTERNAL_STATE/$leg.listener"
-    trap 'printf "term-%s\n" "$leg" >>"$FWDPORTS_TEST_EXTERNAL_ORDER"; exit 0' HUP INT TERM
     while :; do sleep 1; done
     ;;
   is-live) exit 2 ;;
   cleanup)
     leg=$3
-    pid_file=$FWDPORTS_TEST_EXTERNAL_STATE/$leg.pid
-    phase=dead
-    if [[ -s $pid_file ]] && kill -0 "$(<"$pid_file")" 2>/dev/null; then
-      phase=live
+    phase=before-term
+    if [[ -e $FWDPORTS_TEST_EXTERNAL_STATE/$leg.terminated ]]; then
+      phase=after-term
+    else
+      # The first cleanup pass must get an opportunity to retire driver-owned
+      # resources before the core sends TERM to the pane.
       rm -f -- "$FWDPORTS_TEST_EXTERNAL_STATE/$leg.listener"
     fi
     printf 'cleanup-%s-%s\n' "$phase" "$leg" \
@@ -169,8 +182,8 @@ shared_external_driver_case() {
   _assert_exit "external driver reuse: authenticated stop succeeds" \
     0 "$COMMAND_STATUS"
   cleanup_order=$(awk '/^(cleanup|term)-/ { print }' "$lifecycle_order")
-  _assert_eq "external driver cleanup: live hooks precede TERM and final hooks" \
-    $'cleanup-live-second\ncleanup-live-first\nterm-first\nterm-second\ncleanup-dead-second\ncleanup-dead-first' \
+  _assert_eq "external driver cleanup: pre-TERM hooks precede TERM and final hooks" \
+    $'cleanup-before-term-second\ncleanup-before-term-first\nterm-first\nterm-second\ncleanup-after-term-second\ncleanup-after-term-first' \
     "$cleanup_order"
   _assert_not_exists "external driver cleanup: first listener is retired" \
     "$lifecycle_state/first.listener"

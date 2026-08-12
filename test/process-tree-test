@@ -235,6 +235,91 @@ term_owned_group_case() {
   kill_test_server "$PROC_SOCKET"
 }
 
+already_exited_owned_group_case() {
+  local tmp output error status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" term || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  # An external driver's graceful cleanup can make the pane exit after the
+  # controller classified it as live but before core reaches TERM.  Requiring
+  # the old leader to remain alive across that harmless race turns a completed
+  # stop into an error.  Simulate that exact boundary while retaining the real
+  # tmux and process-group evidence used in production.
+  kill -TERM -- "-$PROC_PGID"
+  _fwdports_wait_group_empty "$PROC_PGID" 100 0.02 || return 1
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    100 0.02 >"$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "process cleanup already exited: succeeds" 0 "$status"
+  _assert_eq "process cleanup already exited: reports no signal" \
+    "gone" "$(<"$output")"
+  _assert_eq "process cleanup already exited: has no diagnostic" \
+    "" "$(<"$error")"
+  kill_test_server "$PROC_SOCKET"
+}
+
+exited_before_escalation_case() {
+  local tmp output error status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" term || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  # Force the narrow boundary where the final bounded TERM poll observed the
+  # group as live, but the processes finish before the KILL revalidation.  The
+  # subsequent exact pane and group checks must recognize completed cleanup;
+  # treating it as lost ownership would make graceful shutdown timing flaky.
+  set +e
+  (
+    _fwdports_wait_group_empty() {
+      local pgid=$1 index=0 group_status verify_status
+      while [[ $index -lt 200 ]]; do
+        if _fwdports_process_group_live_records "$pgid" >/dev/null 2>&1; then
+          group_status=0
+        else
+          group_status=$?
+        fi
+        [[ $group_status -ne 0 ]] && break
+        sleep 0.01
+        index=$((index + 1))
+      done
+      [[ $group_status -eq 1 ]] || return 2
+      while [[ $index -lt 400 ]]; do
+        if fwdports_tmux_verify_pane "$TMUX_BIN" "$PROC_SOCKET" \
+          "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE"; then
+          verify_status=0
+        else
+          verify_status=$?
+        fi
+        [[ $verify_status -ne 0 ]] && break
+        sleep 0.01
+        index=$((index + 1))
+      done
+      [[ $verify_status -eq 1 ]] || return 2
+      return 1
+    }
+    fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+      active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+      1 0 >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+
+  _assert_exit "process cleanup late TERM exit: succeeds" 0 "$status"
+  _assert_eq "process cleanup late TERM exit: reports TERM completion" \
+    "term" "$(<"$output")"
+  _assert_eq "process cleanup late TERM exit: has no diagnostic" \
+    "" "$(<"$error")"
+  kill_test_server "$PROC_SOCKET"
+}
+
 kill_escalation_case() {
   local tmp output error status group_status
   tmp=$(_tmpdir) || return 1
@@ -423,6 +508,8 @@ list_panes_failure_case() {
 
 run_case pane-identity pane_identity_case
 run_case term-owned-group term_owned_group_case
+run_case already-exited-owned-group already_exited_owned_group_case
+run_case exited-before-escalation exited_before_escalation_case
 run_case kill-escalation kill_escalation_case
 run_case leader-missing leader_missing_case
 run_case failed-process-enumeration failed_process_enumeration_case

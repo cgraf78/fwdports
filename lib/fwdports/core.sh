@@ -794,13 +794,13 @@ fwdports_inspect() {
   local workspace manifest report actual_digest current report_status
 
   root=$(_fwdports_state_root_path) || return 1
-  tmux_path=$(_fwdports_command_path tmux) || return 69
   if [[ ! -d $root || -L $root ]]; then
     printf 'fwdports inspect\n'
     printf '  overall: stopped\n'
     printf '  active generation: none\n'
     return 0
   fi
+  tmux_path=$(_fwdports_command_path tmux) || return 69
   socket=$(_fwdports_tmux_socket "$root") || return 1
   if [[ ! -e $root/active && ! -L $root/active ]]; then
     if overall=$(fwdports_status "$root" "$tmux_path" "$socket" \

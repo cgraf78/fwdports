@@ -49,7 +49,7 @@ help_version_case() {
 }
 
 inspect_stopped_case() {
-  local tmp home config state runtime output
+  local tmp home config state runtime output empty_bin result status
   tmp=$(_tmpdir) || return 1
   home=$tmp/home
   config=$tmp/config
@@ -67,6 +67,19 @@ inspect_stopped_case() {
   _assert_eq "inspect stopped: is human readable" \
     $'fwdports inspect\n  overall: stopped\n  active generation: none' \
     "$CLI_OUTPUT"
+
+  empty_bin=$tmp/empty-bin
+  mkdir -p "$empty_bin"
+  set +e
+  result=$(PATH="$empty_bin" HOME=$home XDG_CONFIG_HOME=$config \
+    XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
+    FWDPORTS_TMUX_SOCKET=$runtime/fwdports.sock fwdports_inspect 2>&1)
+  status=$?
+  set -e
+  _assert_exit "inspect stopped: does not require tmux" 0 "$status"
+  _assert_eq "inspect stopped: no-tmux report remains complete" \
+    $'fwdports inspect\n  overall: stopped\n  active generation: none' \
+    "$result"
 }
 
 inspect_check_rendering_case() {

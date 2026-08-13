@@ -2,8 +2,14 @@
 
 `fwdports` narrows lifecycle authority; it is not a sandbox for code the user
 chooses to install. User SSH configuration and external driver executables are
-trusted same-user inputs. Profile data is non-executable but can intentionally
-expose network ports, so it still receives strict syntax and path validation.
+trusted same-user inputs. The user's normal tmux configuration is trusted too:
+the private server loads it for consistent interaction, while the private
+socket and cleared inherited client variables keep it separate from the
+ordinary tmux server. Lifecycle-critical `destroy-unattached`,
+`exit-unattached`, and `exit-empty` values are overridden on that private
+server so a presentation preference cannot end supervision or retain a stale
+server. Profile data is non-executable but can intentionally expose network
+ports, so it still receives strict syntax and path validation.
 The private runtime protocol prevents stale cooperating instances from
 claiming one another's state; it does not defend against malicious same-UID
 code racing filesystem operations, because that code already has authority to

@@ -56,6 +56,8 @@ source "$FWDPORTS_MODULE_DIR/drivers.sh"
 # shellcheck disable=SC1091
 source "$FWDPORTS_MODULE_DIR/driver-api.sh"
 # shellcheck disable=SC1091
+source "$FWDPORTS_MODULE_DIR/health.sh"
+# shellcheck disable=SC1091
 source "$FWDPORTS_MODULE_DIR/tmux.sh"
 # shellcheck disable=SC1091
 source "$FWDPORTS_MODULE_DIR/controller.sh"
@@ -67,6 +69,7 @@ usage() {
 Usage:
   fwdports [start] [TARGET] [--profile NAME] [--config FILE] [--force]
   fwdports status
+  fwdports inspect
   fwdports stop
   fwdports attach
   fwdports --version
@@ -97,20 +100,21 @@ esac
 
 command=start
 case "${1:-}" in
-  start | status | stop | attach)
+  start | status | inspect | stop | attach)
     command=$1
     shift
     ;;
 esac
 
 case "$command" in
-  status | stop | attach)
+  status | inspect | stop | attach)
     [[ $# -eq 0 ]] || {
       printf 'fwdports: %s accepts no arguments\n' "$command" >&2
       exit 64
     }
     case "$command" in
       status) fwdports_status_command ;;
+      inspect) fwdports_inspect ;;
       stop) fwdports_stop ;;
       attach) fwdports_attach ;;
     esac

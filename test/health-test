@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pure backoff and manifest-driven service health tests.
-# shellcheck disable=SC2329,SC2016
+# shellcheck disable=SC2329,SC2016,SC2034
 
 set -u
 
@@ -61,6 +61,45 @@ probe_case() {
     "$result"
 }
 
+single_probe_case() {
+  local tmp fake_bin empty_bin log result status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  empty_bin=$tmp/empty
+  log=$tmp/probe.log
+  mkdir -p "$fake_bin" "$empty_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_PROBE_LOG"' \
+    '[[ ${FWDPORTS_TEST_PROBE_RESULT:-0} -eq 0 ]]' >"$fake_bin/nc"
+  chmod 0700 "$fake_bin/nc"
+
+  result=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PROBE_LOG=$log \
+    fwdports_health_probe_local_tcp 127.0.0.1 8080)
+  status=$?
+  _assert_exit "single health probe: passing connect succeeds" 0 "$status"
+  _assert_eq "single health probe: passing result is explicit" \
+    passing "$result"
+  _assert_contains "single health probe: connect has a five-second bound" \
+    "-z -w 5 127.0.0.1 8080" "$(<"$log")"
+
+  set +e
+  result=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PROBE_LOG=$log \
+    FWDPORTS_TEST_PROBE_RESULT=1 \
+    fwdports_health_probe_local_tcp 127.0.0.1 8080)
+  status=$?
+  _assert_exit "single health probe: failed connect is observable" 1 "$status"
+  _assert_eq "single health probe: failed result is explicit" failing "$result"
+
+  result=$(PATH="$empty_bin" \
+    fwdports_health_probe_local_tcp 127.0.0.1 8080)
+  status=$?
+  set -e
+  _assert_exit "single health probe: missing nc is distinguished" 2 "$status"
+  _assert_eq "single health probe: missing nc is actionable" \
+    'unavailable (nc not installed)' "$result"
+}
+
 no_probe_case() {
   local tmp manifest result status
   tmp=$(_tmpdir) || return 1
@@ -80,5 +119,6 @@ no_probe_case() {
 
 run_case backoff backoff_case
 run_case probe probe_case
+run_case single-probe single_probe_case
 run_case no-probe no_probe_case
 _test_summary

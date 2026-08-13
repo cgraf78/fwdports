@@ -3,7 +3,7 @@
 These Bash 3.2-compatible modules implement reusable `fwdports` behavior:
 
 - `config.sh` parses and resolves data-only profiles.
-- `core.sh` composes command-level start/status/stop/attach transactions.
+- `core.sh` composes command-level start/status/inspect/stop/attach operations.
 - `controller.sh` gates activation, reports observed state, and resumes only
   generation-authenticated crash cleanup.
 - `drivers.sh` owns built-in SSH/autossh/ET validation and argv construction.

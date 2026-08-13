@@ -13,6 +13,8 @@ TEST_CASE=${1:-}
 source "$TEST_DIR/lib/test.sh"
 # shellcheck source=../lib/fwdports/runtime.sh
 source "$ROOT/lib/fwdports/runtime.sh"
+# shellcheck source=../lib/fwdports/health.sh
+source "$ROOT/lib/fwdports/health.sh"
 # shellcheck source=../lib/fwdports/core.sh
 source "$ROOT/lib/fwdports/core.sh"
 
@@ -34,6 +36,8 @@ help_version_case() {
   _assert_exit "cli: help succeeds" 0 "$CLI_STATUS"
   _assert_contains "cli: help names command" "fwdports [start]" "$CLI_OUTPUT"
   _assert_contains "cli: help documents status" "fwdports status" "$CLI_OUTPUT"
+  _assert_contains "cli: help documents human inspection" \
+    "fwdports inspect" "$CLI_OUTPUT"
 
   run_cli "$output" --version
   _assert_exit "cli: version succeeds" 0 "$CLI_STATUS"
@@ -42,6 +46,56 @@ help_version_case() {
   run_cli "$output" --driver-api-version
   _assert_exit "cli: driver API query succeeds" 0 "$CLI_STATUS"
   _assert_eq "cli: driver API is v1" 1 "$CLI_OUTPUT"
+}
+
+inspect_stopped_case() {
+  local tmp home config state runtime output empty_bin result status
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  config=$tmp/config
+  state=$tmp/state
+  runtime=$tmp/runtime
+  output=$tmp/output
+  mkdir -p "$home" "$config" "$state" "$runtime"
+  chmod 0700 "$home" "$config" "$state" "$runtime"
+
+  HOME=$home XDG_CONFIG_HOME=$config XDG_STATE_HOME=$state \
+    XDG_RUNTIME_DIR=$runtime FWDPORTS_TMUX_SOCKET=$runtime/fwdports.sock \
+    run_cli "$output" inspect
+  _assert_exit "inspect stopped: succeeds without an active generation" \
+    0 "$CLI_STATUS"
+  _assert_eq "inspect stopped: is human readable" \
+    $'fwdports inspect\n  overall: stopped\n  active generation: none' \
+    "$CLI_OUTPUT"
+
+  empty_bin=$tmp/empty-bin
+  mkdir -p "$empty_bin"
+  set +e
+  result=$(PATH="$empty_bin" HOME=$home XDG_CONFIG_HOME=$config \
+    XDG_STATE_HOME=$state XDG_RUNTIME_DIR=$runtime \
+    FWDPORTS_TMUX_SOCKET=$runtime/fwdports.sock fwdports_inspect 2>&1)
+  status=$?
+  set -e
+  _assert_exit "inspect stopped: does not require tmux" 0 "$status"
+  _assert_eq "inspect stopped: no-tmux report remains complete" \
+    $'fwdports inspect\n  overall: stopped\n  active generation: none' \
+    "$result"
+}
+
+inspect_check_rendering_case() {
+  local tmp empty_bin result status
+  tmp=$(_tmpdir) || return 1
+  empty_bin=$tmp/empty
+  mkdir -p "$empty_bin"
+  set +e
+  result=$(PATH="$empty_bin" \
+    _fwdports_inspect_render_check tcp 127.0.0.1 8080 endpoint)
+  status=$?
+  set -e
+  _assert_exit "inspect check: missing nc does not hide the report" 0 "$status"
+  _assert_eq "inspect check: missing nc is rendered explicitly" \
+    '      check: unavailable (nc not installed); point-in-time local TCP connect to 127.0.0.1 port 8080 (tcp; label endpoint)' \
+    "$result"
 }
 
 summary_authentication_case() {
@@ -96,5 +150,7 @@ summary_authentication_case() {
 }
 
 run_case help-version help_version_case
+run_case inspect-stopped inspect_stopped_case
+run_case inspect-check-rendering inspect_check_rendering_case
 run_case summary-authentication summary_authentication_case
 _test_summary

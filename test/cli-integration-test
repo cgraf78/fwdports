@@ -9,6 +9,7 @@ TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
 FWDPORTS=$ROOT/bin/fwdports
 TEST_CASE=${1:-}
+TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
 
 # shellcheck source=lib/test.sh
 source "$TEST_DIR/lib/test.sh"
@@ -23,7 +24,9 @@ run_fwdports() {
     FWDPORTS_AUTOSSH_COMMAND=$CASE_AUTOSSH \
     FWDPORTS_ET_COMMAND=$CASE_ET \
     FWDPORTS_TEST_ET_LOG=${FWDPORTS_TEST_ET_LOG:-} \
+    FWDPORTS_TEST_PANE_TITLE=${FWDPORTS_TEST_PANE_TITLE:-} \
     FWDPORTS_TEST_SSH_ONESHOT=${FWDPORTS_TEST_SSH_ONESHOT:-} \
+    FWDPORTS_TEST_SSH_RUNS=${FWDPORTS_TEST_SSH_RUNS:-} \
     FWDPORTS_CONTROLLER_TICK_SECONDS=${FWDPORTS_CONTROLLER_TICK_SECONDS:-1} \
     FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=${FWDPORTS_HEALTH_STARTUP_GRACE_TICKS:-5} \
     FWDPORTS_HEALTH_INTERVAL_TICKS=${FWDPORTS_HEALTH_INTERVAL_TICKS:-30} \
@@ -67,6 +70,230 @@ configured_health_case() {
   else
     _fail "CLI health: checked profile stops (exit $COMMAND_STATUS: $COMMAND_OUTPUT)"
   fi
+}
+
+tmux_observability_case() {
+  local tmp config output generation session windows labels heights
+  local border_status border_format selected_window first_height second_height
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg first' \
+    'set first host shell.example.com' \
+    'set first remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'leg second' \
+    'set second host shell.example.com' \
+    'set second remote-forward 127.0.0.1:19091:127.0.0.1:9091' >"$config"
+  chmod 0600 "$config"
+
+  FWDPORTS_TEST_PANE_TITLE=transport-output run_fwdports "$output" start
+  _assert_exit "tmux observability: two-leg profile starts" \
+    0 "$COMMAND_STATUS"
+  generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
+  session=$(LC_ALL=C sed -n $'s/^session-id\t//p' \
+    "$generation/legs/first/pane")
+  windows=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
+    -f /dev/null list-windows -t "$session" \
+    -F $'#{window_name}\t#{window_panes}\t#{window_active}' 2>/dev/null) ||
+    windows=unavailable
+  labels=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
+    -f /dev/null list-panes -t "$session:forwards" \
+    -F '#{@fwdports_label}' 2>/dev/null) || labels=unavailable
+  heights=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
+    -f /dev/null list-panes -t "$session:forwards" \
+    -F '#{pane_height}' 2>/dev/null) || heights=unavailable
+  border_status=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
+    -f /dev/null show-options -wqv -t "$session:forwards" \
+    pane-border-status 2>/dev/null) || border_status=unavailable
+  border_format=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
+    -f /dev/null show-options -wqv -t "$session:forwards" \
+    pane-border-format 2>/dev/null) || border_format=unavailable
+  selected_window=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
+    -f /dev/null display-message -p -t "$session" \
+    '#{window_name}' 2>/dev/null) || selected_window=unavailable
+
+  _assert_contains "tmux observability: forwards have a dedicated window" \
+    $'forwards\t2\t1' "$windows"
+  _assert_contains "tmux observability: controller has a separate window" \
+    $'control\t1\t0' "$windows"
+  _assert_eq "tmux observability: every transport pane names leg and driver" \
+    $'first [ssh]\nsecond [ssh]' "$labels"
+  _assert_eq "tmux observability: transport labels are visible" \
+    top "$border_status"
+  _assert_eq "tmux observability: pane border renders the stable label" \
+    ' #{@fwdports_label} ' "$border_format"
+  _assert_eq "tmux observability: attach defaults to transport output" \
+    forwards "$selected_window"
+  first_height=${heights%%$'\n'*}
+  second_height=${heights#*$'\n'}
+  if [[ $first_height =~ ^[0-9]+$ && $second_height =~ ^[0-9]+$ &&
+    $((first_height - second_height)) -le 1 &&
+    $((second_height - first_height)) -le 1 ]]; then
+    _pass "tmux observability: transport panes share space evenly"
+  else
+    _fail "tmux observability: transport panes share space evenly (heights '$heights')"
+  fi
+
+  run_fwdports "$output" stop
+  _assert_exit "tmux observability: split-window profile stops cleanly" \
+    0 "$COMMAND_STATUS"
+}
+
+inspect_observability_case() {
+  local tmp config output generation_before generation_after observed=''
+  local index=0 pane_pattern controller_pattern inspect_output
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ " $* " == *" -w 1 "* ]] && exit 1' \
+    '[[ " $* " != *" 19090 "* ]]' \
+    >"$tmp/bin/nc"
+  chmod 0700 "$tmp/bin/nc"
+  printf '%s\n' \
+    'profile default' \
+    'leg web' \
+    'set web host shell.example.com' \
+    'set web local-forward 127.0.0.1:18080:127.0.0.1:8080' \
+    'check web loopback 18080 web-listener' \
+    'leg api' \
+    'set api host shell.example.com' \
+    'set api remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'check api tcp 127.0.0.1 19090 api-listener' >"$config"
+  chmod 0600 "$config"
+
+  PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+    FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+    FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" start
+  _assert_exit "inspect active: checked two-leg profile starts" \
+    0 "$COMMAND_STATUS"
+  generation_before=$(basename "$CASE_STATE/fwdports/generations"/*)
+  while [[ $index -lt 200 ]]; do
+    PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+      FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+      FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" status
+    observed=$COMMAND_OUTPUT
+    [[ $observed == degraded ]] && break
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_eq "inspect active: aggregate status identifies a failed check" \
+    degraded "$observed"
+
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" inspect
+  inspect_output=$COMMAND_OUTPUT
+  _assert_exit "inspect active: human report succeeds" 0 "$COMMAND_STATUS"
+  _assert_contains "inspect active: names the report" \
+    'fwdports inspect' "$inspect_output"
+  _assert_contains "inspect active: reports overall state" \
+    '  overall: degraded' "$inspect_output"
+  _assert_contains "inspect active: reports selected profile" \
+    '  profile: default' "$inspect_output"
+  _assert_contains "inspect active: reports authenticated generation" \
+    '  generation: generation.' "$inspect_output"
+  _assert_contains "inspect active: states check limitations" \
+    'local TCP connect only; not end-to-end destination proof' \
+    "$inspect_output"
+  _assert_contains "inspect active: names first leg and driver" \
+    '    web [ssh]' "$inspect_output"
+  _assert_contains "inspect active: names second leg and driver" \
+    '    api [ssh]' "$inspect_output"
+  _assert_contains "inspect active: reports declared local forward" \
+    'standard forward: local 127.0.0.1:18080:127.0.0.1:8080' \
+    "$inspect_output"
+  _assert_contains "inspect active: reports declared remote forward" \
+    'standard forward: remote 127.0.0.1:19090:127.0.0.1:9090' \
+    "$inspect_output"
+  _assert_contains "inspect active: reports the passing check result" \
+    'check: passing; point-in-time local TCP connect to 127.0.0.1 port 18080 (loopback; label web-listener)' \
+    "$inspect_output"
+  _assert_contains "inspect active: identifies the failing leg check" \
+    'check: failing; point-in-time local TCP connect to 127.0.0.1 port 19090 (tcp; label api-listener)' \
+    "$inspect_output"
+  pane_pattern='tmux: live; session \$[0-9]+; window @[0-9]+ \(forwards\); pane %[0-9]+; pid [0-9]+'
+  if [[ $inspect_output =~ $pane_pattern ]]; then
+    _pass "inspect active: reports transport pane and window identity"
+  else
+    _fail "inspect active: reports transport pane and window identity"
+  fi
+  controller_pattern='controller: live; session \$[0-9]+; window @[0-9]+ \(control\); pane %[0-9]+; pid [0-9]+'
+  if [[ $inspect_output =~ $controller_pattern ]]; then
+    _pass "inspect active: reports controller pane and window identity"
+  else
+    _fail "inspect active: reports controller pane and window identity"
+  fi
+  _assert_contains "inspect active: distinguishes supervisor from transport" \
+    'transport: not separately observed (supervisor live)' "$inspect_output"
+
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" status
+  _assert_exit "inspect active: machine status still succeeds" \
+    0 "$COMMAND_STATUS"
+  _assert_eq "inspect active: machine status remains one token" \
+    degraded "$COMMAND_OUTPUT"
+  generation_after=$(basename "$CASE_STATE/fwdports/generations"/*)
+  _assert_eq "inspect active: report does not churn generation" \
+    "$generation_before" "$generation_after"
+
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
+  _assert_exit "inspect active: inspected profile stops cleanly" \
+    0 "$COMMAND_STATUS"
+}
+
+inspect_builtin_backoff_case() {
+  local tmp config output runs inspect_output index=0 run_count=0
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  runs=$tmp/ssh-runs
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == -G ]]; then' \
+    '  printf "hostname shell.example.com\nuser example\nport 22\nforwardagent no\n"' \
+    '  exit 0' \
+    'fi' \
+    'printf "run\n" >>"$FWDPORTS_TEST_SSH_RUNS"' \
+    'exit 0' >"$CASE_SSH"
+  chmod 0700 "$CASE_SSH"
+  printf '%s\n' \
+    'profile default' \
+    'leg retrying' \
+    'set retrying host shell.example.com' \
+    'set retrying remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    >"$config"
+  chmod 0600 "$config"
+
+  FWDPORTS_TEST_SSH_RUNS=$runs run_fwdports "$output" start
+  _assert_exit "inspect SSH backoff: profile starts" 0 "$COMMAND_STATUS"
+  while [[ $index -lt 500 ]]; do
+    if [[ -f $runs ]]; then
+      run_count=$(wc -l <"$runs" | tr -d '[:space:]')
+      [[ $run_count -ge 3 ]] && break
+    fi
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_eq "inspect SSH backoff: transport has entered repeated retry" \
+    3 "$run_count"
+  sleep 0.05
+
+  FWDPORTS_TEST_SSH_RUNS=$runs run_fwdports "$output" inspect
+  inspect_output=$COMMAND_OUTPUT
+  _assert_exit "inspect SSH backoff: live supervisor remains inspectable" \
+    0 "$COMMAND_STATUS"
+  _assert_contains "inspect SSH backoff: does not equate supervisor with transport" \
+    'transport: not separately observed (supervisor live)' "$inspect_output"
+  _assert_not_contains "inspect SSH backoff: makes no live transport claim" \
+    'transport: live' "$inspect_output"
+
+  FWDPORTS_TEST_SSH_RUNS=$runs run_fwdports "$output" stop
+  _assert_exit "inspect SSH backoff: profile stops cleanly" 0 "$COMMAND_STATUS"
 }
 
 write_external_driver() {
@@ -184,6 +411,13 @@ shared_external_driver_case() {
   _assert_exit "external driver reuse: status succeeds" 0 "$COMMAND_STATUS"
   _assert_eq "external driver reuse: both panes remain live" \
     live/unverified "$COMMAND_OUTPUT"
+  run_fwdports "$output" inspect
+  _assert_exit "external driver inspect: human report succeeds" \
+    0 "$COMMAND_STATUS"
+  _assert_contains "external driver inspect: identifies driver per leg" \
+    '    first [example]' "$COMMAND_OUTPUT"
+  _assert_contains "external driver inspect: distinguishes pane liveness" \
+    'transport: not separately reported (pane live)' "$COMMAND_OUTPUT"
   FWDPORTS_TEST_EXTERNAL_STATE=$lifecycle_state \
     FWDPORTS_TEST_EXTERNAL_ORDER=$lifecycle_order \
     run_fwdports "$output" stop
@@ -229,6 +463,7 @@ setup_case_root() {
     'fi' \
     'printf "%s\n" "$@" >"$FWDPORTS_TEST_SSH_LOG"' \
     '[[ -z ${FWDPORTS_TEST_SSH_ONESHOT:-} ]] || { printf "IDPASSKEY:XXXXXXXXXXXXXXXX/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"; exit 0; }' \
+    '[[ -z ${FWDPORTS_TEST_PANE_TITLE:-} ]] || printf "\033]2;%s\007" "$FWDPORTS_TEST_PANE_TITLE"' \
     'trap "exit 0" INT TERM HUP' \
     'while :; do sleep 1; done' >"$CASE_SSH"
   chmod 0700 "$CASE_SSH"
@@ -454,6 +689,9 @@ default_ssh_lifecycle_case() {
 run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case stock-et-lifecycle stock_et_lifecycle_case
 run_case configured-health configured_health_case
+run_case tmux-observability tmux_observability_case
+run_case inspect-observability inspect_observability_case
+run_case inspect-builtin-backoff inspect_builtin_backoff_case
 run_case shared-external-driver shared_external_driver_case
 run_case symlink-config-target-override symlink_config_target_override_case
 run_case later-pane-failure-reaps-autossh \

@@ -22,6 +22,11 @@ source "$ROOT/lib/fwdports/driver-api.sh"
 source "$ROOT/lib/fwdports/controller.sh"
 
 TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
+TMUX_TEST_HOME=$(_tmpdir)/home
+TMUX_TEST_CONFIG=$TMUX_TEST_HOME/config
+mkdir -p "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
+chmod 0700 "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
+export HOME=$TMUX_TEST_HOME XDG_CONFIG_HOME=$TMUX_TEST_CONFIG
 
 controller_fixture() {
   local tmp=$1 driver=${2:-ssh} home state source root generation digest

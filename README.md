@@ -60,6 +60,7 @@ fwdports                       # start the default profile
 fwdports host.example.com      # override the profile target
 fwdports --profile local-dev
 fwdports status
+fwdports inspect
 fwdports attach
 fwdports stop
 ```
@@ -86,6 +87,26 @@ A dead generation, dead controller, or restart-policy health failure is
 replaced sequentially; `preserve` keeps a still-live degraded generation.
 A differing configuration requires `--force`, which completes an authenticated
 stop before starting the replacement. Two generations never overlap.
+
+`fwdports attach` connects to that session through its private socket while
+retaining the user's normal tmux configuration, including mouse, copy-mode,
+key, and style settings. Transport panes live in a `forwards` window, use an
+even vertical layout, and show `LEG [DRIVER]` on their borders. The lifecycle
+controller runs separately in a `control` window, and each attach refocuses an
+authenticated transport pane instead of presenting controller output.
+The private server overrides only lifecycle-critical tmux settings:
+`destroy-unattached` and `exit-unattached` cannot end supervision when a client
+disconnects, while `exit-empty` retires the server after its last owned session
+ends.
+
+`fwdports status` intentionally remains a single machine-readable state token.
+For interactive diagnosis, `fwdports inspect` authenticates the active
+generation and reports the overall state, controller and transport pane/window
+identities, per-leg supervisor or driver liveness, declared standard forwards,
+and a bounded point-in-time result for each configured check. Checks are
+described as local TCP connect probes: they show whether the configured address
+accepted a connection from the machine running `fwdports`, not that traffic
+reached a tunnel's final destination or exercised an application protocol.
 
 ## Drivers
 

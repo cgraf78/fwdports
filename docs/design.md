@@ -18,6 +18,7 @@ configuration fragments.
 ```text
 fwdports [start] [TARGET] [--profile NAME] [--config FILE] [--force]
 fwdports status
+fwdports inspect
 fwdports stop
 fwdports attach
 fwdports --version
@@ -130,6 +131,16 @@ calls can be bound and tested independently.
 
 Process or monitor liveness is never reported as endpoint health.
 
+`status` emits exactly one vocabulary token for scripts. `inspect` is the
+human-readable companion: it authenticates the active pointer and manifest
+before emitting a report, then shows controller and leg tmux identities,
+supervisor or driver-reported liveness, standard forwards, and a bounded
+point-in-time result for every normalized check. A configured check is always
+labeled as a local TCP connect probe. It is not described as end-to-end tunnel
+or application health because the probe sends no payload and cannot establish
+either claim. Built-in panes are labeled as live supervisors rather than live
+transports because direct SSH may be between retry attempts.
+
 ## Reconciliation
 
 Each foreground transport owns reconnect behavior while its tmux pane remains
@@ -167,6 +178,17 @@ Tmux sessions carry a random generation nonce at creation. Core records pane,
 session, PID/start identity, tty, SID, and PGID evidence. Cleanup revalidates
 that evidence before signalling the owned foreground process group. Ambiguous
 evidence is retained for manual diagnosis rather than guessed away.
+
+The explicit tmux socket, cleared inherited client variables, session nonce,
+and recorded IDs provide isolation and lifecycle authority. The private server
+still loads the user's normal tmux configuration so copy-mode, mouse, keys, and
+styles behave consistently with their other sessions. Lifecycle-owned display
+structure is narrower: labeled transport panes share an even vertical
+`forwards` window, while the controller occupies a separate `control` window.
+Attach authenticates a recorded transport pane and selects its window before
+connecting. The private server forces `destroy-unattached` and
+`exit-unattached` off and `exit-empty` on because detached supervision and
+server retirement are lifecycle invariants, not presentation preferences.
 
 ## Compatibility
 

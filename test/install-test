@@ -232,16 +232,15 @@ single_link_failure_preserves_old_target_case() {
   fi
 }
 
-provider_header_and_lock_case() {
-  local lock='' config='' installer=''
-  [[ -f "$ROOT/.github/cgraf78-actions.lock" ]] &&
-    lock=$(<"$ROOT/.github/cgraf78-actions.lock")
+provider_header_case() {
+  local config='' installer=''
   [[ -f "$ROOT/scripts/checkout-installer.conf" ]] &&
     config=$(<"$ROOT/scripts/checkout-installer.conf")
   [[ -f "$ROOT/install.sh" ]] && installer=$(<"$ROOT/install.sh")
 
-  _assert_eq "installer provider: reviewed Actions lock" \
-    "3834fe036de0360a8418b6e129034797071edb0c" "$lock"
+  # The separately protected cgraf78/actions sync job owns exact lock, workflow
+  # ref, and generated-byte consistency. Keep this suite focused on fwdports'
+  # repository identity so a provider refresh has only one source of truth.
   _assert_contains "installer provider: consumer repository is fwdports" \
     "CHECKOUT_INSTALLER_REPO=cgraf78/fwdports" "$config"
   _assert_contains "installer provider: generated ownership header" \
@@ -288,6 +287,6 @@ run_case reject-real-path reject_real_path_case
 run_case missing-source-no-mutation missing_source_no_mutation_case
 run_case single-link-failure-preserves-old-target \
   single_link_failure_preserves_old_target_case
-run_case provider-header-and-lock provider_header_and_lock_case
+run_case provider-header provider_header_case
 run_case direct-generated-delegation direct_generated_delegation_case
 _test_summary

@@ -241,7 +241,7 @@ provider_header_and_lock_case() {
   [[ -f "$ROOT/install.sh" ]] && installer=$(<"$ROOT/install.sh")
 
   _assert_eq "installer provider: reviewed Actions lock" \
-    "464468328f050e43299298fc0eac8b971ddd38b7" "$lock"
+    "3834fe036de0360a8418b6e129034797071edb0c" "$lock"
   _assert_contains "installer provider: consumer repository is fwdports" \
     "CHECKOUT_INSTALLER_REPO=cgraf78/fwdports" "$config"
   _assert_contains "installer provider: generated ownership header" \

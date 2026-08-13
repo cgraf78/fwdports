@@ -8,8 +8,9 @@
 `fwdports` keeps a declared set of port forwards alive in one inspectable tmux
 session. It uses ordinary foreground OpenSSH by default, supports autossh when
 explicitly selected, supports stock Eternal Terminal 7.0.0 for resilient
-direct-host tunnels, and lets trusted local executables provide other transport
-drivers without putting consumer policy in the core.
+direct-host tunnels, supports the public `ettun` relay engine for destinations
+reached through an ET host, and lets trusted local executables provide other
+transport drivers without putting consumer policy in the core.
 
 ## Install
 
@@ -49,7 +50,8 @@ check web loopback 8080 web
 
 Configuration is parsed as records, never evaluated as shell. Omitted drivers
 mean `ssh`; select `autossh` explicitly when its monitor semantics are wanted,
-or select `et` for an Eternal Terminal 7.0.0-compatible direct connection.
+select `et` for an Eternal Terminal 7.0.0-compatible direct connection, or
+select `ettun` for a relay-backed local forward through an ET host.
 See [the design contract](docs/design.md) and the directly tested
 [examples](examples/README.md) for the complete grammar.
 
@@ -110,12 +112,23 @@ reached a tunnel's final destination or exercised an application protocol.
 
 ## Drivers
 
-Built-in `ssh`, `autossh`, and `et` share the standard forward record names.
+Built-in `ssh`, `autossh`, `et`, and `ettun` share the standard forward record
+names where their transport semantics overlap.
 ET uses an explicit four-part network form and is deliberately direct-host only
 in its first version; its SSH bootstrap rejects ambient proxy routing and
 other configuration that ET would turn into undeclared forwarding behavior.
-Literal IPv6 targets are deferred; use an SSH alias for an IPv6 host. See the
-exact ET limits in [the design contract](docs/design.md).
+Literal IPv6 targets are deferred; use an SSH alias for an IPv6 host. The
+`ettun` built-in accepts exactly one loopback-bound `local-forward`; its four
+fields map to `ettun VIA LOCAL_PORT TARGET TARGET_PORT`. It resolves and pins
+both `ettun` and its selected transport before creating a tmux session. The
+engine and any custom adapter run from generation-owned snapshots, so worker
+re-execs and later reconnects cannot adopt an upgrade halfway through the
+generation. By default the transport is stock ET 7.0.0 behind the same fixed
+`TERM`, private SSH gate, ambient-configuration checks, and telemetry controls
+as the direct ET built-in. An optional `transport` setting may name an
+executable adapter that supports the noninteractive
+`--fwdports-validate` dependency check described in the design contract.
+See the exact transport limits in [the design contract](docs/design.md).
 Additional drivers are trusted, single-file executables under
 `${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/drivers.d/`. Their versioned argv
 protocol is documented in [docs/drivers.md](docs/drivers.md).
@@ -138,6 +151,11 @@ name, port, or a stale PID. See [docs/security.md](docs/security.md).
 - `lsof` or `ss` for local-listener diagnostics
 - autossh only for profiles that select it
 - Eternal Terminal 7.0.0 only for profiles that select `et`
+- `ettun` and either Eternal Terminal 7.0.0 or a validated adapter only for
+  profiles that select `ettun`
+- base64, gzip, mkfifo, od, and tee for profiles that select `ettun`
+- Python 3.9 or newer with `os.getsid` support on macOS only for profiles that select
+  `ettun`
 
 Numeric minimums are claimed only for versions exercised by CI. Current
 platform results and intentional limitations are kept in the design document.

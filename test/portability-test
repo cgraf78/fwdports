@@ -116,7 +116,7 @@ stock_macos_bash_ci_case() {
 }
 
 bsd_ps_session_keyword_case() {
-  local tmp fake_bin log snapshot members
+  local tmp fake_bin log snapshot members session_members
   tmp=$(_tmpdir) || return 1
   fake_bin=$tmp/bin
   log=$tmp/ps.log
@@ -137,11 +137,16 @@ bsd_ps_session_keyword_case() {
     _fwdports_process_snapshot 123) || true
   members=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_PS_LOG=$log \
     _fwdports_process_group_records 456) || true
+  session_members=$(PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_PS_LOG=$log \
+    _fwdports_process_session_records_portable 789) || true
 
   _assert_eq "portability: BSD ps snapshot records session identity" \
     $'12\t456\t789\t??\tS' "$snapshot"
   _assert_eq "portability: BSD ps group records session identity" \
     $'123\t789\t??\tS' "$members"
+  _assert_eq "portability: portable session scan selects the exact SID" \
+    $'123\t456\t??\tS' "$session_members"
   _assert_contains "portability: ps requests the shared sess keyword" \
     'sess=' "$(<"$log")"
   _assert_not_contains "portability: ps avoids Darwin-unsupported sid keyword" \

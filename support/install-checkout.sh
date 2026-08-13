@@ -31,8 +31,11 @@ LIBRARY_SOURCES=(
   "$ROOT/lib/fwdports/drivers.sh"
   "$ROOT/lib/fwdports/et-gate.sh"
   "$ROOT/lib/fwdports/et-ssh-wrapper.sh"
+  "$ROOT/lib/fwdports/ettun-et-gate.sh"
+  "$ROOT/lib/fwdports/ettun-gate.sh"
   "$ROOT/lib/fwdports/health.sh"
   "$ROOT/lib/fwdports/runtime.sh"
+  "$ROOT/lib/fwdports/session-enumerator.py"
   "$ROOT/lib/fwdports/ssh-gate.sh"
   "$ROOT/lib/fwdports/tmux.sh"
 )
@@ -49,6 +52,8 @@ EXECUTABLE_SOURCES=(
   "$ROOT/lib/fwdports/driver-api.sh"
   "$ROOT/lib/fwdports/et-gate.sh"
   "$ROOT/lib/fwdports/et-ssh-wrapper.sh"
+  "$ROOT/lib/fwdports/ettun-et-gate.sh"
+  "$ROOT/lib/fwdports/ettun-gate.sh"
   "$ROOT/lib/fwdports/ssh-gate.sh"
 )
 for source in "${EXECUTABLE_SOURCES[@]}"; do

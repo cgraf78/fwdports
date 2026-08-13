@@ -61,9 +61,14 @@ jobs:
           "$install_prefix/bin/fwdports" --version
 
           for suite in autossh-driver builtin-runner cli config driver-api \
-            et-driver examples install portability ssh-driver; do
+            et-driver ettun-driver examples install portability ssh-driver; do
             /bin/bash "test/$suite-test"
           done
+
+          # Bash 3.2 treats the length of an empty nounset array as unbound.
+          # Exercise the controller's no-pane rollback without requiring tmux
+          # to be installed in this explicit stock-interpreter job.
+          /bin/bash test/controller-test no-pane-stop
 
   stock-et-contract:
     name: Stock ET 7.0.0 contract

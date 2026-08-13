@@ -1,0 +1,1265 @@
+#!/usr/bin/env bash
+# Relay-backed ettun built-in validation and generation-gate tests.
+# Case callbacks and TEST_CASE are consumed indirectly by the shared harness.
+# shellcheck disable=SC2329,SC2016,SC2034
+
+set -u
+
+TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+TEST_CASE=${1:-}
+
+# shellcheck source=lib/test.sh
+source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/driver-api.sh
+source "$ROOT/lib/fwdports/driver-api.sh"
+# shellcheck source=../lib/fwdports/drivers.sh
+source "$ROOT/lib/fwdports/drivers.sh"
+
+wait_for_path() {
+  local path=$1 attempts=0
+
+  while [[ ! -e $path && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -e $path ]]
+}
+
+write_fake_ettun() {
+  local path=$1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2' \
+    '  exit 0' \
+    'fi' \
+    '{' \
+    '  printf "ETTUN_ET=%s\n" "${ETTUN_ET:-}"' \
+    '  printf "ETTUN_TRANSPORT=%s\n" "${ETTUN_TRANSPORT:-}"' \
+    '  printf "ETTUN_CLIENT_ID=%s\n" "${ETTUN_CLIENT_ID:-}"' \
+    '  printf "ETTUN_BOOTSTRAP_TIMEOUT=%s\n" "${ETTUN_BOOTSTRAP_TIMEOUT:-}"' \
+    '  printf "TMPDIR=%s\n" "${TMPDIR:-}"' \
+    '  printf "ARG=%s\n" "$@"' \
+    '} >"${FWDPORTS_TEST_ETTUN_LOG:-/dev/null}"' \
+    'exit "${FWDPORTS_TEST_ETTUN_STATUS:-0}"' >"$path"
+  chmod 0700 "$path"
+}
+
+write_fake_ettun_passthrough() {
+  local path=$1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2' \
+    '  exit 0' \
+    'fi' \
+    '"$ETTUN_ET" -N --keepalive 5 -t "18080:49152,18081:49153" --command "echo safe-bootstrap" "$1"' \
+    >"$path"
+  chmod 0700 "$path"
+}
+
+write_reexec_ettun() {
+  local path=$1 version=$2
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2' \
+    '  exit 0' \
+    'fi' \
+    'if [[ ${1:-} == --fwdports-test-worker ]]; then' \
+    "  printf '%s\\n' '$version' >\"\$FWDPORTS_TEST_ETTUN_LOG\"" \
+    '  exit 0' \
+    'fi' \
+    ': >"$FWDPORTS_TEST_ETTUN_READY"' \
+    'while [[ ! -e $FWDPORTS_TEST_ETTUN_TRIGGER ]]; do sleep 0.01; done' \
+    '"$BASH" "${BASH_SOURCE[0]}" --fwdports-test-worker' \
+    >"$path"
+  chmod 0700 "$path"
+}
+
+write_delayed_adapter_ettun() {
+  local path=$1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2' \
+    '  exit 0' \
+    'fi' \
+    ': >"$FWDPORTS_TEST_ETTUN_READY"' \
+    'while [[ ! -e $FWDPORTS_TEST_ETTUN_TRIGGER ]]; do sleep 0.01; done' \
+    '"$ETTUN_TRANSPORT" gateway.example.net tunnel-spec remote-command' \
+    >"$path"
+  chmod 0700 "$path"
+}
+
+write_versioned_transport() {
+  local path=$1 version=$2
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --fwdports-validate ]]; then exit 0; fi' \
+    "printf '%s\\n' '$version' >\"\$FWDPORTS_TEST_TRANSPORT_LOG\"" \
+    >"$path"
+  chmod 0700 "$path"
+}
+
+write_fake_et() {
+  local path=$1 capability
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+    printf '%s\n' \
+      'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
+      'if [[ ${1:-} == --help ]]; then'
+    for capability in --port --tunnel --reversetunnel --logdir \
+      --logtostdout --no-terminal --telemetry; do
+      printf '  printf "  %s\\n"\n' "$capability"
+    done
+    printf '%s\n' '  exit 0' 'fi'
+    printf '%s\n' \
+      'if [[ -n ${FWDPORTS_TEST_ET_LOG:-} ]]; then' \
+      '  {' \
+      '    printf "TERM=%s\nTMPDIR=%s\nPATH=%s\n" "${TERM:-}" "${TMPDIR:-}" "${PATH:-}"' \
+      '    printf "ARG=%s\n" "$@"' \
+      '  } >"$FWDPORTS_TEST_ET_LOG"' \
+      'fi' \
+      'if [[ -n ${FWDPORTS_TEST_ET_SSH_LOG:-} ]]; then' \
+      '  via=' \
+      '  for via in "$@"; do :; done' \
+      '  ssh "$via" "echo safe-bootstrap"' \
+      'fi' \
+      'exit "${FWDPORTS_TEST_ET_STATUS:-0}"'
+  } >"$path"
+  chmod 0700 "$path"
+}
+
+write_fake_ssh() {
+  local path=$1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == -G ]]; then cat "$FWDPORTS_TEST_SSH_CONFIG"; exit 0; fi' \
+    'printf "%s\n" "$@" >"${FWDPORTS_TEST_SSH_LOG:-/dev/null}"' \
+    'exit 0' >"$path"
+  chmod 0700 "$path"
+}
+
+write_clean_ssh_config() {
+  printf '%s\n' \
+    'hostname gateway.example.net' \
+    'user example' \
+    'port 22' \
+    'forwardagent no' >"$1"
+  chmod 0600 "$1"
+}
+
+write_fake_transport() {
+  local path=$1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --fwdports-validate ]]; then' \
+    '  if [[ -n ${FWDPORTS_TEST_TRANSPORT_STDIN_LOG:-} ]]; then' \
+    '    if IFS= read -r input; then' \
+    '      printf "read=%s\n" "$input" >"$FWDPORTS_TEST_TRANSPORT_STDIN_LOG"' \
+    '    else' \
+    '      printf "eof\n" >"$FWDPORTS_TEST_TRANSPORT_STDIN_LOG"' \
+    '    fi' \
+    '  fi' \
+    '  if [[ -n ${FWDPORTS_TEST_TRANSPORT_LOG:-} ]]; then' \
+    '    {' \
+    '      printf "ETTUN_ET=%s\n" "${ETTUN_ET:-}"' \
+    '      printf "ETTUN_TRANSPORT=%s\n" "${ETTUN_TRANSPORT:-}"' \
+    '      printf "ETTUN_CLIENT_ID=%s\n" "${ETTUN_CLIENT_ID:-}"' \
+    '    } >"$FWDPORTS_TEST_TRANSPORT_LOG"' \
+    '  fi' \
+    '  exit "${FWDPORTS_TEST_TRANSPORT_VALIDATE_STATUS:-0}"' \
+    'fi' \
+    'exit 0' >"$path"
+  chmod 0700 "$path"
+}
+
+write_ettun_manifest() {
+  local path=$1
+  printf '%s\n' \
+    $'version\t1' \
+    $'generation\tgeneration.test' \
+    $'target\tnone' \
+    $'profile\tdemo' \
+    $'leg\trelay\tettun' \
+    $'set\trelay\thost\tgateway.example.net' \
+    $'set\trelay\tlocal-forward\t127.0.0.1:18080:desktop.example.net:3389' \
+    $'check\trelay\tloopback\t127.0.0.1\t18080\trelay' >"$path"
+  chmod 0600 "$path"
+}
+
+missing_dependency_case() {
+  local tmp output error status
+  tmp=$(_tmpdir) || return 1
+  output=$tmp/source
+  error=$tmp/error
+
+  set +e
+  fwdports_ettun_resolve "$tmp/not-installed" "$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun dependency: missing executable fails early" 1 "$status"
+  _assert_contains "ettun dependency: diagnostic names the missing command" \
+    "ettun executable is not available" "$(<"$error")"
+  _assert_not_exists "ettun dependency: failed resolution publishes nothing" \
+    "$output"
+}
+
+resolve_case() {
+  local tmp fake output error status expected_digest content=''
+  tmp=$(_tmpdir) || return 1
+  fake=$tmp/ettun
+  output=$tmp/source
+  error=$tmp/error
+  write_fake_ettun "$fake"
+
+  set +e
+  fwdports_ettun_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  [[ ! -f $output ]] || content=$(<"$output")
+  expected_digest=$(_fwdports_sha256_file "$fake")
+
+  _assert_exit "ettun dependency: compatible executable resolves" 0 "$status"
+  _assert_contains "ettun dependency: records canonical path" \
+    $'path\t'"$fake" "$content"
+  _assert_contains "ettun dependency: records immutable digest" \
+    $'digest\t'"$expected_digest" "$content"
+  _assert_contains "ettun dependency: records file identity" $'identity\t' \
+    "$content"
+  _assert_eq "ettun dependency: compatible executable emits no diagnostic" \
+    "" "$(<"$error")"
+}
+
+local_dependencies_case() {
+  local tmp fake_bin error status test_python_path hostile marker
+  local launcher_dir launcher resolved
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  error=$tmp/error
+  test_python_path=$(python3 -c \
+    'import os, sys; print(os.path.realpath(sys.executable))') || return 1
+  mkdir -p "$fake_bin"
+
+  set +e
+  (
+    _fwdports_ettun_command_path() {
+      [[ $1 != gzip ]] || return 1
+      printf '/fixture/%s\n' "$1"
+    }
+    fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependencies: a missing local command fails early" \
+    1 "$status"
+  _assert_contains "ettun dependencies: diagnostic names the missing command" \
+    "ettun local dependency is not available: gzip" "$(<"$error")"
+
+  set +e
+  (
+    _fwdports_ettun_platform_is_darwin() { return 0; }
+    _fwdports_canonical_executable() {
+      [[ $1 != python3 ]] || return 1
+      return 1
+    }
+    _fwdports_ettun_command_path() {
+      printf '/fixture/%s\n' "$1"
+    }
+    fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependencies: missing Darwin Python fails early" \
+    1 "$status"
+  _assert_contains \
+    "ettun dependencies: diagnostic names the missing Darwin Python" \
+    "ettun local dependency is not available on macOS: python3" \
+    "$(<"$error")"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'exit 2' >"$fake_bin/python3"
+  chmod 0700 "$fake_bin/python3"
+  set +e
+  (
+    _fwdports_ettun_platform_is_darwin() { return 0; }
+    _fwdports_canonical_executable() {
+      [[ $1 != python3 ]] || {
+        printf '%s\n' "$fake_bin/python3"
+        return 0
+      }
+      return 1
+    }
+    _fwdports_ettun_command_path() {
+      printf '/fixture/%s\n' "$1"
+    }
+    fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependencies: incompatible Darwin Python fails early" \
+    1 "$status"
+  _assert_contains \
+    "ettun dependencies: incompatible Darwin Python is actionable" \
+    "ettun macOS session enumerator probe failed" \
+    "$(<"$error")"
+
+  chmod 0722 "$fake_bin/python3"
+  set +e
+  (
+    _fwdports_ettun_platform_is_darwin() { return 0; }
+    _fwdports_canonical_executable() {
+      [[ $1 != python3 ]] || {
+        printf '%s\n' "$fake_bin/python3"
+        return 0
+      }
+      return 1
+    }
+    _fwdports_ettun_command_path() {
+      printf '/fixture/%s\n' "$1"
+    }
+    fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependencies: writable Darwin Python fails early" \
+    1 "$status"
+  _assert_contains \
+    "ettun dependencies: writable Darwin Python is actionable" \
+    "ettun macOS session interpreter has untrusted metadata" \
+    "$(<"$error")"
+
+  set +e
+  (
+    _fwdports_ettun_platform_is_darwin() { return 1; }
+    _fwdports_ettun_command_path() {
+      printf '/fixture/%s\n' "$1"
+    }
+    fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependencies: Linux needs no Python enumerator" 0 \
+    "$status"
+  _assert_eq "ettun dependencies: Linux dependency check is quiet" "" \
+    "$(<"$error")"
+
+  hostile=$tmp/hostile-python
+  marker=$tmp/sitecustomize-loaded
+  mkdir -p "$hostile"
+  printf '%s\n' \
+    'import os' \
+    'with open(os.environ["FWDPORTS_TEST_SITE_MARKER"], "w") as marker:' \
+    '    marker.write("loaded")' >"$hostile/sitecustomize.py"
+
+  set +e
+  (
+    _fwdports_ettun_platform_is_darwin() { return 0; }
+    _fwdports_canonical_executable() {
+      [[ $1 != python3 && $1 != "$test_python_path" ]] || {
+        printf '%s\n' "$test_python_path"
+        return 0
+      }
+      return 1
+    }
+    _fwdports_ettun_command_path() {
+      printf '/fixture/%s\n' "$1"
+    }
+    PYTHONPATH=$hostile FWDPORTS_TEST_SITE_MARKER=$marker \
+      fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependencies: complete local toolset succeeds" 0 \
+    "$status"
+  _assert_eq "ettun dependencies: complete toolset is quiet" "" \
+    "$(<"$error")"
+  _assert_not_exists \
+    "ettun dependencies: isolated Python ignores ambient startup" "$marker"
+
+  set +e
+  (
+    _fwdports_ettun_platform_is_darwin() { return 0; }
+    _fwdports_canonical_executable() {
+      case $1 in
+        python3) return 1 ;;
+        /usr/bin/python3)
+          printf '%s\n' "$test_python_path"
+          return 0
+          ;;
+        "$test_python_path")
+          printf '%s\n' "$test_python_path"
+          return 0
+          ;;
+        *) return 1 ;;
+      esac
+    }
+    _fwdports_ettun_command_path() {
+      printf '/fixture/%s\n' "$1"
+    }
+    fwdports_ettun_validate_local_dependencies
+  ) 2>"$error"
+  status=$?
+  set -e
+  _assert_exit \
+    "ettun dependencies: macOS system Python bypasses an unsafe PATH entry" \
+    0 "$status"
+  _assert_eq "ettun dependencies: system Python fallback is quiet" "" \
+    "$(<"$error")"
+
+  launcher_dir=$tmp/python-launcher
+  launcher=$launcher_dir/python3
+  mkdir -p "$launcher_dir"
+  chmod 0700 "$launcher_dir"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'exec "$FWDPORTS_TEST_PYTHON_BACKEND" "$@"' >"$launcher"
+  chmod 0700 "$launcher"
+  resolved=$(PATH="$launcher_dir:/usr/bin:/bin" \
+    FWDPORTS_TEST_PYTHON_BACKEND=$test_python_path \
+    _fwdports_ettun_session_python_resolve) || return 1
+  _assert_contains \
+    "ettun dependencies: stable launcher records its exact Python backend" \
+    "$test_python_path" "$resolved"
+  _assert_not_contains \
+    "ettun dependencies: lifecycle metadata excludes the ambient launcher" \
+    "$launcher" "$resolved"
+}
+
+untrusted_python_backend_case() {
+  local tmp safe_dir unsafe_dir launcher backend error status
+  tmp=$(_tmpdir) || return 1
+  safe_dir=$tmp/safe
+  unsafe_dir=$tmp/unsafe
+  launcher=$safe_dir/python3
+  backend=$unsafe_dir/python3
+  error=$tmp/error
+  mkdir -p "$safe_dir" "$unsafe_dir"
+  chmod 0700 "$safe_dir"
+  chmod 0777 "$unsafe_dir"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$FWDPORTS_TEST_PYTHON_BACKEND"' >"$launcher"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$backend"
+  chmod 0700 "$launcher" "$backend"
+
+  set +e
+  PATH="$safe_dir:/usr/bin:/bin" \
+    FWDPORTS_TEST_PYTHON_BACKEND=$backend \
+    _fwdports_ettun_session_python_resolve 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun dependency: untrusted Python backend is rejected" \
+    1 "$status"
+  _assert_contains \
+    "ettun dependency: untrusted backend diagnostic names its candidate" \
+    "$backend" "$(<"$error")"
+  _assert_contains \
+    "ettun dependency: untrusted backend diagnostic names its writable ancestor" \
+    "$unsafe_dir (mode 777)" "$(<"$error")"
+}
+
+darwin_group_writable_python_backend_case() {
+  local tmp safe_dir group_dir launcher backend output error status
+  tmp=$(_tmpdir) || return 1
+  safe_dir=$tmp/safe
+  group_dir=$tmp/group
+  launcher=$safe_dir/python3
+  backend=$group_dir/python3
+  output=$tmp/output
+  error=$tmp/error
+  mkdir -p "$safe_dir" "$group_dir"
+  chmod 0700 "$safe_dir"
+  chmod 0770 "$group_dir"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$FWDPORTS_TEST_PYTHON_BACKEND"' >"$launcher"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$backend"
+  chmod 0700 "$launcher" "$backend"
+
+  set +e
+  (
+    _fwdports_platform_is_darwin() { return 0; }
+    _fwdports_stat_group() { printf '80\n'; }
+    id() {
+      if [[ ${1:-} == -G ]]; then
+        printf '%s 80\n' "$(command id -G)"
+      else
+        command id "$@"
+      fi
+    }
+    PATH="$safe_dir:/usr/bin:/bin" \
+      FWDPORTS_TEST_PYTHON_BACKEND=$backend \
+      _fwdports_ettun_session_python_resolve >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+
+  _assert_exit \
+    "ettun dependency: Darwin accepts a backend under the admin group" \
+    0 "$status"
+  _assert_contains \
+    "ettun dependency: Darwin records the admin-group backend" \
+    "$backend" "$(<"$output")"
+  _assert_eq "ettun dependency: admin-group backend is quiet" "" \
+    "$(<"$error")"
+
+  chmod 0777 "$group_dir"
+  set +e
+  (
+    _fwdports_platform_is_darwin() { return 0; }
+    _fwdports_stat_group() { printf '80\n'; }
+    id() {
+      if [[ ${1:-} == -G ]]; then
+        printf '%s 80\n' "$(command id -G)"
+      else
+        command id "$@"
+      fi
+    }
+    PATH="$safe_dir:/usr/bin:/bin" \
+      FWDPORTS_TEST_PYTHON_BACKEND=$backend \
+      _fwdports_ettun_session_python_resolve >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+  _assert_exit \
+    "ettun dependency: Darwin still rejects a world-writable backend parent" \
+    1 "$status"
+
+  chmod 0770 "$group_dir"
+  set +e
+  (
+    _fwdports_platform_is_darwin() { return 0; }
+    PATH="$safe_dir:/usr/bin:/bin" \
+      FWDPORTS_TEST_PYTHON_BACKEND=$backend \
+      _fwdports_ettun_session_python_resolve >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+  _assert_exit \
+    "ettun dependency: Darwin rejects a non-admin group-writable parent" \
+    1 "$status"
+}
+
+builtin_dependency_preflight_case() {
+  local tmp core drivers output error status
+  tmp=$(_tmpdir) || return 1
+  core=$(<"$ROOT/lib/fwdports/core.sh")
+  drivers=$(<"$ROOT/lib/fwdports/drivers.sh")
+
+  _assert_contains "built-in dependency preflight: every leg prepares before tmux creation" \
+    'Validate every leg before invoking any interactive prepare operation' \
+    "$core"
+  _assert_contains "built-in dependency preflight: SSH resolves during prepare" \
+    'fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}"' "$drivers"
+  _assert_contains "built-in dependency preflight: autossh resolves during prepare" \
+    'fwdports_autossh_resolve "${FWDPORTS_AUTOSSH_COMMAND:-autossh}"' \
+    "$drivers"
+  _assert_contains "built-in dependency preflight: ET resolves during prepare" \
+    'fwdports_et_resolve "${FWDPORTS_ET_COMMAND:-et}"' "$drivers"
+
+  output=$tmp/ssh-source
+  error=$tmp/ssh-error
+  set +e
+  fwdports_ssh_resolve "$tmp/missing-ssh" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "built-in dependency preflight: missing SSH fails" 1 "$status"
+  _assert_not_exists "built-in dependency preflight: missing SSH publishes nothing" \
+    "$output"
+
+  output=$tmp/autossh-source
+  error=$tmp/autossh-error
+  set +e
+  fwdports_autossh_resolve "$tmp/missing-autossh" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "built-in dependency preflight: missing autossh fails" 1 \
+    "$status"
+  _assert_not_exists "built-in dependency preflight: missing autossh publishes nothing" \
+    "$output"
+
+  output=$tmp/et-source
+  error=$tmp/et-error
+  set +e
+  fwdports_et_resolve "$tmp/missing-et" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "built-in dependency preflight: missing ET fails" 1 "$status"
+  _assert_not_exists "built-in dependency preflight: missing ET publishes nothing" \
+    "$output"
+}
+
+external_only_dependency_preflight_case() {
+  local tmp manifest preflight error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  preflight=$tmp/preflight
+  error=$tmp/error
+  printf '%s\n' \
+    $'version\t1' \
+    $'profile\tdemo' \
+    $'leg\textension\texample' >"$manifest"
+  chmod 0600 "$manifest"
+
+  set +e
+  fwdports_builtin_preflight_dependencies "$manifest" "$preflight" '' \
+    2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "built-in dependency preflight: external-only profile succeeds" \
+    0 "$status"
+  _assert_eq "built-in dependency preflight: external-only emits no diagnostic" \
+    "" "$(<"$error")"
+}
+
+builtin_selection_case() {
+  local status=0
+  fwdports_driver_is_builtin ettun || status=$?
+  _assert_exit "ettun selection: driver is a reserved built-in" 0 "$status"
+}
+
+nested_dependency_case() {
+  local tmp manifest runtime fake_ettun fake_et preflight error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_ettun=$tmp/ettun
+  error=$tmp/error
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  write_ettun_manifest "$manifest"
+  write_fake_ettun "$fake_ettun"
+
+  set +e
+  FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$tmp/missing-et \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun dependency: missing selected ET transport fails before launch" \
+    1 "$status"
+  _assert_contains "ettun dependency: nested diagnostic names Eternal Terminal" \
+    "Eternal Terminal executable is not available" "$(<"$error")"
+  _assert_not_exists "ettun dependency: failed prepare publishes no driver kind" \
+    "$runtime/driver-kind"
+
+  fake_et=$tmp/et
+  preflight=$tmp/preflight
+  write_fake_et "$fake_et"
+  set +e
+  FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$fake_et \
+    FWDPORTS_SSH_COMMAND=$tmp/missing-ssh \
+    fwdports_builtin_preflight_dependencies "$manifest" "$preflight" '' \
+    2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun dependency: missing nested SSH fails before launch" \
+    1 "$status"
+  _assert_contains "ettun dependency: nested diagnostic names OpenSSH" \
+    "OpenSSH executable is not available" "$(<"$error")"
+}
+
+generation_prepare_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_et fake_ssh
+  local ssh_config error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_et=$fake_bin/et
+  fake_ssh=$fake_bin/ssh
+  ssh_config=$tmp/ssh-config
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$manifest"
+  write_fake_ettun "$fake_ettun"
+  write_fake_et "$fake_et"
+  write_fake_ssh "$fake_ssh"
+  write_clean_ssh_config "$ssh_config"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$fake_et \
+    FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun generation: dependency-complete prepare succeeds" 0 \
+    "$status"
+  _assert_eq "ettun generation: publishes driver kind last" ettun \
+    "$(<"$runtime/driver-kind")"
+  _assert_file "ettun generation: immutable launch gate exists" \
+    "$runtime/ettun-gate"
+  _assert_file "ettun generation: records the ettun executable" \
+    "$runtime/ettun-source"
+  _assert_file "ettun generation: snapshots the relay engine" \
+    "$runtime/ettun-engine"
+  if _fwdports_ettun_platform_is_darwin; then
+    _assert_file "ettun generation: snapshots the macOS session enumerator" \
+      "$runtime/session-enumerator.py"
+    _assert_file "ettun generation: records the macOS session interpreter" \
+      "$runtime/session-python"
+  else
+    _assert_not_exists "ettun generation: Linux needs no session helper" \
+      "$runtime/session-enumerator.py"
+    _assert_not_exists "ettun generation: Linux needs no session Python" \
+      "$runtime/session-python"
+  fi
+  _assert_file "ettun generation: records the nested ET executable" \
+    "$runtime/ettun-et-source"
+  _assert_not_exists "ettun generation: stock ET needs no adapter snapshot" \
+    "$runtime/ettun-transport-exec"
+  _assert_file "ettun generation: nested ET launch gate is immutable" \
+    "$runtime/ettun-et-gate"
+  _assert_file "ettun generation: nested ET uses the private SSH shim" \
+    "$runtime/et-bin/ssh"
+  _assert_file "ettun generation: nested ET ambient SSH gate exists" \
+    "$runtime/et-ssh-ambient/ssh-gate"
+  _assert_file "ettun generation: nested ET bootstrap SSH gate exists" \
+    "$runtime/et-ssh-bootstrap/ssh-gate"
+  _assert_eq "ettun generation: publishes fixed launch arguments" \
+    $'gateway.example.net\n18080\ndesktop.example.net\n3389' \
+    "$(<"$runtime/ettun-argv")"
+}
+
+generation_gate_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_et fake_ssh
+  local ssh_config log error status before after
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_et=$fake_bin/et
+  fake_ssh=$fake_bin/ssh
+  ssh_config=$tmp/ssh-config
+  log=$tmp/ettun.log
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$manifest"
+  write_fake_ettun "$fake_ettun"
+  write_fake_et "$fake_et"
+  write_fake_ssh "$fake_ssh"
+  write_clean_ssh_config "$ssh_config"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$fake_et \
+    FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    >/dev/null 2>"$error" || return 1
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_LOG=$log \
+    FWDPORTS_TEST_ETTUN_STATUS=23 ETTUN_TRANSPORT=ambient-adapter \
+    ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    ETTUN_BOOTSTRAP_TIMEOUT=999 "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  before=$(<"$log")
+
+  _assert_exit "ettun gate: foreground status is preserved" 23 "$status"
+  _assert_contains "ettun gate: selects the hardened ET dependency gate" \
+    "ETTUN_ET=$runtime/ettun-et-gate" "$before"
+  _assert_contains "ettun gate: ambient transport override is removed" \
+    "ETTUN_TRANSPORT=" "$before"
+  _assert_not_contains "ettun gate: ambient transport cannot replace ET" \
+    "ambient-adapter" "$before"
+  _assert_contains "ettun gate: temporary state is generation-private" \
+    "TMPDIR=$runtime/ettun-tmp" "$before"
+  _assert_contains "ettun gate: fixed route arguments reach the engine" \
+    $'ARG=gateway.example.net\nARG=18080\nARG=desktop.example.net\nARG=3389' \
+    "$before"
+
+  : >"$runtime/ettun-argv"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_LOG=$log \
+    FWDPORTS_TEST_ETTUN_STATUS=0 "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun gate: empty argv fails with generation drift" 78 "$status"
+  _assert_eq "ettun gate: empty argv launches no engine bytes" "$before" \
+    "$(<"$log")"
+  printf '%s\n' gateway.example.net 18080 desktop.example.net 3389 \
+    >"$runtime/ettun-argv"
+
+  printf '\n# drift\n' >>"$fake_ettun"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_LOG=$log \
+    FWDPORTS_TEST_ETTUN_STATUS=0 "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  after=$(<"$log")
+  _assert_exit "ettun gate: executable drift fails closed" 78 "$status"
+  _assert_eq "ettun gate: drift launches no replacement bytes" "$before" \
+    "$after"
+}
+
+default_et_hardening_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_et fake_ssh
+  local ssh_config et_log ssh_log error status before_et before_ssh
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_et=$fake_bin/et
+  fake_ssh=$fake_bin/ssh
+  ssh_config=$tmp/ssh-config
+  et_log=$tmp/et.log
+  ssh_log=$tmp/ssh.log
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$manifest"
+  write_fake_ettun_passthrough "$fake_ettun"
+  write_fake_et "$fake_et"
+  write_fake_ssh "$fake_ssh"
+  write_clean_ssh_config "$ssh_config"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$fake_et \
+    FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    >/dev/null 2>"$error" || return 1
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_SSH_LOG=1 \
+    FWDPORTS_TEST_ET_STATUS=23 TERM="unsafe' value" TMPDIR=/tmp \
+    "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: foreground status is preserved" 23 \
+    "$status"
+  _assert_contains "ettun nested ET gate: TERM is fixed" \
+    "TERM=xterm-256color" "$(<"$et_log")"
+  _assert_not_contains "ettun nested ET gate: hostile TERM never reaches ET" \
+    "unsafe" "$(<"$et_log")"
+  _assert_contains "ettun nested ET gate: temporary state is private" \
+    "TMPDIR=$runtime/et-tmp" "$(<"$et_log")"
+  _assert_contains "ettun nested ET gate: private SSH shim leads PATH" \
+    "PATH=$runtime/et-bin:" "$(<"$et_log")"
+  _assert_contains "ettun nested ET gate: telemetry is disabled" \
+    "ARG=--telemetry=false" "$(<"$et_log")"
+  _assert_contains "ettun nested SSH shim: inherited forwards are disabled" \
+    "ClearAllForwardings=yes" "$(<"$ssh_log")"
+  _assert_contains "ettun nested SSH shim: multiplexing is disabled" \
+    "ControlMaster=no" "$(<"$ssh_log")"
+  _assert_contains "ettun nested SSH shim: preserves the relay destination" \
+    "gateway.example.net" "$(<"$ssh_log")"
+
+  before_et=$(<"$et_log")
+  before_ssh=$(<"$ssh_log")
+  printf '%s\n' 'localforward 127.0.0.1:9000 127.0.0.1:80' \
+    >>"$ssh_config"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_SSH_LOG=1 \
+    FWDPORTS_TEST_ET_STATUS=0 "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: ambient SSH drift fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: drift launches no ET" "$before_et" \
+    "$(<"$et_log")"
+  _assert_eq "ettun nested ET gate: drift launches no SSH" "$before_ssh" \
+    "$(<"$ssh_log")"
+}
+
+custom_transport_generation_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_transport log error
+  local status before after
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_transport=$fake_bin/relay-adapter
+  log=$tmp/ettun.log
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$manifest"
+  printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
+  write_fake_ettun "$fake_ettun"
+  write_fake_transport "$fake_transport"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$tmp/missing-default-et \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun adapter generation: prepare succeeds without default ET" \
+    0 "$status"
+  _assert_eq "ettun adapter generation: publishes driver kind last" ettun \
+    "$(<"$runtime/driver-kind")"
+  _assert_file "ettun adapter generation: records selected adapter" \
+    "$runtime/ettun-transport-source"
+  _assert_file "ettun adapter generation: snapshots the relay engine" \
+    "$runtime/ettun-engine"
+  _assert_file "ettun adapter generation: snapshots the selected adapter" \
+    "$runtime/ettun-transport-exec"
+  _assert_not_exists "ettun adapter generation: does not record unused ET" \
+    "$runtime/ettun-et-source"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_LOG=$log \
+    FWDPORTS_TEST_ETTUN_STATUS=23 ETTUN_ET=ambient-et \
+    ETTUN_TRANSPORT=ambient-adapter "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  before=$(<"$log")
+
+  _assert_exit "ettun adapter gate: foreground status is preserved" 23 \
+    "$status"
+  _assert_contains "ettun adapter gate: selects the preflighted adapter" \
+    "ETTUN_TRANSPORT=$runtime/ettun-transport-exec" "$before"
+  _assert_contains "ettun adapter gate: removes ambient default ET" \
+    "ETTUN_ET=" "$before"
+  _assert_not_contains "ettun adapter gate: ambient values cannot replace selection" \
+    "ambient-" "$before"
+
+  printf '\n# drift\n' >>"$fake_transport"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_LOG=$log \
+    FWDPORTS_TEST_ETTUN_STATUS=0 "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  after=$(<"$log")
+  _assert_exit "ettun adapter gate: adapter drift fails closed" 78 "$status"
+  _assert_eq "ettun adapter gate: drift launches no engine bytes" "$before" \
+    "$after"
+}
+
+engine_snapshot_reexec_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_transport
+  local ready trigger log error gate_pid status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_transport=$fake_bin/relay-adapter
+  ready=$tmp/ready
+  trigger=$tmp/trigger
+  log=$tmp/ettun.log
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$manifest"
+  printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
+  write_reexec_ettun "$fake_ettun" original
+  write_fake_transport "$fake_transport"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    2>"$error"
+  status=$?
+  _assert_exit "ettun engine snapshot: generation prepare succeeds" 0 \
+    "$status"
+  _assert_file "ettun engine snapshot: generation owns immutable engine bytes" \
+    "$runtime/ettun-engine"
+
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_READY=$ready \
+    FWDPORTS_TEST_ETTUN_TRIGGER=$trigger FWDPORTS_TEST_ETTUN_LOG=$log \
+    "$runtime/ettun-gate" 2>"$error" &
+  gate_pid=$!
+  if ! wait_for_path "$ready"; then
+    kill -TERM "$gate_pid" 2>/dev/null || true
+    wait "$gate_pid" 2>/dev/null || true
+    _fail "ettun engine snapshot: initial engine reaches test barrier"
+    return 0
+  fi
+  _pass "ettun engine snapshot: initial engine reaches test barrier"
+
+  write_reexec_ettun "$fake_ettun" replacement
+  : >"$trigger"
+  wait "$gate_pid"
+  status=$?
+
+  _assert_exit "ettun engine snapshot: re-exec succeeds after source upgrade" \
+    0 "$status"
+  _assert_eq "ettun engine snapshot: worker reopens generation bytes" \
+    original "$(<"$log")"
+}
+
+adapter_snapshot_invocation_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_transport
+  local ready trigger log error gate_pid status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_transport=$fake_bin/relay-adapter
+  ready=$tmp/ready
+  trigger=$tmp/trigger
+  log=$tmp/transport.log
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$manifest"
+  printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
+  write_delayed_adapter_ettun "$fake_ettun"
+  write_versioned_transport "$fake_transport" original
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    2>"$error"
+  status=$?
+  _assert_exit "ettun adapter snapshot: generation prepare succeeds" 0 \
+    "$status"
+  _assert_file \
+    "ettun adapter snapshot: generation owns immutable transport bytes" \
+    "$runtime/ettun-transport-exec"
+
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_ETTUN_READY=$ready \
+    FWDPORTS_TEST_ETTUN_TRIGGER=$trigger \
+    FWDPORTS_TEST_TRANSPORT_LOG=$log \
+    "$runtime/ettun-gate" 2>"$error" &
+  gate_pid=$!
+  if ! wait_for_path "$ready"; then
+    kill -TERM "$gate_pid" 2>/dev/null || true
+    wait "$gate_pid" 2>/dev/null || true
+    _fail "ettun adapter snapshot: engine reaches invocation barrier"
+    return 0
+  fi
+  _pass "ettun adapter snapshot: engine reaches invocation barrier"
+
+  write_versioned_transport "$fake_transport" replacement
+  : >"$trigger"
+  wait "$gate_pid"
+  status=$?
+
+  _assert_exit "ettun adapter snapshot: invocation succeeds after upgrade" \
+    0 "$status"
+  _assert_eq "ettun adapter snapshot: engine invokes generation bytes" \
+    original "$(<"$log")"
+}
+
+argv_case() {
+  local tmp manifest argv_file error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  error=$tmp/error
+  write_ettun_manifest "$manifest"
+
+  set +e
+  fwdports_ettun_build_argv "$manifest" relay '' "$argv_file" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun argv: valid relay profile builds" 0 "$status"
+  if [[ -f $argv_file ]]; then
+    _assert_eq "ettun argv: maps the declared route to four fixed arguments" \
+      $'gateway.example.net\n18080\ndesktop.example.net\n3389' \
+      "$(<"$argv_file")"
+  else
+    _fail "ettun argv: maps the declared route to four fixed arguments"
+  fi
+  _assert_eq "ettun argv: valid profile emits no diagnostic" "" \
+    "$(<"$error")"
+}
+
+health_contract_case() {
+  local tmp manifest argv_file error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  error=$tmp/error
+  write_ettun_manifest "$tmp/with-check"
+  sed '/^check/d' "$tmp/with-check" >"$manifest"
+  chmod 0600 "$manifest"
+
+  set +e
+  fwdports_ettun_build_argv "$manifest" relay '' "$argv_file" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun health contract: unchecked listener is rejected" 1 \
+    "$status"
+  _assert_contains "ettun health contract: matching check requirement is actionable" \
+    "requires a matching check" "$(<"$error")"
+  _assert_not_exists "ettun health contract: invalid argv is not published" \
+    "$argv_file"
+}
+
+invalid_records_case() {
+  local tmp base manifest argv_file error status
+  tmp=$(_tmpdir) || return 1
+  base=$tmp/base
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  error=$tmp/error
+  write_ettun_manifest "$base"
+
+  cp "$base" "$manifest"
+  printf 'set\trelay\tlocal-forward\t127.0.0.1:18081:other.example.net:3389\n' \
+    >>"$manifest"
+  set +e
+  fwdports_ettun_build_argv "$manifest" relay '' "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun records: repeated local forward is rejected" 1 "$status"
+  _assert_contains "ettun records: exactly-one limit is actionable" \
+    "exactly one local-forward" "$(<"$error")"
+
+  sed 's/127\.0\.0\.1:18080/0.0.0.0:18080/' "$base" >"$manifest"
+  set +e
+  fwdports_ettun_build_argv "$manifest" relay '' "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun records: non-loopback bind is rejected" 1 "$status"
+  _assert_contains "ettun records: loopback requirement is actionable" \
+    "must bind 127.0.0.1" "$(<"$error")"
+
+  cp "$base" "$manifest"
+  printf 'set\trelay\tremote-forward\t127.0.0.1:19090:target.example.net:22\n' \
+    >>"$manifest"
+  set +e
+  fwdports_ettun_build_argv "$manifest" relay '' "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun records: unsupported reverse direction is rejected" \
+    1 "$status"
+  _assert_contains "ettun records: unsupported key is named" \
+    "unknown ettun key" "$(<"$error")"
+}
+
+custom_transport_case() {
+  local tmp manifest argv_file transport_file error status
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  argv_file=$tmp/argv
+  transport_file=$tmp/transport
+  error=$tmp/error
+  write_ettun_manifest "$manifest"
+  printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
+
+  set +e
+  fwdports_ettun_build_argv "$manifest" relay '' "$argv_file" \
+    "$transport_file" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun transport: custom adapter profile builds" 0 "$status"
+  _assert_eq "ettun transport: adapter remains a separate executable token" \
+    relay-adapter "$(<"$transport_file")"
+  _assert_eq "ettun transport: route argv remains unchanged" \
+    $'gateway.example.net\n18080\ndesktop.example.net\n3389' \
+    "$(<"$argv_file")"
+}
+
+transport_dependency_case() {
+  local tmp fake output error log input stdin_log status
+  tmp=$(_tmpdir) || return 1
+  fake=$tmp/relay-adapter
+  output=$tmp/source
+  error=$tmp/error
+  log=$tmp/validation.log
+  input=$tmp/input
+  stdin_log=$tmp/stdin.log
+  write_fake_transport "$fake"
+
+  set +e
+  FWDPORTS_TEST_TRANSPORT_VALIDATE_STATUS=69 \
+    fwdports_ettun_transport_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun transport: nested dependency failure is early" 1 \
+    "$status"
+  _assert_contains "ettun transport: validation failure is actionable" \
+    "adapter dependency validation failed" "$(<"$error")"
+  _assert_not_exists "ettun transport: failed validation publishes nothing" \
+    "$output"
+
+  status=0
+  FWDPORTS_TEST_TRANSPORT_LOG=$log ETTUN_ET=ambient-et \
+    ETTUN_TRANSPORT=ambient-transport ETTUN_CLIENT_ID=ambient-client \
+    fwdports_ettun_transport_resolve "$fake" "$output" 2>"$error" ||
+    status=$?
+  _assert_exit "ettun transport: dependency-complete adapter resolves" 0 \
+    "$status"
+  _assert_contains "ettun transport: resolved adapter is pinned" \
+    $'path\t'"$fake" "$(<"$output")"
+  _assert_eq "ettun transport: validation sees the launch environment" \
+    $'ETTUN_ET=\nETTUN_TRANSPORT=\nETTUN_CLIENT_ID=' "$(<"$log")"
+
+  printf '%s\n' caller-input >"$input"
+  status=0
+  FWDPORTS_TEST_TRANSPORT_STDIN_LOG=$stdin_log \
+    fwdports_ettun_transport_resolve "$fake" "$output" \
+    <"$input" 2>"$error" || status=$?
+  _assert_exit "ettun transport: noninteractive validation succeeds" 0 \
+    "$status"
+  _assert_eq "ettun transport: validator receives EOF instead of caller input" \
+    eof "$(<"$stdin_log")"
+}
+
+run_case argv argv_case
+run_case health-contract health_contract_case
+run_case invalid-records invalid_records_case
+run_case custom-transport custom_transport_case
+run_case transport-dependency transport_dependency_case
+run_case missing-dependency missing_dependency_case
+run_case resolve resolve_case
+run_case local-dependencies local_dependencies_case
+run_case untrusted-python-backend untrusted_python_backend_case
+run_case darwin-group-writable-python-backend \
+  darwin_group_writable_python_backend_case
+run_case builtin-dependency-preflight builtin_dependency_preflight_case
+run_case external-only-dependency-preflight \
+  external_only_dependency_preflight_case
+run_case builtin-selection builtin_selection_case
+run_case nested-dependency nested_dependency_case
+run_case generation-prepare generation_prepare_case
+run_case generation-gate generation_gate_case
+run_case default-et-hardening default_et_hardening_case
+run_case custom-transport-generation custom_transport_generation_case
+run_case engine-snapshot-reexec engine_snapshot_reexec_case
+run_case adapter-snapshot-invocation adapter_snapshot_invocation_case
+_test_summary

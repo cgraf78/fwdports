@@ -8,10 +8,11 @@ configuration, lifecycle, observation, repair, and built-in transport behavior;
 consumer-specific policy belongs in profile data or a trusted executable
 driver.
 
-The built-ins are `ssh`, explicit `autossh`, and explicit stock Eternal
-Terminal (`et`). The executable driver API is the only extension mechanism.
-There are no sourced plug-ins, raw shell command options, or evaluated
-configuration fragments.
+The built-ins are `ssh`, explicit `autossh`, explicit stock Eternal Terminal
+(`et`), and explicit public `ettun`. Extensions are executable boundaries: the
+versioned driver API adds a complete driver, while an ettun `transport` adapter
+only supplies ettun's three-argument connection contract. There are no sourced
+plug-ins, raw shell command options, or evaluated configuration fragments.
 
 ## Commands
 
@@ -118,6 +119,56 @@ commands, agent forwarding, and `SetEnv` are rejected: ET consumes those itself,
 outside the manifest. Jump-host support is deferred until both ET SSH bootstrap
 calls can be bound and tested independently.
 
+## Built-in ettun records
+
+The `ettun` built-in understands:
+
+```text
+host
+local-forward
+transport (optional)
+```
+
+`host` is the ET-accessible relay host. Exactly one `local-forward` is required
+in the explicit `127.0.0.1:LOCAL_PORT:TARGET:TARGET_PORT` form. Those four
+fields become the public `ettun VIA LOCAL_PORT TARGET TARGET_PORT` interface;
+non-loopback binds, reverse forwards, sockets, ranges, and raw IPv6 literals
+are rejected. A matching local check is required so process liveness cannot be
+reported as endpoint health.
+
+Preparation resolves and authenticates both the public `ettun` executable and
+its selected transport before any tmux session or earlier leg starts. With no
+`transport` record, fwdports selects stock ET 7.0.0 plus the exact OpenSSH
+bootstrap and requires a direct-host-safe `host`. It also checks ettun's
+non-core local commands (base64, gzip, mkfifo, od, and tee) during dependency
+preflight. On macOS it additionally resolves the exact Python 3.9-or-newer
+backend reported by an isolated interpreter, runs the installed session
+enumerator's bounded `os.getsid` capability probe in isolated mode, and
+snapshots the helper plus backend identity and digest into the generation.
+Standard `admin`-group-writable macOS application and package-manager ancestry
+is accepted only when the current user belongs to that root-capable group;
+other shared groups and non-sticky world-writable ancestry remain invalid. The
+ordinary trusted-owner sticky-directory exception is unchanged. A declared
+adapter must be one executable token, must remain in the foreground when called
+by ettun, must not call `setsid`, daemonize, change real user identity, or
+otherwise escape the pane process session, and must implement a noninteractive
+`--fwdports-validate` call that returns success only when all of its own nested
+dependencies are usable. Validation may write actionable diagnostics to
+standard error; its standard output is ignored.
+
+Preparation copies the engine and any selected adapter into generation-owned
+snapshots after before/after identity and digest checks. The generation gate
+rechecks the installed executable identities and hashes immediately before
+launch, executes the engine snapshot, removes ambient ettun transport and
+identity overrides, exports only the adapter snapshot, and keeps temporary
+state generation-private. That keeps worker re-execs and later adapter calls
+on one immutable set of bytes. The stock-ET path exports a generation-owned ET
+wrapper instead of the raw executable. That wrapper fixes `TERM`, disables
+telemetry, binds and rechecks ET's effective SSH view, and routes the reviewed
+bootstrap shape through the private hardened SSH shim. `ettun` owns its
+reconnect and authenticated relay-cleanup policy; fwdports adds no second
+retry loop.
+
 ## Status vocabulary
 
 - `starting`: a verified pending generation has not become active.
@@ -146,8 +197,8 @@ transports because direct SSH may be between retry attempts.
 Each foreground transport owns reconnect behavior while its tmux pane remains
 alive. Direct SSH retries with a 1, 2, 4, 8, 16, 30-second cap and resets its
 backoff after stable operation. Autossh owns child retries while its monitor is
-live; ET owns reconnects inside its single foreground process; an external
-driver owns retry policy inside its foreground `run` process.
+live; ET and ettun own reconnects inside their single foreground processes; an
+external driver owns retry policy inside its foreground `run` process.
 
 The controller observes configured service checks and publishes status; it does
 not mutate transport panes in the background. An explicit matching `start`
@@ -175,9 +226,23 @@ and repeated target read agree. This avoids both an ownerless lock state and a
 hard-link dependency that Android application filesystems cannot provide.
 
 Tmux sessions carry a random generation nonce at creation. Core records pane,
-session, PID/start identity, tty, SID, and PGID evidence. Cleanup revalidates
-that evidence before signalling the owned foreground process group. Ambiguous
-evidence is retained for manual diagnosis rather than guessed away.
+session, PID/start identity, tty, platform session metadata, and PGID evidence.
+Cleanup revalidates that evidence before signalling the owned foreground
+process group. For ettun, which creates additional worker process groups in
+the same session, tmux's authenticated pane leader PID is the kernel SID
+anchor. Linux and Termux select that SID from one strict `ps` snapshot. Darwin's
+sanitized `ps sess` pointer is not a POSIX SID, so a generation-owned Python
+helper validates a same-real-UID `ps` snapshot and queries each PID with
+`os.getsid`. Each scan rechecks both the helper and interpreter identities and
+digests, and Python isolated mode excludes ambient startup customization. The
+probe child's lifetime is tied to a parent-owned pipe so interruption cannot
+leave a detached probe session behind. Two complete scans with no live member
+are required before absence is accepted. Zombie and dead rows remain ownership
+evidence but are excluded from liveness because they cannot execute or retain a
+forwarding socket. Cleanup then uses ettun's bounded first-TERM and second-TERM
+contract. The generation is removable only after two complete scans find no
+live session member. Ambiguous evidence is retained for manual diagnosis rather
+than guessed away.
 
 The explicit tmux socket, cleared inherited client variables, session nonce,
 and recorded IDs provide isolation and lifecycle authority. The private server

@@ -18,6 +18,40 @@ _fwdports_stat_identity() {
   return 1
 }
 
+_fwdports_stat_group() {
+  local path=$1 output
+
+  if output=$(LC_ALL=C stat -c '%g' -- "$path" 2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  if output=$(LC_ALL=C stat -f '%g' "$path" 2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  return 1
+}
+
+_fwdports_platform_is_darwin() {
+  [[ ${OSTYPE:-} == darwin* ]]
+}
+
+_fwdports_darwin_group_parent_trusted() {
+  local directory=$1 mode_bits=$2 group memberships
+
+  _fwdports_platform_is_darwin || return 1
+  # Standard macOS application and package-manager roots are commonly 0775
+  # for the admin group. Local admins already share a root-capable trust
+  # boundary; other-write remains outside it.
+  (((mode_bits & 020) != 0 && (mode_bits & 002) == 0)) || return 1
+  group=$(_fwdports_stat_group "$directory") || return 1
+  # macOS reserves gid 80 for the local admin group.
+  [[ $group == 80 ]] || return 1
+  memberships=$(id -G) || return 1
+  [[ $memberships =~ ^[0-9]+([[:space:]]+[0-9]+)*$ ]] || return 1
+  [[ " $memberships " == *" $group "* ]]
+}
+
 _fwdports_canonical_executable() {
   local requested=$1 candidate target directory depth=0
 
@@ -67,28 +101,40 @@ _fwdports_executable_parent_chain_trusted() {
   fi
   while :; do
     [[ -d $directory && ! -L $directory ]] || {
-      printf 'fwdports: executable path has an untrusted parent\n' >&2
+      printf 'fwdports: executable path has an untrusted parent: %s\n' \
+        "$directory" >&2
       return 1
     }
-    record=$(_fwdports_stat_identity "$directory") || return 1
+    record=$(_fwdports_stat_identity "$directory") || {
+      printf 'fwdports: executable path has an untrusted parent: %s\n' \
+        "$directory" >&2
+      return 1
+    }
     read -r owner mode _rest <<<"$record"
     [[ $owner =~ ^[0-9]+$ && $mode =~ ^[0-7]{3,4}$ ]] || {
-      printf 'fwdports: executable path has an untrusted parent\n' >&2
+      printf 'fwdports: executable path has an untrusted parent: %s\n' \
+        "$directory" >&2
       return 1
     }
     [[ $owner == 0 || $owner == "$uid" ]] || {
-      printf 'fwdports: executable path has an untrusted parent\n' >&2
+      printf 'fwdports: executable path has an untrusted parent: %s (owner %s)\n' \
+        "$directory" "$owner" >&2
       return 1
     }
     mode_bits=$((8#$mode))
     if (((mode_bits & 022) != 0)); then
       # A trusted-owner sticky directory such as /tmp prevents another UID
-      # from replacing this user's entry. Other writable ancestors leave a
-      # cross-UID rename seam between the launch gate's hash and exec.
-      (((mode_bits & 01000) != 0)) || {
-        printf 'fwdports: executable path has an untrusted parent\n' >&2
+      # from replacing this user's entry. Darwin's explicit group rule treats
+      # the caller's root-capable local group as trusted; other writable
+      # ancestors leave a cross-UID rename seam between the hash and exec.
+      if (((mode_bits & 01000) != 0)) ||
+        _fwdports_darwin_group_parent_trusted "$directory" "$mode_bits"; then
+        :
+      else
+        printf 'fwdports: executable path has an untrusted parent: %s (mode %s)\n' \
+          "$directory" "$mode" >&2
         return 1
-      }
+      fi
     fi
     [[ -z $trust_anchor || $directory != "$trust_anchor" ]] || break
     [[ $directory != / ]] || break
@@ -324,6 +370,122 @@ _fwdports_et_forward_record() {
   ((10#$source_port <= 65535 && 10#$destination_port <= 65535)) || return 1
   printf '%s\t%s\t%s\t%s\n' "$source_host" "$source_port" \
     "$destination_host" "$destination_port"
+}
+
+_fwdports_ettun_safe_via() {
+  [[ $1 =~ ^[[:alnum:]_][[:alnum:]_.@:-]*$ ]]
+}
+
+_fwdports_ettun_safe_destination() {
+  [[ $1 =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]]
+}
+
+_fwdports_ettun_local_forward_has_check() {
+  local manifest=$1 leg_name=$2 bind_host=$3 bind_port=$4
+  local kind leg probe_type host port _label _extra
+
+  while IFS=$'\t' read -r kind leg probe_type host port _label _extra ||
+    [[ -n ${kind:-} ]]; do
+    [[ $kind == check && $leg == "$leg_name" ]] || continue
+    case "$probe_type" in loopback | tcp) ;; *) continue ;; esac
+    [[ $host == "$bind_host" && $port == "$bind_port" ]] && return 0
+  done <"$manifest"
+  printf 'fwdports: ettun local-forward for leg %s requires a matching check\n' \
+    "$leg_name" >&2
+  return 1
+}
+
+fwdports_ettun_build_argv() {
+  local manifest=$1 leg_name=$2 target_override=$3 argv_output=$4
+  local transport_output=${5:-}
+  local kind leg key value _extra driver='' host='' local_forward=''
+  local transport=''
+  local via record bind_host bind_port destination_host destination_port
+
+  [[ -f $manifest && ! -L $manifest ]] || {
+    printf 'fwdports: resolved manifest is unavailable\n' >&2
+    return 1
+  }
+  while IFS=$'\t' read -r kind leg key value _extra ||
+    [[ -n ${kind:-} ]]; do
+    case "$kind" in
+      leg)
+        [[ $leg != "$leg_name" ]] || driver=$key
+        ;;
+      set)
+        [[ $leg == "$leg_name" ]] || continue
+        case "$key" in
+          host) host=$value ;;
+          transport)
+            [[ -z $transport ]] || {
+              printf 'fwdports: ettun accepts at most one transport per leg\n' \
+                >&2
+              return 1
+            }
+            transport=$value
+            ;;
+          local-forward)
+            [[ -z $local_forward ]] || {
+              printf 'fwdports: ettun requires exactly one local-forward per leg\n' >&2
+              return 1
+            }
+            local_forward=$value
+            ;;
+          *)
+            printf 'fwdports: unknown ettun key for leg %s: %s\n' \
+              "$leg_name" "$key" >&2
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+  done <"$manifest"
+
+  [[ $driver == ettun ]] || {
+    printf 'fwdports: leg is not an ettun driver: %s\n' "$leg_name" >&2
+    return 1
+  }
+  via=${target_override:-$host}
+  _fwdports_ettun_safe_via "$via" || {
+    printf 'fwdports: ettun via host is missing or unsafe for leg %s\n' \
+      "$leg_name" >&2
+    return 1
+  }
+  [[ -n $local_forward ]] || {
+    printf 'fwdports: ettun requires exactly one local-forward per leg\n' >&2
+    return 1
+  }
+  record=$(_fwdports_et_forward_record "$local_forward") || {
+    printf 'fwdports: ettun local-forward must use four-part network syntax\n' >&2
+    return 1
+  }
+  IFS=$'\t' read -r bind_host bind_port destination_host destination_port \
+    <<<"$record"
+  [[ $bind_host == 127.0.0.1 ]] || {
+    printf 'fwdports: ettun local-forward must bind 127.0.0.1\n' >&2
+    return 1
+  }
+  _fwdports_ettun_safe_destination "$destination_host" || {
+    printf 'fwdports: ettun destination host is unsafe for leg %s\n' \
+      "$leg_name" >&2
+    return 1
+  }
+  _fwdports_ettun_local_forward_has_check "$manifest" "$leg_name" \
+    "$bind_host" "$bind_port" || return 1
+
+  _fwdports_write_private_lines "$argv_output" "$via" "$bind_port" \
+    "$destination_host" "$destination_port" || return 1
+  if [[ -n $transport_output ]]; then
+    if [[ -n $transport ]]; then
+      _fwdports_write_private_lines "$transport_output" "$transport" || {
+        rm -f -- "$argv_output" "$transport_output"
+        return 1
+      }
+    elif ! _fwdports_write_private_lines "$transport_output"; then
+      rm -f -- "$argv_output" "$transport_output"
+      return 1
+    fi
+  fi
 }
 
 _fwdports_ssh_safe_forward() {
@@ -781,6 +943,369 @@ _fwdports_write_private_lines() {
   fi
 }
 
+_fwdports_ettun_command_path() {
+  command -v "$1" 2>/dev/null
+}
+
+_fwdports_ettun_platform_is_darwin() {
+  _fwdports_platform_is_darwin
+}
+
+_fwdports_ettun_session_enumerator_source() {
+  local module_dir
+
+  module_dir=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) ||
+    return 1
+  printf '%s\n' "$module_dir/session-enumerator.py"
+}
+
+_fwdports_ettun_session_python_file_record() {
+  local path=$1 stat_record owner mode device inode size mtime extra uid digest
+
+  [[ $path == /* && $path != *$'\t'* && $path != *$'\r'* &&
+    $path != *$'\n'* ]] || {
+    printf 'fwdports: ettun macOS session interpreter has an unsafe path\n' \
+      >&2
+    return 1
+  }
+  stat_record=$(_fwdports_stat_identity "$path") || {
+    printf 'fwdports: cannot identify ettun macOS session interpreter\n' >&2
+    return 1
+  }
+  read -r owner mode device inode size mtime extra <<<"$stat_record"
+  uid=$(id -u) || return 1
+  if [[ -n $extra || ! $owner =~ ^[0-9]+$ ||
+    ! $mode =~ ^[0-7]{3,4}$ || ! $device =~ ^[0-9]+$ ||
+    ! $inode =~ ^[0-9]+$ || ! $size =~ ^[0-9]+$ ||
+    ! $mtime =~ ^[0-9]+$ || ($owner != 0 && $owner != "$uid") ]] ||
+    (((8#$mode & 022) != 0)); then
+    printf 'fwdports: ettun macOS session interpreter has untrusted metadata\n' \
+      >&2
+    return 1
+  fi
+  digest=$(_fwdports_sha256_file "$path") || {
+    printf 'fwdports: cannot hash ettun macOS session interpreter\n' >&2
+    return 1
+  }
+  printf '%s\t%s\n' "$owner:$mode:$device:$inode:$size:$mtime" "$digest"
+}
+
+_fwdports_ettun_session_python_resolve() {
+  local launcher launcher_record reported current_record path path_record
+  local identity digest extra
+
+  if launcher=$(_fwdports_canonical_executable python3 2>/dev/null); then
+    :
+  elif launcher=$(
+    _fwdports_canonical_executable /usr/bin/python3 2>/dev/null
+  ); then
+    # A runner-managed Python can precede the system binary while living below
+    # writable ancestry that is unsuitable for lifecycle authority. The
+    # protected system interpreter remains a safe deterministic fallback.
+    :
+  else
+    printf '%s\n' \
+      'fwdports: ettun local dependency is not available on macOS: python3' \
+      >&2
+    return 1
+  fi
+  launcher_record=$(
+    _fwdports_ettun_session_python_file_record "$launcher"
+  ) || return 1
+  if ! reported=$(
+    _fwdports_ettun_session_python_run "$launcher" -c \
+      'import os, sys; print(os.path.realpath(sys.executable))'
+  ) || [[ $reported != /* || $reported == *$'\t'* ||
+    $reported == *$'\r'* || $reported == *$'\n'* ]]; then
+    printf '%s\n' \
+      'fwdports: ettun macOS session enumerator probe failed (Python 3.9 or newer required)' \
+      >&2
+    return 1
+  fi
+  current_record=$(
+    _fwdports_ettun_session_python_file_record "$launcher"
+  ) || return 1
+  [[ $current_record == "$launcher_record" ]] || {
+    printf 'fwdports: ettun macOS Python launcher changed during discovery\n' \
+      >&2
+    return 1
+  }
+  path=$(_fwdports_canonical_executable "$reported") || {
+    printf 'fwdports: ettun macOS Python backend is not trustworthy: %s\n' \
+      "$reported" >&2
+    return 1
+  }
+  path_record=$(_fwdports_ettun_session_python_file_record "$path") || return 1
+  IFS=$'\t' read -r identity digest extra <<<"$path_record"
+  [[ -z $extra && -n $identity && $digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\t%s\t%s\n' "$path" "$identity" "$digest"
+}
+
+_fwdports_ettun_session_python_run() {
+  local python_path=$1
+  shift
+
+  (
+    # Isolated mode ignores every PYTHON* variable and user site directory.
+    # -S also excludes system site customization, while -B prevents cache
+    # writes beside the generation-owned helper.
+    unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE
+    LC_ALL=C "$python_path" -I -S -B "$@"
+  )
+}
+
+_fwdports_ettun_session_python_probe() {
+  local python_path=$1 enumerator=$2
+
+  if ! _fwdports_ettun_session_python_run "$python_path" -c \
+    'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' ||
+    ! _fwdports_ettun_session_python_run \
+      "$python_path" "$enumerator" --probe </dev/null; then
+    printf '%s\n' \
+      'fwdports: ettun macOS session enumerator probe failed (Python 3.9 or newer required)' \
+      >&2
+    return 1
+  fi
+}
+
+fwdports_ettun_validate_local_dependencies() {
+  local dependency python_record python_path identity digest extra enumerator
+
+  # These are the non-core commands the public ettun launcher and fwdports'
+  # ettun lifecycle boundary need locally. Remote-side relay prerequisites
+  # remain the selected VIA host's responsibility.
+  for dependency in base64 gzip mkfifo od tee; do
+    if ! _fwdports_ettun_command_path "$dependency" >/dev/null; then
+      printf 'fwdports: ettun local dependency is not available: %s\n' \
+        "$dependency" >&2
+      return 1
+    fi
+  done
+  _fwdports_ettun_platform_is_darwin || return 0
+
+  python_record=$(_fwdports_ettun_session_python_resolve) || return 1
+  IFS=$'\t' read -r python_path identity digest extra <<<"$python_record"
+  [[ -z $extra && -n $python_path && -n $identity &&
+    $digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  enumerator=$(_fwdports_ettun_session_enumerator_source) || return 1
+  [[ -f $enumerator && ! -L $enumerator ]] || {
+    printf 'fwdports: ettun macOS session enumerator is unavailable\n' >&2
+    return 1
+  }
+  _fwdports_ettun_session_python_probe "$python_path" "$enumerator" \
+    >/dev/null 2>&1 || {
+    printf '%s\n' \
+      'fwdports: ettun macOS session enumerator probe failed (Python 3.9 or newer required)' \
+      >&2
+    return 1
+  }
+}
+
+fwdports_ettun_resolve() {
+  local requested=$1 output=$2 path stat_record owner mode device inode size
+  local mtime help_text digest old_umask tmp
+
+  path=$(_fwdports_canonical_executable "$requested") || {
+    printf 'fwdports: ettun executable is not available: %s\n' \
+      "$requested" >&2
+    return 1
+  }
+  stat_record=$(_fwdports_stat_identity "$path") || {
+    printf 'fwdports: cannot identify ettun executable\n' >&2
+    return 1
+  }
+  read -r owner mode device inode size mtime <<<"$stat_record"
+  if [[ $owner != 0 && $owner != "$(id -u)" ]]; then
+    printf 'fwdports: ettun executable has an untrusted owner\n' >&2
+    return 1
+  fi
+  if (((8#$mode & 022) != 0)); then
+    printf 'fwdports: ettun executable is group/other writable\n' >&2
+    return 1
+  fi
+
+  help_text=$(LC_ALL=C "$path" --help 2>&1) || {
+    printf 'fwdports: cannot query ettun command contract\n' >&2
+    return 1
+  }
+  [[ $help_text == *'Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT'* ]] || {
+    printf 'fwdports: executable does not provide the expected ettun contract\n' \
+      >&2
+    return 1
+  }
+  fwdports_ettun_validate_local_dependencies || return 1
+  digest=$(_fwdports_sha256_file "$path") || {
+    printf 'fwdports: cannot hash ettun executable\n' >&2
+    return 1
+  }
+
+  old_umask=$(umask)
+  umask 077
+  tmp=$(mktemp "${output}.tmp.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  umask "$old_umask"
+  if ! {
+    printf 'path\t%s\n' "$path"
+    printf 'identity\t%s:%s:%s:%s:%s\n' \
+      "$device" "$inode" "$mode" "$size" "$mtime"
+    printf 'digest\t%s\n' "$digest"
+  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+fwdports_ettun_transport_resolve() {
+  local requested=$1 output=$2 path stat_record owner mode device inode size
+  local mtime digest old_umask tmp
+
+  path=$(_fwdports_canonical_executable "$requested") || {
+    printf 'fwdports: ettun transport adapter is not available: %s\n' \
+      "$requested" >&2
+    return 1
+  }
+  stat_record=$(_fwdports_stat_identity "$path") || {
+    printf 'fwdports: cannot identify ettun transport adapter\n' >&2
+    return 1
+  }
+  read -r owner mode device inode size mtime <<<"$stat_record"
+  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+    (((8#$mode & 022) != 0)); then
+    printf 'fwdports: ettun transport adapter has untrusted metadata\n' >&2
+    return 1
+  fi
+  if ! (
+    unset ETTUN_ET ETTUN_TRANSPORT ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT
+    "$path" --fwdports-validate </dev/null >/dev/null
+  ); then
+    printf 'fwdports: ettun transport adapter dependency validation failed\n' \
+      >&2
+    return 1
+  fi
+  digest=$(_fwdports_sha256_file "$path") || {
+    printf 'fwdports: cannot hash ettun transport adapter\n' >&2
+    return 1
+  }
+
+  old_umask=$(umask)
+  umask 077
+  tmp=$(mktemp "${output}.tmp.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  umask "$old_umask"
+  if ! {
+    printf 'path\t%s\n' "$path"
+    printf 'identity\t%s:%s:%s:%s:%s\n' \
+      "$device" "$inode" "$mode" "$size" "$mtime"
+    printf 'digest\t%s\n' "$digest"
+  } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+fwdports_ettun_snapshot_executable() {
+  local source_record=$1 destination=$2 description=$3 line key value extra
+  local path='' expected_identity='' expected_digest='' line_number=0
+  local stat_record owner mode device inode size mtime identity digest
+  local destination_parent old_umask tmp snapshot_digest
+
+  [[ -f $source_record && ! -L $source_record ]] || {
+    printf 'fwdports: %s source record is unavailable\n' "$description" >&2
+    return 1
+  }
+  while IFS= read -r line || [[ -n $line ]]; do
+    line_number=$((line_number + 1))
+    IFS=$'\t' read -r key value extra <<<"$line"
+    [[ -n $value && -z $extra ]] || return 1
+    case "$line_number:$key" in
+      1:path) path=$value ;;
+      2:identity) expected_identity=$value ;;
+      3:digest) expected_digest=$value ;;
+      *) return 1 ;;
+    esac
+  done <"$source_record"
+  [[ $line_number -eq 3 && $path == /* && -f $path && -x $path &&
+    ! -L $path && $expected_identity =~ ^[^:]+:[^:]+:[0-7]+:[^:]+:[^:]+$ &&
+    $expected_digest =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'fwdports: %s source record is invalid\n' "$description" >&2
+    return 1
+  }
+
+  stat_record=$(_fwdports_stat_identity "$path") || return 1
+  read -r owner mode device inode size mtime <<<"$stat_record"
+  identity=$device:$inode:$mode:$size:$mtime
+  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+    (((8#$mode & 022) != 0)) || [[ $identity != "$expected_identity" ]]; then
+    printf 'fwdports: %s changed before snapshot\n' "$description" >&2
+    return 1
+  fi
+  digest=$(_fwdports_sha256_file "$path") || return 1
+  [[ $digest == "$expected_digest" ]] || {
+    printf 'fwdports: %s changed before snapshot\n' "$description" >&2
+    return 1
+  }
+
+  destination_parent=${destination%/*}
+  [[ $destination_parent != "$destination" && -d $destination_parent &&
+    ! -L $destination_parent && ! -e $destination && ! -L $destination ]] || {
+    printf 'fwdports: %s snapshot destination is unavailable\n' \
+      "$description" >&2
+    return 1
+  }
+  stat_record=$(_fwdports_stat_identity "$destination_parent") || return 1
+  read -r owner mode device inode size mtime <<<"$stat_record"
+  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+    (((8#$mode & 022) != 0)); then
+    printf 'fwdports: %s snapshot parent is untrusted\n' \
+      "$description" >&2
+    return 1
+  fi
+  old_umask=$(umask)
+  umask 077
+  tmp=$(mktemp "$destination_parent/.ettun-snapshot.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  umask "$old_umask"
+  if ! cp -- "$path" "$tmp" || ! chmod 0700 "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  snapshot_digest=$(_fwdports_sha256_file "$tmp") || {
+    rm -f -- "$tmp"
+    return 1
+  }
+
+  stat_record=$(_fwdports_stat_identity "$path") || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  read -r owner mode device inode size mtime <<<"$stat_record"
+  identity=$device:$inode:$mode:$size:$mtime
+  digest=$(_fwdports_sha256_file "$path") || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  if [[ ! -f $path || ! -x $path || -L $path ||
+    ($owner != 0 && $owner != "$(id -u)") ]] ||
+    (((8#$mode & 022) != 0)) || [[ $identity != "$expected_identity" ||
+    $digest != "$expected_digest" ||
+    $snapshot_digest != "$expected_digest" ]]; then
+    rm -f -- "$tmp"
+    printf 'fwdports: %s changed while being snapshotted\n' \
+      "$description" >&2
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
 fwdports_et_resolve() {
   local requested=$1 output=$2 path stat_record owner mode device inode size
   local mtime version_text version major minor patch help_text capability digest
@@ -1110,6 +1635,169 @@ fwdports_et_prepare_runtime() {
   fi
 }
 
+_fwdports_ettun_prepare_session_enumerator() {
+  local runtime=$1 source python_record python_path identity python_digest
+  local extra current_record helper_record helper_owner helper_mode
+  local helper_device helper_inode helper_size helper_mtime helper_extra
+  local helper_identity helper_digest old_umask helper_tmp python_tmp
+
+  _fwdports_ettun_platform_is_darwin || return 0
+  source=$(_fwdports_ettun_session_enumerator_source) || return 1
+  python_record=$(_fwdports_ettun_session_python_resolve) || return 1
+  IFS=$'\t' read -r python_path identity python_digest extra \
+    <<<"$python_record"
+  [[ -z $extra && -n $python_path && -n $identity &&
+    $python_digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ -f $source && ! -L $source ]] || {
+    printf 'fwdports: ettun macOS session enumerator is unavailable\n' >&2
+    return 1
+  }
+
+  old_umask=$(umask)
+  umask 077
+  helper_tmp=$(mktemp "$runtime/.session-enumerator.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  python_tmp=$(mktemp "$runtime/.session-python.XXXXXXXX") || {
+    umask "$old_umask"
+    rm -f -- "$helper_tmp"
+    return 1
+  }
+  umask "$old_umask"
+  if ! cp -- "$source" "$helper_tmp" || ! chmod 0600 "$helper_tmp" ||
+    ! _fwdports_ettun_session_python_probe \
+      "$python_path" "$helper_tmp" </dev/null >/dev/null 2>&1; then
+    printf '%s\n' \
+      'fwdports: ettun macOS session enumerator probe failed (Python 3.9 or newer required)' \
+      >&2
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  fi
+  helper_digest=$(_fwdports_sha256_file "$helper_tmp") || {
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  }
+  helper_record=$(_fwdports_stat_identity "$helper_tmp") || {
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  }
+  read -r helper_owner helper_mode helper_device helper_inode helper_size \
+    helper_mtime helper_extra <<<"$helper_record"
+  [[ -z $helper_extra && $helper_owner =~ ^[0-9]+$ &&
+    $helper_mode =~ ^[0-7]{3,4}$ && $helper_device =~ ^[0-9]+$ &&
+    $helper_inode =~ ^[0-9]+$ && $helper_size =~ ^[0-9]+$ &&
+    $helper_mtime =~ ^[0-9]+$ ]] || {
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  }
+  helper_identity=$helper_owner:$helper_mode:$helper_device:$helper_inode
+  helper_identity=$helper_identity:$helper_size:$helper_mtime
+  current_record=$(_fwdports_ettun_session_python_resolve) || {
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  }
+  [[ $current_record == "$python_record" ]] || {
+    printf 'fwdports: ettun macOS session interpreter changed during prepare\n' \
+      >&2
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  }
+  if ! printf '%s\n' \
+    $'path\t'"$python_path" \
+    $'identity\t'"$identity" \
+    $'digest\t'"$python_digest" \
+    $'helper-identity\t'"$helper_identity" \
+    $'helper-digest\t'"$helper_digest" >"$python_tmp" ||
+    ! chmod 0600 "$python_tmp"; then
+    rm -f -- "$helper_tmp" "$python_tmp"
+    return 1
+  fi
+  if ! mv -f -- "$helper_tmp" "$runtime/session-enumerator.py" ||
+    ! mv -f -- "$python_tmp" "$runtime/session-python"; then
+    rm -f -- "$helper_tmp" "$python_tmp" \
+      "$runtime/session-enumerator.py" "$runtime/session-python"
+    return 1
+  fi
+}
+
+fwdports_ettun_prepare_runtime() {
+  local runtime=$1 stock_et=${2:-0} module_dir gate_template
+  local et_gate_template shim_template gate_tmp et_gate_tmp='' shim_tmp=''
+  local temp_dir=$runtime/ettun-tmp et_bin_dir=$runtime/et-bin
+  local et_temp_dir=$runtime/et-tmp old_umask
+
+  module_dir=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) ||
+    return 1
+  gate_template=$module_dir/ettun-gate.sh
+  et_gate_template=$module_dir/ettun-et-gate.sh
+  shim_template=$module_dir/et-ssh-wrapper.sh
+  [[ $stock_et == 0 || $stock_et == 1 ]] || return 1
+  [[ -f $gate_template && -x $gate_template &&
+    ! -L $gate_template ]] || {
+    printf 'fwdports: ettun gate template is unavailable\n' >&2
+    return 1
+  }
+  if [[ $stock_et -eq 1 ]] &&
+    ! [[ -f $et_gate_template && -x $et_gate_template &&
+      ! -L $et_gate_template && -f $shim_template && -x $shim_template &&
+      ! -L $shim_template ]]; then
+    printf 'fwdports: ettun stock ET gate templates are unavailable\n' >&2
+    return 1
+  fi
+
+  old_umask=$(umask)
+  umask 077
+  if ! mkdir -p "$temp_dir" || ! chmod 0700 "$temp_dir"; then
+    umask "$old_umask"
+    return 1
+  fi
+  if [[ $stock_et -eq 1 ]] &&
+    { ! mkdir -p "$et_bin_dir" "$et_temp_dir" ||
+      ! chmod 0700 "$et_bin_dir" "$et_temp_dir"; }; then
+    umask "$old_umask"
+    return 1
+  fi
+  gate_tmp=$(mktemp "$runtime/.ettun-gate.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  if [[ $stock_et -eq 1 ]]; then
+    et_gate_tmp=$(mktemp "$runtime/.ettun-et-gate.XXXXXXXX") || {
+      umask "$old_umask"
+      rm -f -- "$gate_tmp"
+      return 1
+    }
+    shim_tmp=$(mktemp "$et_bin_dir/.ssh.XXXXXXXX") || {
+      umask "$old_umask"
+      rm -f -- "$gate_tmp" "$et_gate_tmp"
+      return 1
+    }
+  fi
+  umask "$old_umask"
+  if ! cp -- "$gate_template" "$gate_tmp" || ! chmod 0700 "$gate_tmp"; then
+    rm -f -- "$gate_tmp" "$et_gate_tmp" "$shim_tmp"
+    return 1
+  fi
+  if [[ $stock_et -eq 1 ]]; then
+    if ! cp -- "$et_gate_template" "$et_gate_tmp" ||
+      ! cp -- "$shim_template" "$shim_tmp" ||
+      ! chmod 0700 "$et_gate_tmp" "$shim_tmp" ||
+      ! mv -f -- "$shim_tmp" "$et_bin_dir/ssh" ||
+      ! mv -f -- "$et_gate_tmp" "$runtime/ettun-et-gate"; then
+      rm -f -- "$gate_tmp" "$et_gate_tmp" "$shim_tmp" \
+        "$et_bin_dir/ssh" "$runtime/ettun-et-gate"
+      return 1
+    fi
+  fi
+  # The outer gate is the complete-runtime marker and is published last.
+  if ! mv -f -- "$gate_tmp" "$runtime/ettun-gate"; then
+    rm -f -- "$gate_tmp" "$runtime/ettun-gate" "$runtime/ettun-et-gate" \
+      "$et_bin_dir/ssh"
+    return 1
+  fi
+}
+
 _fwdports_builtin_prepare_ssh() {
   local manifest=$1 leg=$2 driver=$3 runtime=$4 target_override=$5
   local identity=$runtime/ssh-source argv_file=$runtime/ssh-argv
@@ -1169,6 +1857,80 @@ _fwdports_builtin_prepare_et() {
   fwdports_et_prepare_runtime "$runtime"
 }
 
+_fwdports_ettun_default_et_via() {
+  local argv_file=$1 via
+
+  [[ -f $argv_file && ! -L $argv_file ]] || return 1
+  via=$(LC_ALL=C sed -n '1p' "$argv_file") || return 1
+  _fwdports_et_safe_target "$via" || {
+    printf '%s\n' \
+      'fwdports: ettun default ET host is unsupported; select a validated transport adapter' \
+      >&2
+    return 1
+  }
+  printf '%s\n' "$via"
+}
+
+_fwdports_ettun_prepare_stock_et() {
+  local runtime=$1 via ssh_path
+  local ssh_source=$runtime/et-ssh-source
+  local ambient_argv=$runtime/et-ssh-ambient-argv
+  local ambient_digest=$runtime/et-ssh-ambient-digest
+  local bootstrap_argv=$runtime/et-ssh-argv
+  local bootstrap_digest=$runtime/et-ssh-bootstrap-digest
+
+  via=$(_fwdports_ettun_default_et_via "$runtime/ettun-argv") || return 1
+  _fwdports_write_private_lines "$runtime/et-target" "$via" || return 1
+  fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" "$ssh_source" ||
+    return 1
+  ssh_path=$(LC_ALL=C sed -n 's/^path\t//p' "$ssh_source") || return 1
+  [[ -n $ssh_path ]] || return 1
+
+  _fwdports_write_private_lines "$ambient_argv" || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$via" "$ambient_argv" \
+    "$ambient_digest" et || return 1
+  fwdports_ssh_prepare_gate "$runtime/et-ssh-ambient" "$ssh_source" \
+    "$ambient_digest" || return 1
+
+  fwdports_et_write_ssh_argv "$bootstrap_argv" || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$via" "$bootstrap_argv" \
+    "$bootstrap_digest" || return 1
+  fwdports_ssh_prepare_gate "$runtime/et-ssh-bootstrap" "$ssh_source" \
+    "$bootstrap_digest"
+}
+
+_fwdports_builtin_prepare_ettun() {
+  local manifest=$1 leg=$2 runtime=$3 target_override=$4 transport
+  local stock_et=0
+
+  fwdports_ettun_resolve "${FWDPORTS_ETTUN_COMMAND:-ettun}" \
+    "$runtime/ettun-source" || return 1
+  fwdports_ettun_build_argv "$manifest" "$leg" "$target_override" \
+    "$runtime/ettun-argv" "$runtime/ettun-transport" || return 1
+  transport=$(<"$runtime/ettun-transport") || return 1
+  if [[ -n $transport ]]; then
+    fwdports_ettun_transport_resolve "$transport" \
+      "$runtime/ettun-transport-source" || return 1
+  else
+    stock_et=1
+    # The public ettun command uses ET unless a manifest-selected adapter owns
+    # its nested dependencies. Resolve the selected path before any tmux
+    # session or earlier leg can start.
+    fwdports_et_resolve "${FWDPORTS_ETTUN_ET_COMMAND:-et}" \
+      "$runtime/ettun-et-source" || return 1
+    _fwdports_ettun_prepare_stock_et "$runtime" || return 1
+  fi
+  fwdports_et_preflight_local_ports "$manifest" "$leg" || return 1
+  fwdports_ettun_snapshot_executable "$runtime/ettun-source" \
+    "$runtime/ettun-engine" 'ettun executable' || return 1
+  if [[ -n $transport ]]; then
+    fwdports_ettun_snapshot_executable "$runtime/ettun-transport-source" \
+      "$runtime/ettun-transport-exec" 'ettun transport adapter' || return 1
+  fi
+  _fwdports_ettun_prepare_session_enumerator "$runtime" || return 1
+  fwdports_ettun_prepare_runtime "$runtime" "$stock_et"
+}
+
 fwdports_autossh_resolve() {
   local requested=$1 output=$2 path stat_record owner mode _rest
   local version_text old_umask tmp
@@ -1208,6 +1970,87 @@ fwdports_autossh_resolve() {
   fi
 }
 
+fwdports_builtin_preflight_dependencies() {
+  local manifest=$1 preflight_root=$2 target_override=${3:-}
+  local kind leg driver _ runtime transport via index
+  local -a legs=() drivers=()
+
+  [[ -f $manifest && ! -L $manifest ]] || {
+    printf 'fwdports: resolved profile is unavailable for dependency preflight\n' \
+      >&2
+    return 1
+  }
+  [[ $preflight_root == /* ]] || return 1
+  mkdir -p "$preflight_root" || return 1
+  [[ -d $preflight_root && ! -L $preflight_root ]] || return 1
+  chmod 0700 "$preflight_root" || return 1
+
+  while IFS=$'\t' read -r kind leg driver _ || [[ -n ${kind:-} ]]; do
+    [[ $kind == leg ]] || continue
+    fwdports_driver_is_builtin "$driver" || continue
+    legs+=("$leg")
+    drivers+=("$driver")
+  done <"$manifest"
+  # Bash 3.2 treats the length of an empty nounset array as an unbound
+  # expansion. An external-driver-only profile has nothing to preflight here.
+  [[ -n ${legs[0]+set} ]] || return 0
+
+  for ((index = 0; index < ${#legs[@]}; index++)); do
+    leg=${legs[index]}
+    driver=${drivers[index]}
+    runtime=$preflight_root/$leg
+    mkdir "$runtime" || return 1
+    chmod 0700 "$runtime" || return 1
+
+    # This phase deliberately resolves only executable dependencies. Local
+    # bind checks remain in generation preparation because the active
+    # generation may legitimately own the replacement's desired port until
+    # cutover. Generation preparation repeats these checks and pins the exact
+    # executable identities used at launch.
+    case "$driver" in
+      ssh)
+        fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
+          "$runtime/ssh-source" || return 1
+        ;;
+      autossh)
+        fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
+          "$runtime/ssh-source" || return 1
+        fwdports_autossh_resolve "${FWDPORTS_AUTOSSH_COMMAND:-autossh}" \
+          "$runtime/autossh-source" || return 1
+        ;;
+      et)
+        fwdports_et_resolve "${FWDPORTS_ET_COMMAND:-et}" \
+          "$runtime/et-source" || return 1
+        fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
+          "$runtime/ssh-source" || return 1
+        ;;
+      ettun)
+        fwdports_ettun_resolve "${FWDPORTS_ETTUN_COMMAND:-ettun}" \
+          "$runtime/ettun-source" || return 1
+        fwdports_ettun_build_argv "$manifest" "$leg" "$target_override" \
+          "$runtime/ettun-argv" "$runtime/ettun-transport" || return 1
+        transport=$(<"$runtime/ettun-transport") || return 1
+        if [[ -n $transport ]]; then
+          fwdports_ettun_transport_resolve "$transport" \
+            "$runtime/ettun-transport-source" || return 1
+        else
+          via=$(_fwdports_ettun_default_et_via "$runtime/ettun-argv") ||
+            return 1
+          fwdports_et_resolve "${FWDPORTS_ETTUN_ET_COMMAND:-et}" \
+            "$runtime/ettun-et-source" || return 1
+          fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
+            "$runtime/ssh-source" || return 1
+        fi
+        ;;
+      *)
+        printf 'fwdports: unsupported built-in dependency preflight: %s\n' \
+          "$driver" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
 fwdports_builtin_prepare() {
   local manifest=$1 leg=$2 driver=$3 runtime=$4 target_override=$5
   local kind_file=$runtime/driver-kind tmp old_umask
@@ -1221,6 +2064,10 @@ fwdports_builtin_prepare() {
       ;;
     et)
       _fwdports_builtin_prepare_et "$manifest" "$leg" "$runtime" \
+        "$target_override" || return 1
+      ;;
+    ettun)
+      _fwdports_builtin_prepare_ettun "$manifest" "$leg" "$runtime" \
         "$target_override" || return 1
       ;;
   esac

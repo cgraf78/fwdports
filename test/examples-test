@@ -29,7 +29,8 @@ reserved_data_case() {
 executable_case() {
   local tmp profile output status version
   tmp=$(_tmpdir) || return 1
-  for profile in ssh-default ssh-resilient et-direct executable-driver; do
+  for profile in ssh-default ssh-resilient et-direct ettun-relay \
+    executable-driver; do
     output=$tmp/$profile
     status=0
     fwdports_config_resolve "$EXAMPLES/tunnels.conf" "$profile" "$output" ||

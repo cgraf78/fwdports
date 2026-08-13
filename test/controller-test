@@ -29,19 +29,27 @@ chmod 0700 "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
 export HOME=$TMUX_TEST_HOME XDG_CONFIG_HOME=$TMUX_TEST_CONFIG
 
 controller_fixture() {
-  local tmp=$1 driver=${2:-ssh} home state source root generation digest
+  local tmp=$1 driver=${2:-ssh} extra_leg=${3:-}
+  local home state source root generation digest
   home=$tmp/home
   state=$tmp/state
   source=$tmp/resolved-profile
   mkdir -p "$home" "$state"
   chmod 0700 "$home" "$state"
-  printf '%s\n' \
-    $'version\t1' \
-    $'profile\tdemo' \
-    $'leg\tweb\t'"$driver" \
-    $'set\tweb\thost\tshell.example.com' \
-    $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
-    >"$source"
+  {
+    printf '%s\n' \
+      $'version\t1' \
+      $'profile\tdemo' \
+      $'leg\tweb\t'"$driver" \
+      $'set\tweb\thost\tshell.example.com' \
+      $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80'
+    if [[ -n $extra_leg ]]; then
+      printf '%s\n' \
+        $'leg\t'"$extra_leg"$'\t'"$driver" \
+        $'set\t'"$extra_leg"$'\thost\tlater.example.com' \
+        $'set\t'"$extra_leg"$'\tlocal-forward\t127.0.0.1:8081:127.0.0.1:81'
+    fi
+  } >"$source"
   chmod 0600 "$source"
   root=$(HOME=$home XDG_STATE_HOME=$state fwdports_runtime_init) || return 1
   generation=$(fwdports_generation_create "$root" "$source") || return 1
@@ -372,6 +380,37 @@ unowned_session_case() {
   : "$record"
 }
 
+no_pane_stop_case() {
+  local tmp fixture root generation digest events output error status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  output=$tmp/output
+  error=$tmp/error
+
+  (
+    _fwdports_cleanup_generation_drivers() {
+      printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+    }
+    fwdports_tmux_remove_generation_session() {
+      printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+    }
+    FWDPORTS_TEST_EVENTS=$events \
+      _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+      pending "$generation" "$digest" fwdports 1 0 \
+      >"$output" 2>"$error"
+  )
+  status=$?
+
+  _assert_exit "no-pane stop: succeeds under nounset" 0 "$status"
+  _assert_eq "no-pane stop: performs both cleanup passes" \
+    $'cleanup\ncleanup\nremove-session' "$(<"$events")"
+  _assert_not_exists "no-pane stop: removes pending pointer" "$root/pending"
+  _assert_not_exists "no-pane stop: removes generation" "$generation"
+  _assert_eq "no-pane stop: emits no nounset diagnostic" "" "$(<"$error")"
+}
+
 crash_before_active_case() {
   local tmp fixture root generation digest output error
   tmp=$(_tmpdir) || return 1
@@ -633,20 +672,64 @@ external_cleanup_order_case() {
     $'cleanup\nterminate\ncleanup\nremove-session' "$(<"$events")"
 }
 
+ettun_stop_strategy_case() {
+  local tmp fixture root generation digest events status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" ettun) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+
+  fwdports_tmux_verify_pane() { return 0; }
+  _fwdports_verify_owned_group() {
+    printf 'group-verify\n' >>"$FWDPORTS_TEST_EVENTS"
+    return 74
+  }
+  _fwdports_verify_owned_session() {
+    printf 'session-verify\n' >>"$FWDPORTS_TEST_EVENTS"
+    printf '101\t101\t101\n'
+  }
+  _fwdports_cleanup_generation_drivers() { return 0; }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate=%s\n' "${10:-missing}" >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 1 0 >/dev/null 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "ettun stop strategy: generation stop succeeds" 0 "$status"
+  _assert_eq "ettun stop strategy: authenticates and passes session scope" \
+    $'session-verify\nsession-verify\nterminate=ettun-session\nremove-session' \
+    "$(<"$events")"
+  _assert_not_exists "ettun stop strategy: removes completed generation" \
+    "$generation"
+}
+
 precleanup_all_panes_validated_case() {
   local tmp fixture root generation digest events status evidence
   tmp=$(_tmpdir) || return 1
-  fixture=$(controller_fixture "$tmp" example) || return 1
+  fixture=$(controller_fixture "$tmp" example z-ambiguous) || return 1
   IFS=$'\t' read -r root generation digest <<<"$fixture"
   events=$tmp/events
-  for evidence in a-valid z-ambiguous; do
+  for evidence in web z-ambiguous; do
     mkdir -p "$generation/legs/$evidence"
     chmod 0700 "$generation/legs" "$generation/legs/$evidence"
     : >"$generation/legs/$evidence/pane"
   done
+  FWDPORTS_TEST_VALIDATIONS=
 
   fwdports_tmux_verify_pane() { return 0; }
   _fwdports_verify_owned_group() {
+    FWDPORTS_TEST_VALIDATIONS=${FWDPORTS_TEST_VALIDATIONS}${3%/pane}$'\n'
     case "$3" in
       */z-ambiguous/pane) return 74 ;;
       *) printf '1\n' ;;
@@ -668,6 +751,9 @@ precleanup_all_panes_validated_case() {
 
   _assert_exit "precleanup validation: ambiguous later pane fails closed" \
     74 "$status"
+  _assert_eq "precleanup validation: authenticates every earlier pane first" \
+    "$generation/legs/web"$'\n'"$generation/legs/z-ambiguous"$'\n' \
+    "$FWDPORTS_TEST_VALIDATIONS"
   _assert_not_exists "precleanup validation: invokes no hook or signal" "$events"
   _assert_file "precleanup validation: preserves generation" \
     "$generation/manifest"
@@ -755,6 +841,52 @@ precleanup_revalidation_ambiguity_case() {
   _assert_file "precleanup revalidation: preserves pointer" "$root/pending"
 }
 
+darwin_dead_ettun_scope_case() {
+  local tmp fixture root generation digest evidence rewritten output scope_arg
+  local status
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp") || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  activate_status_generation "$tmp" "$root" "$generation" "$digest" ||
+    return 1
+  evidence=$generation/legs/web/pane
+  rewritten=$tmp/pane-rewritten
+  output=$tmp/output
+  scope_arg=$tmp/scope-arg
+
+  while IFS=$'\t' read -r key value; do
+    if [[ $key == sid ]]; then
+      value=0
+    fi
+    printf '%s\t%s\n' "$key" "$value"
+  done <"$evidence" >"$rewritten"
+  chmod 0600 "$rewritten"
+  mv -f -- "$rewritten" "$evidence"
+
+  set +e
+  (
+    fwdports_tmux_verify_pane() { return 1; }
+    _fwdports_process_session_live_records() {
+      printf '%s\t%s\n' "$1" "$2" >"$scope_arg"
+      return 1
+    }
+    _fwdports_stop_pane_state /fake/tmux "$tmp/socket" "$generation" \
+      "$digest" "$evidence" ettun-session
+  ) >"$output"
+  status=$?
+  set -e
+
+  _assert_exit "Darwin dead ettun: empty kernel session is accepted" 0 \
+    "$status"
+  _assert_eq "Darwin dead ettun: pane is classified dead" dead \
+    "$(<"$output")"
+  _assert_eq "Darwin dead ettun: controller selects authenticated leader" \
+    "$(<"$tmp/status-pid")"$'\t'"$evidence" "$(<"$scope_arg")"
+
+  : >"$STATUS_RELEASE"
+  kill_test_server "$STATUS_SOCKET"
+}
+
 run_case controller-ready controller_ready_case
 run_case controller-before-publish controller_before_publish_case
 run_case controller-after-publish controller_after_publish_case
@@ -763,6 +895,7 @@ run_case status-live-unverified status_live_unverified_case
 run_case status-down status_down_case
 run_case status-external-driver-liveness status_external_driver_liveness_case
 run_case unowned-session unowned_session_case
+run_case no-pane-stop no_pane_stop_case
 run_case crash-before-active crash_before_active_case
 run_case crash-after-active crash_after_active_case
 run_case crash-before-stop-control crash_before_stop_control_case
@@ -770,9 +903,11 @@ run_case crash-after-stop-control crash_after_stop_control_case
 run_case crash-after-term crash_after_term_case
 run_case crash-after-kill crash_after_kill_case
 run_case force-between-generations force_between_generations_case
+run_case darwin-dead-ettun-scope darwin_dead_ettun_scope_case
 run_case dead-pane-process-inspection-failure \
   dead_pane_process_inspection_failure_case
 run_case external-cleanup-order external_cleanup_order_case
+run_case ettun-stop-strategy ettun_stop_strategy_case
 run_case precleanup-all-panes-validated precleanup_all_panes_validated_case
 run_case precleanup-stops-pane precleanup_stops_pane_case
 run_case precleanup-revalidation-ambiguity \

@@ -38,6 +38,8 @@ They distinguish a complete old/new control record—which readers may retry—
 from malformed ownership evidence, which must fail closed. Cleanup cases place
 sentinels beside generations and behind symlinks so future refactors prove the
 destructive boundary rather than merely asserting the expected target vanished.
+The process-tree suite also forces the Darwin `os.getsid` adapter on Linux so a
+worker that survives pane-leader exit and loses its tty remains observable.
 
 `cli-integration-test` uses a real isolated tmux server and a harmless fake SSH
 transport to exercise the installed command path from start through status and
@@ -48,4 +50,6 @@ supplies a temporary normal tmux configuration to prove that mouse and
 copy-mode preferences reach the isolated server. `driver-api-test` keeps
 external consumers on the fixed argv/file boundary. `examples-test` reads
 checked-in examples directly, and `portability-test` names platform adapters
-that are easy to regress on macOS.
+that are easy to regress on macOS. The process-tree suite also exercises the
+Darwin helper's isolated startup, generation integrity checks, and
+parent-interruption cleanup contract.

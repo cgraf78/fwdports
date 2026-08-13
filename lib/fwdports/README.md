@@ -6,13 +6,16 @@ These Bash 3.2-compatible modules implement reusable `fwdports` behavior:
 - `core.sh` composes command-level start/status/inspect/stop/attach operations.
 - `controller.sh` gates activation, reports observed state, and resumes only
   generation-authenticated crash cleanup.
-- `drivers.sh` owns built-in SSH/autossh/ET validation and argv construction.
+- `drivers.sh` owns built-in SSH/autossh/ET/ettun validation and argv construction.
 - `driver-api.sh` owns trusted external-driver discovery and invocation.
 - `builtin-runner.sh` keeps direct SSH alive with bounded backoff and launches
-  explicitly selected autossh or ET with one foreground supervised child.
+  explicitly selected autossh, ET, or ettun with one foreground supervised child.
 - `ssh-gate.sh` binds OpenSSH identity and effective configuration at exec.
 - `et-gate.sh` revalidates ET bytes and sanitizes ET's environment at exec.
 - `et-ssh-wrapper.sh` pins ET's bootstrap to authenticated SSH gates.
+- `ettun-gate.sh` reauthenticates installed sources and launches the
+  generation-owned relay engine and transport snapshots.
+- `ettun-et-gate.sh` hardens and authenticates ettun's default ET transport.
 - `health.sh` owns pure health and backoff state transitions.
 - `runtime.sh` owns XDG state, generations, locks, manifests, and pointers.
 - `tmux.sh` owns direct-argv session and pane operations.

@@ -370,7 +370,8 @@ fwdports_start() {
   local candidate='' active generation digest result status release_status
   local controller_record controller_pid=none controller_start=none
   local session_record session_id='' observed_state return_existing=0
-  local forward_summary=''
+  local forward_summary='' repair_state='' stop_existing=0
+  local builtin_preflighted=0
 
   config_root=$(_fwdports_config_root) || {
     printf 'fwdports: HOME or XDG_CONFIG_HOME must be absolute\n' >&2
@@ -414,7 +415,12 @@ fwdports_start() {
   }
 
   status=0
-  if [[ -e $root/pending || -L $root/pending ]]; then
+  # Recovery is also meaningful when only active exists: an authenticated
+  # stopping/stopped control record commits cleanup authority before any
+  # replacement dependency is considered. A running active generation is
+  # observed without mutation.
+  if [[ -e $root/pending || -L $root/pending ||
+    -e $root/active || -L $root/active ]]; then
     _fwdports_recover_state_locked "$tmux_path" "$socket" "$root" \
       "$FWDPORTS_SESSION_NAME" 40 0.05 >/dev/null || status=$?
   fi
@@ -439,18 +445,13 @@ fwdports_start() {
                   "$profile"
                 return_existing=1
               else
-                printf 'fwdports: repairing degraded profile %s\n' "$profile"
-                _fwdports_stop_generation_locked "$tmux_path" "$socket" \
-                  "$root" active "$generation" "$digest" \
-                  "$FWDPORTS_SESSION_NAME" 40 0.05 || status=$?
+                repair_state=$observed_state
+                stop_existing=1
               fi
               ;;
             down | controller-down | stopping)
-              printf 'fwdports: repairing profile %s from %s\n' \
-                "$profile" "$observed_state"
-              _fwdports_stop_generation_locked "$tmux_path" "$socket" \
-                "$root" active "$generation" "$digest" \
-                "$FWDPORTS_SESSION_NAME" 40 0.05 || status=$?
+              repair_state=$observed_state
+              stop_existing=1
               ;;
             *) status=74 ;;
           esac
@@ -460,9 +461,26 @@ fwdports_start() {
           >&2
         status=1
       else
-        _fwdports_stop_generation_locked "$tmux_path" "$socket" "$root" \
-          active "$generation" "$digest" "$FWDPORTS_SESSION_NAME" \
-          40 0.05 || status=$?
+        stop_existing=1
+      fi
+      if [[ $status -eq 0 && $stop_existing -eq 1 ]]; then
+        fwdports_builtin_preflight_dependencies "$resolved" \
+          "$workspace/builtin-preflight" "$target_override" || status=$?
+        if [[ $status -eq 0 ]]; then
+          builtin_preflighted=1
+          case "$repair_state" in
+            degraded)
+              printf 'fwdports: repairing degraded profile %s\n' "$profile"
+              ;;
+            down | controller-down | stopping)
+              printf 'fwdports: repairing profile %s from %s\n' \
+                "$profile" "$repair_state"
+              ;;
+          esac
+          _fwdports_stop_generation_locked "$tmux_path" "$socket" "$root" \
+            active "$generation" "$digest" "$FWDPORTS_SESSION_NAME" \
+            40 0.05 || status=$?
+        fi
       fi
     fi
     if [[ $status -eq 0 && $return_existing -eq 1 ]]; then
@@ -486,6 +504,11 @@ fwdports_start() {
     printf 'fwdports: an unowned tmux session named %s already exists\n' \
       "$FWDPORTS_SESSION_NAME" >&2
     status=1
+  fi
+  if [[ $status -eq 0 && $builtin_preflighted -eq 0 ]]; then
+    fwdports_builtin_preflight_dependencies "$resolved" \
+      "$workspace/builtin-preflight" "$target_override" || status=$?
+    [[ $status -ne 0 ]] || builtin_preflighted=1
   fi
   if [[ $status -eq 0 ]]; then
     generation=$(fwdports_generation_create "$root" "$resolved" \

@@ -386,15 +386,26 @@ _fwdports_cleanup_generation_drivers() {
 
 _fwdports_stop_pane_state() {
   local tmux_path=$1 socket=$2 generation=$3 digest=$4 evidence=$5
-  local verify_status record pgid group_status
+  local strategy=${6:-group} verify_status record leader pgid scope_status
+
+  case "$strategy" in
+    group | ettun-session) ;;
+    *) return 74 ;;
+  esac
 
   if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
     "$digest" "$evidence"; then
     # A valid pane leader alone is insufficient authority for a live cleanup
-    # opportunity: an unexpected same-PGID member could make later teardown
-    # ambiguous. Authenticate the complete owned group before any hook runs.
-    _fwdports_verify_owned_group "$generation" "$digest" "$evidence" \
-      >/dev/null || return 74
+    # opportunity. Most drivers own one process group; ettun deliberately
+    # creates worker groups, so its complete kernel process session is the
+    # boundary.
+    if [[ $strategy == ettun-session ]]; then
+      _fwdports_verify_owned_session "$generation" "$digest" "$evidence" \
+        >/dev/null || return 74
+    else
+      _fwdports_verify_owned_group "$generation" "$digest" "$evidence" \
+        >/dev/null || return 74
+    fi
     printf 'live\n'
     return 0
   else
@@ -402,22 +413,37 @@ _fwdports_stop_pane_state() {
   fi
   case "$verify_status" in
     1)
-      # A dead pane is safe to finish only when its recorded group is also
-      # empty. If a survivor remains after its leader disappeared, ownership
-      # is incomplete and automatic recovery must stop.
+      # A dead pane is safe to finish only when its complete recorded process
+      # boundary is empty. If a survivor remains after its leader disappeared,
+      # ownership is incomplete and automatic recovery must stop.
       record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
         "$evidence") || return 74
-      IFS=$'\t' read -r _ _ _ _ _ _ pgid _ _ <<<"$record"
-      if _fwdports_process_group_live_records "$pgid" \
-        >/dev/null 2>&1; then
-        printf 'fwdports: recorded leader is gone but its group remains\n' \
-          >&2
-        return 74
+      IFS=$'\t' read -r _ _ leader _ _ _ pgid _ _ <<<"$record"
+      if [[ $strategy == ettun-session ]]; then
+        if _fwdports_process_session_live_records "$leader" "$evidence" \
+          >/dev/null 2>&1; then
+          printf 'fwdports: recorded leader is gone but its session remains\n' \
+            >&2
+          return 74
+        else
+          scope_status=$?
+        fi
       else
-        group_status=$?
+        if _fwdports_process_group_live_records "$pgid" \
+          >/dev/null 2>&1; then
+          printf 'fwdports: recorded leader is gone but its group remains\n' \
+            >&2
+          return 74
+        else
+          scope_status=$?
+        fi
       fi
-      if [[ $group_status -ne 1 ]]; then
-        printf 'fwdports: cannot inspect the recorded process group\n' >&2
+      if [[ $scope_status -ne 1 ]]; then
+        if [[ $strategy == ettun-session ]]; then
+          printf 'fwdports: cannot inspect the recorded process session\n' >&2
+        else
+          printf 'fwdports: cannot inspect the recorded process group\n' >&2
+        fi
         return 74
       fi
       printf 'dead\n'
@@ -430,8 +456,8 @@ _fwdports_stop_generation_locked() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 session_name=$7 attempts=$8 delay=$9
   local control_record phase desired controller_pid controller_start
-  local probe evidence pane_state
-  local -a pane_evidence=()
+  local probe evidence pane_state runtime leg driver strategy index
+  local -a pane_evidence=() pane_strategies=()
 
   control_record=$(fwdports_control_read "$generation" "$digest") || return 74
   IFS=$'\t' read -r phase desired controller_pid controller_start probe \
@@ -452,9 +478,19 @@ _fwdports_stop_generation_locked() {
   # cannot make a pane disappear from the second pass by removing its record.
   for evidence in "$generation"/legs/*/pane; do
     [[ -e "$evidence" || -L "$evidence" ]] || continue
+    runtime=${evidence%/pane}
+    leg=${runtime##*/}
+    driver=$(_fwdports_manifest_driver_for_leg \
+      "$generation/manifest" "$leg") || return 74
+    if [[ $driver == ettun ]]; then
+      strategy=ettun-session
+    else
+      strategy=group
+    fi
     pane_evidence+=("$evidence")
+    pane_strategies+=("$strategy")
     _fwdports_stop_pane_state "$tmux_path" "$socket" "$generation" \
-      "$digest" "$evidence" >/dev/null || return 74
+      "$digest" "$evidence" "$strategy" >/dev/null || return 74
   done
 
   # Cleanup is deliberately idempotent in the driver contract. The live pass
@@ -464,18 +500,24 @@ _fwdports_stop_generation_locked() {
   # both passes.
   _fwdports_cleanup_generation_drivers "$generation" "$digest"
 
+  # Bash 3.2 treats the length of an empty nounset array as unbound. Iterate
+  # through the safely guarded evidence expansion and use the explicit index
+  # only after the loop has proved that the parallel arrays contain an entry.
+  index=0
   for evidence in ${pane_evidence[@]+"${pane_evidence[@]}"}; do
+    strategy=${pane_strategies[index]}
     pane_state=$(_fwdports_stop_pane_state "$tmux_path" "$socket" \
-      "$generation" "$digest" "$evidence") || return 74
+      "$generation" "$digest" "$evidence" "$strategy") || return 74
     case "$pane_state" in
       live)
         fwdports_tmux_terminate_pane "$tmux_path" "$socket" "$root" \
           "$pointer_kind" "$generation" "$digest" "$evidence" \
-          "$attempts" "$delay" >/dev/null || return 74
+          "$attempts" "$delay" "$strategy" >/dev/null || return 74
         ;;
       dead) ;;
       *) return 74 ;;
     esac
+    index=$((index + 1))
   done
   _fwdports_cleanup_generation_drivers "$generation" "$digest"
   fwdports_tmux_remove_generation_session "$tmux_path" "$socket" \

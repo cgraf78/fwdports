@@ -13,7 +13,7 @@ fwdports_driver_is_builtin() {
   # omitted from discovery, cleanup, liveness, or launch would be mistaken for
   # an external executable and cross the wrong trust boundary.
   case "$1" in
-    ssh | autossh | et) return 0 ;;
+    ssh | autossh | et | ettun) return 0 ;;
     *) return 1 ;;
   esac
 }

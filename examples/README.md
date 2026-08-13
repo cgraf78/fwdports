@@ -13,6 +13,8 @@ The `ssh-default` profile demonstrates the default driver. `ssh-resilient`
 selects autossh explicitly; installing autossh never changes another profile's
 driver. `et-direct` uses the stock Eternal Terminal 7.0.0 built-in with one local
 and one remote forward; its local endpoint has the required matching health
-check. `executable-driver` demonstrates the fixed single-file extension
-protocol. Real drivers are trusted local programs and belong in
+check. `ettun-relay` demonstrates one loopback-only local endpoint whose remote
+destination is reached through the public ettun relay engine.
+`executable-driver` demonstrates the fixed single-file extension protocol.
+Real drivers are trusted local programs and belong in
 `${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/drivers.d/` with mode 0700.

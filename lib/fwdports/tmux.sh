@@ -635,6 +635,219 @@ _fwdports_process_group_live_records() {
   printf '%s' "$live"
 }
 
+_fwdports_tmux_platform_is_darwin() {
+  [[ ${OSTYPE:-} == darwin* ]]
+}
+
+_fwdports_tmux_stat_identity() {
+  local path=$1 output
+
+  if output=$(LC_ALL=C stat -c '%u %a %d %i %s %Y' -- "$path" \
+    2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  if output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' "$path" \
+    2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  return 1
+}
+
+_fwdports_tmux_trusted_file_identity() {
+  local path=$1 record owner mode device inode size mtime extra uid
+
+  record=$(_fwdports_tmux_stat_identity "$path") || return 2
+  read -r owner mode device inode size mtime extra <<<"$record"
+  uid=$(id -u) || return 2
+  [[ -z $extra && $owner =~ ^[0-9]+$ && $mode =~ ^[0-7]{3,4}$ &&
+    $device =~ ^[0-9]+$ && $inode =~ ^[0-9]+$ &&
+    $size =~ ^[0-9]+$ && $mtime =~ ^[0-9]+$ &&
+    ($owner == 0 || $owner == "$uid") ]] || return 2
+  (((8#$mode & 022) == 0)) || return 2
+  printf '%s:%s:%s:%s:%s:%s\n' \
+    "$owner" "$mode" "$device" "$inode" "$size" "$mtime"
+}
+
+_fwdports_process_session_runtime() {
+  local evidence=$1 runtime helper python_file key python_path identity digest
+  local helper_identity helper_digest extra actual_identity actual_digest
+
+  runtime=${evidence%/*}
+  helper=$runtime/session-enumerator.py
+  python_file=$runtime/session-python
+  [[ $runtime != "$evidence" && -d $runtime && ! -L $runtime &&
+    -f $helper && ! -L $helper && -f $python_file &&
+    ! -L $python_file ]] || return 2
+  {
+    IFS=$'\t' read -r key python_path extra || return 2
+    [[ $key == path && -z $extra ]] || return 2
+    IFS=$'\t' read -r key identity extra || return 2
+    [[ $key == identity && -z $extra ]] || return 2
+    IFS=$'\t' read -r key digest extra || return 2
+    [[ $key == digest && -z $extra ]] || return 2
+    IFS=$'\t' read -r key helper_identity extra || return 2
+    [[ $key == helper-identity && -z $extra ]] || return 2
+    IFS=$'\t' read -r key helper_digest extra || return 2
+    [[ $key == helper-digest && -z $extra ]] || return 2
+    if IFS= read -r extra; then
+      return 2
+    fi
+  } <"$python_file"
+  [[ $python_path == /* && $python_path != *$'\t'* &&
+    $python_path != *$'\r'* && -f $python_path && -x $python_path &&
+    ! -L $python_path && $identity != *$'\t'* &&
+    $digest =~ ^[0-9a-f]{64}$ && $helper_identity != *$'\t'* &&
+    $helper_digest =~ ^[0-9a-f]{64}$ ]] || return 2
+  actual_identity=$(_fwdports_tmux_trusted_file_identity "$python_path") ||
+    return 2
+  [[ $actual_identity == "$identity" ]] || return 2
+  actual_digest=$(_fwdports_runtime_sha256_file "$python_path") || return 2
+  [[ $actual_digest == "$digest" ]] || return 2
+  actual_identity=$(_fwdports_tmux_trusted_file_identity "$helper") ||
+    return 2
+  [[ $actual_identity == "$helper_identity" ]] || return 2
+  actual_digest=$(_fwdports_runtime_sha256_file "$helper") || return 2
+  [[ $actual_digest == "$helper_digest" ]] || return 2
+  printf '%s\t%s\n' "$python_path" "$helper"
+}
+
+_fwdports_process_session_records_portable() {
+  local wanted_sid=$1 output line pid pgid sid tty state extra found=0
+  local records=''
+
+  output=$(LC_ALL=C ps -e -o pid= -o pgid= -o sess= -o tty= -o stat= \
+    2>/dev/null) || return 2
+  while IFS= read -r line || [[ -n $line ]]; do
+    read -r pid pgid sid tty state extra <<<"$line"
+    [[ -z $extra && $pid =~ ^[0-9]+$ &&
+      $pgid =~ ^[0-9]+$ && $sid =~ ^[0-9]+$ &&
+      -n $tty && -n $state ]] || return 2
+    [[ $pid != 0 ]] || continue
+    [[ $sid == "$wanted_sid" ]] || continue
+    [[ $pgid =~ ^[1-9][0-9]*$ ]] || return 2
+    records=$records$pid$'\t'$pgid$'\t'$tty$'\t'$state$'\n'
+    found=1
+  done <<<"$output"
+  [[ $found -eq 1 ]] || return 1
+  printf '%s' "$records"
+}
+
+_fwdports_process_session_records_darwin() {
+  local wanted_sid=$1 evidence=$2 runtime_record python_path helper snapshot
+  local output status line pid pgid tty state extra found=0 records=''
+
+  runtime_record=$(_fwdports_process_session_runtime "$evidence") || return 2
+  IFS=$'\t' read -r python_path helper extra <<<"$runtime_record"
+  [[ -z $extra && -n $python_path && -n $helper ]] || return 2
+  snapshot=$(LC_ALL=C ps -e -o ruid= -o pid= -o pgid= -o tty= -o stat= \
+    2>/dev/null) || return 2
+  if output=$(
+    unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE
+    LC_ALL=C "$python_path" -I -S -B "$helper" "$wanted_sid" \
+      <<<"$snapshot" 2>/dev/null
+  ); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  while IFS= read -r line || [[ -n $line ]]; do
+    IFS=$'\t' read -r pid pgid tty state extra <<<"$line"
+    [[ -z $extra && $pid =~ ^[1-9][0-9]*$ &&
+      $pgid =~ ^[1-9][0-9]*$ && -n $tty && -n $state ]] || return 2
+    records=$records$pid$'\t'$pgid$'\t'$tty$'\t'$state$'\n'
+    found=1
+  done <<<"$output"
+  [[ $found -eq 1 ]] || return 2
+  printf '%s' "$records"
+}
+
+_fwdports_process_session_records() {
+  local wanted_sid=$1 evidence=$2
+
+  [[ $wanted_sid =~ ^[1-9][0-9]*$ ]] || return 1
+  if _fwdports_tmux_platform_is_darwin; then
+    _fwdports_process_session_records_darwin "$wanted_sid" "$evidence"
+  else
+    _fwdports_process_session_records_portable "$wanted_sid"
+  fi
+}
+
+_fwdports_process_session_live_snapshot() {
+  local wanted_sid=$1 evidence=$2 records status line pid pgid tty state extra
+  local live='' found=0
+
+  if records=$(_fwdports_process_session_records "$wanted_sid" "$evidence"); then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) ;;
+    1) return 1 ;;
+    *) return "$status" ;;
+  esac
+  while IFS= read -r line || [[ -n $line ]]; do
+    IFS=$'\t' read -r pid pgid tty state extra <<<"$line"
+    [[ -z $extra && $pid =~ ^[1-9][0-9]*$ &&
+      $pgid =~ ^[1-9][0-9]*$ && -n $tty && -n $state ]] || return 2
+    # A zombie retains its session identity until an ancestor reaps it, which
+    # may never happen under a minimal container PID 1. It cannot execute,
+    # fork, receive another signal, or retain a forwarding socket.
+    [[ $state != Z* && $state != X* ]] || continue
+    live=$live$line$'\n'
+    found=1
+  done <<<"$records"
+  [[ $found -eq 1 ]] || return 3
+  printf '%s' "$live"
+}
+
+_fwdports_process_session_live_records() {
+  local wanted_sid=$1 evidence=$2 records first_status second_status
+
+  if records=$(
+    _fwdports_process_session_live_snapshot "$wanted_sid" "$evidence"
+  ); then
+    printf '%s' "$records"
+    return 0
+  else
+    first_status=$?
+  fi
+  case "$first_status" in
+    1 | 3) ;;
+    *) return "$first_status" ;;
+  esac
+
+  # A process can fork while ps is walking the process table. Require two
+  # complete empty scans so a child appearing during a parent-exit handoff
+  # cannot become an early empty result on either supported process adapter.
+  if records=$(
+    _fwdports_process_session_live_snapshot "$wanted_sid" "$evidence"
+  ); then
+    printf '%s' "$records"
+    return 0
+  else
+    second_status=$?
+  fi
+  case "$second_status" in
+    1 | 3) ;;
+    *) return "$second_status" ;;
+  esac
+  # Seeing the recorded session in a zombie-only state proves that its numeric
+  # anchor is the inert original process, not a live reused PID missed by ps.
+  [[ $first_status -eq 3 || $second_status -eq 3 ]] && return 1
+  # A live numeric anchor after two empty scans is either a race or PID reuse.
+  # Neither is sufficient proof that the recorded session is empty.
+  command kill -0 -- "$wanted_sid" 2>/dev/null && return 2
+  return 1
+}
+
 _fwdports_verify_owned_group() {
   local generation=$1 digest=$2 evidence=$3 record session pane leader
   local leader_start expected_tty expected_sid expected_pgid parent state
@@ -675,6 +888,65 @@ _fwdports_verify_owned_group() {
   printf '%s\n' "$expected_pgid"
 }
 
+_fwdports_verify_owned_session() {
+  local generation=$1 digest=$2 evidence=$3 record session pane leader
+  local leader_start expected_tty expected_sid expected_pgid parent state
+  local members line pid pgid tty process_state extra
+  local leader_found=0 current_start
+
+  record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$evidence") || return 2
+  IFS=$'\t' read -r session pane leader leader_start expected_tty \
+    expected_sid expected_pgid parent state <<<"$record"
+  current_start=$(_fwdports_process_start_identity "$leader") || {
+    printf 'fwdports: recorded leader is no longer live\n' >&2
+    return 2
+  }
+  [[ $current_start == "$leader_start" ]] || {
+    printf 'fwdports: recorded leader process identity changed\n' >&2
+    return 2
+  }
+  # tmux creates the pane leader with setsid, so its authenticated PID is the
+  # POSIX session selector. Darwin's `ps sess` evidence field is a sanitized
+  # kernel pointer (commonly zero), so its adapter verifies each PID with
+  # getsid(2) instead of trusting that display field.
+  members=$(_fwdports_process_session_records "$leader" "$evidence") || {
+    printf 'fwdports: recorded process session is no longer live\n' >&2
+    return 2
+  }
+  while IFS= read -r line || [[ -n $line ]]; do
+    IFS=$'\t' read -r pid pgid tty process_state extra <<<"$line"
+    [[ -z $extra && $pid =~ ^[0-9]+$ && $pgid =~ ^[0-9]+$ &&
+      -n $tty && -n $process_state ]] || {
+      printf 'fwdports: process session contains an unverifiable member\n' >&2
+      return 2
+    }
+    if [[ $pid == "$leader" ]]; then
+      [[ $pgid == "$expected_pgid" &&
+        ${tty#/dev/} == "${expected_tty#/dev/}" ]] || {
+        printf 'fwdports: recorded leader changed process scope\n' >&2
+        return 2
+      }
+      leader_found=1
+    fi
+    : "$process_state"
+  done <<<"$members"
+  [[ $leader_found -eq 1 ]] || {
+    printf 'fwdports: recorded leader is absent from its process session\n' >&2
+    return 2
+  }
+  current_start=$(_fwdports_process_start_identity "$leader") || {
+    printf 'fwdports: recorded leader exited during session observation\n' >&2
+    return 2
+  }
+  [[ $current_start == "$leader_start" ]] || {
+    printf 'fwdports: recorded leader changed during session observation\n' >&2
+    return 2
+  }
+  : "$session" "$pane" "$parent" "$state" "$expected_sid"
+  printf '%s\t%s\t%s\n' "$leader" "$leader" "$expected_pgid"
+}
+
 _fwdports_lifecycle_allows_stop() {
   local root=$1 pointer_kind=$2 generation=$3 digest=$4 pointer control_record
   local phase desired
@@ -691,6 +963,28 @@ _fwdports_wait_group_empty() {
 
   while :; do
     if _fwdports_process_group_live_records "$pgid" >/dev/null 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    case "$status" in
+      0)
+        [[ $index -lt $attempts ]] || return 1
+        sleep "$delay"
+        index=$((index + 1))
+        ;;
+      1) return 0 ;;
+      *) return 2 ;;
+    esac
+  done
+}
+
+_fwdports_wait_session_empty() {
+  local sid=$1 evidence=$2 attempts=$3 delay=$4 index=0 status
+
+  while :; do
+    if _fwdports_process_session_live_records "$sid" "$evidence" \
+      >/dev/null 2>&1; then
       status=0
     else
       status=$?
@@ -727,16 +1021,185 @@ _fwdports_recorded_group_is_empty() {
   return 0
 }
 
+_fwdports_recorded_session_is_empty() {
+  local generation=$1 digest=$2 evidence=$3 record leader status
+
+  record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$evidence") || return 2
+  IFS=$'\t' read -r _ _ leader _ _ _ _ _ _ <<<"$record"
+  if _fwdports_process_session_live_records "$leader" "$evidence" \
+    >/dev/null 2>&1; then
+    return 1
+  else
+    status=$?
+  fi
+  [[ $status -eq 1 ]] || return 2
+  return 0
+}
+
+_fwdports_wait_recorded_session_empty() {
+  local generation=$1 digest=$2 evidence=$3 attempts=$4 delay=$5 record leader
+
+  record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$evidence") || return 2
+  IFS=$'\t' read -r _ _ leader _ _ _ _ _ _ <<<"$record"
+  _fwdports_wait_session_empty "$leader" "$evidence" "$attempts" "$delay"
+}
+
+_fwdports_tmux_terminate_ettun_session() {
+  local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
+  local digest=$6 evidence=$7 attempts=$8 delay=$9 verify_status scope leader
+  local sid session_status
+
+  _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+    "$generation" "$digest" || {
+    printf 'fwdports: generation no longer authorizes cleanup\n' >&2
+    return 74
+  }
+  if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
+    "$digest" "$evidence"; then
+    verify_status=0
+  else
+    verify_status=$?
+  fi
+  if [[ $verify_status -ne 0 ]]; then
+    if [[ $verify_status -eq 1 ]]; then
+      if _fwdports_wait_recorded_session_empty "$generation" "$digest" \
+        "$evidence" "$attempts" "$delay"; then
+        _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+          "$generation" "$digest" || return 74
+        printf 'gone\n'
+        return 0
+      else
+        session_status=$?
+      fi
+      if [[ $session_status -eq 2 ]]; then
+        printf 'fwdports: cannot inspect the recorded process session\n' >&2
+        return 74
+      fi
+      printf 'fwdports: recorded leader is no longer live; its recorded session remains\n' \
+        >&2
+      return 74
+    fi
+    printf 'fwdports: pane ownership cannot be verified\n' >&2
+    return 74
+  fi
+
+  scope=$(_fwdports_verify_owned_session "$generation" "$digest" \
+    "$evidence") || return 74
+  IFS=$'\t' read -r leader sid _ <<<"$scope"
+  _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+    "$generation" "$digest" || return 74
+  # The pane leader is builtin-runner, which forwards one TERM to its direct
+  # ettun child. Signalling the shared group would also hit that child directly
+  # and could turn one graceful request into ettun's second-TERM force request.
+  kill -TERM -- "$leader" 2>/dev/null || {
+    if _fwdports_wait_session_empty \
+      "$sid" "$evidence" "$attempts" "$delay"; then
+      printf 'term\n'
+      return 0
+    fi
+    printf 'fwdports: TERM could not be delivered to the owned pane leader\n' >&2
+    return 74
+  }
+  if _fwdports_wait_session_empty "$sid" "$evidence" "$attempts" "$delay"; then
+    printf 'term\n'
+    return 0
+  else
+    session_status=$?
+  fi
+  if [[ $session_status -eq 2 ]]; then
+    printf 'fwdports: cannot inspect the recorded process session after TERM\n' \
+      >&2
+    return 74
+  fi
+
+  # Public ettun reserves a second TERM as its force-cleanup request. Keep the
+  # pane leader as the authenticated signal target: if that leader has already
+  # exited while another process group remains in its session, retain the
+  # generation rather than guessing that a survivor is still ours.
+  _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+    "$generation" "$digest" || return 74
+  if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
+    "$digest" "$evidence"; then
+    verify_status=0
+  else
+    verify_status=$?
+  fi
+  if [[ $verify_status -ne 0 ]]; then
+    if [[ $verify_status -eq 1 ]]; then
+      if _fwdports_wait_recorded_session_empty "$generation" "$digest" \
+        "$evidence" "$attempts" "$delay"; then
+        _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+          "$generation" "$digest" || return 74
+        printf 'term\n'
+        return 0
+      else
+        session_status=$?
+      fi
+      if [[ $session_status -eq 2 ]]; then
+        printf 'fwdports: cannot inspect the recorded process session before second TERM\n' \
+          >&2
+      else
+        printf 'fwdports: recorded leader exited but its recorded session remains\n' \
+          >&2
+      fi
+      return 74
+    fi
+    printf 'fwdports: pane ownership changed before second TERM\n' >&2
+    return 74
+  fi
+  scope=$(_fwdports_verify_owned_session "$generation" "$digest" \
+    "$evidence") || return 74
+  IFS=$'\t' read -r leader sid _ <<<"$scope"
+  kill -TERM -- "$leader" 2>/dev/null || {
+    if _fwdports_wait_session_empty \
+      "$sid" "$evidence" "$attempts" "$delay"; then
+      printf 'term\n'
+      return 0
+    fi
+    printf 'fwdports: second TERM could not be delivered to the owned pane leader\n' \
+      >&2
+    return 74
+  }
+  if _fwdports_wait_session_empty "$sid" "$evidence" "$attempts" "$delay"; then
+    printf 'term\n'
+    return 0
+  else
+    session_status=$?
+  fi
+  if [[ $session_status -eq 2 ]]; then
+    printf 'fwdports: cannot inspect the recorded process session after second TERM\n' \
+      >&2
+  else
+    printf 'fwdports: recorded session remains after second TERM\n' >&2
+  fi
+  return 74
+}
+
 fwdports_tmux_terminate_pane() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 evidence=$7 attempts=$8 delay=$9 verify_status pgid
-  local group_status
+  local group_status strategy=${10:-group}
 
   [[ $attempts =~ ^[1-9][0-9]*$ &&
     $delay =~ ^(0|0\.[0-9]+|[1-9][0-9]*(\.[0-9]+)?)$ ]] || {
     printf 'fwdports: invalid process termination bound\n' >&2
     return 1
   }
+  case "$strategy" in
+    group) ;;
+    ettun-session)
+      _fwdports_tmux_terminate_ettun_session "$tmux_path" "$socket" \
+        "$root" "$pointer_kind" "$generation" "$digest" "$evidence" \
+        "$attempts" "$delay"
+      return $?
+      ;;
+    *)
+      printf 'fwdports: invalid process termination strategy\n' >&2
+      return 1
+      ;;
+  esac
   _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
     "$generation" "$digest" || {
     printf 'fwdports: generation no longer authorizes cleanup\n' >&2

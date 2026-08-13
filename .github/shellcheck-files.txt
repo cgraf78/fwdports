@@ -11,6 +11,8 @@ program	lib/fwdports/driver-api.sh
 program	lib/fwdports/drivers.sh
 program	lib/fwdports/et-gate.sh
 program	lib/fwdports/et-ssh-wrapper.sh
+program	lib/fwdports/ettun-et-gate.sh
+program	lib/fwdports/ettun-gate.sh
 program	lib/fwdports/health.sh
 program	lib/fwdports/runtime.sh
 program	lib/fwdports/ssh-gate.sh
@@ -26,6 +28,7 @@ program	test/config-test
 program	test/controller-test
 program	test/driver-api-test
 program	test/et-driver-test
+program	test/ettun-driver-test
 program	test/examples-test
 program	test/harness-test
 program	test/health-test

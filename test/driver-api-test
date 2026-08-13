@@ -71,7 +71,7 @@ trusted_discovery_case() {
     _pass "driver discovery: rejects a writable executable"
   fi
 
-  for source in ssh autossh et; do
+  for source in ssh autossh et ettun; do
     if fwdports_driver_discover "$config_root" "$source" >/dev/null 2>&1; then
       _fail "driver discovery: built-in $source cannot be shadowed"
     else

@@ -25,6 +25,10 @@ case "$kind" in
     [[ -f $runtime/et-gate && -x $runtime/et-gate &&
       ! -L $runtime/et-gate ]] || exit 70
     ;;
+  ettun)
+    [[ -f $runtime/ettun-gate && -x $runtime/ettun-gate &&
+      ! -L $runtime/ettun-gate ]] || exit 70
+    ;;
   *)
     printf 'fwdports: invalid built-in driver snapshot\n' >&2
     exit 70
@@ -123,11 +127,12 @@ case "$kind" in
     [[ $signal_status -eq 0 ]] || exit "$signal_status"
     exit "$status"
     ;;
-  et)
-    # ET owns reconnect behavior inside one foreground process. Adding the
+  et | ettun)
+    # ET and ettun own reconnect behavior inside one foreground process. Adding the
     # direct-SSH retry loop here would create competing policies and could
     # repeatedly prompt for authentication after a deterministic ET failure.
-    "$runtime/et-gate" &
+    gate=$runtime/$kind-gate
+    "$gate" &
     child=$!
     wait "$child"
     status=$?

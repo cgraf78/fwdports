@@ -456,6 +456,17 @@ duplicate_profile_local_ports_case() {
     "$status"
   _assert_contains "profile local ports: SSH/ET diagnostic names duplicate" \
     "local forward port 8080 is claimed more than once" "$(<"$error")"
+
+  sed $'s/second\tautossh/second\tettun/' "$manifest" \
+    >"$tmp/ettun-manifest"
+  set +e
+  fwdports_builtin_validate_profile_ports "$tmp/ettun-manifest" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "profile local ports: SSH/ettun duplicate is rejected" 1 \
+    "$status"
+  _assert_contains "profile local ports: SSH/ettun diagnostic names duplicate" \
+    "local forward port 8080 is claimed more than once" "$(<"$error")"
 }
 
 run_case resolve-executable resolve_executable_case

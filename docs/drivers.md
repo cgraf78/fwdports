@@ -2,7 +2,7 @@
 
 External drivers are trusted, self-contained executable files in
 `${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/drivers.d/`. A driver name is a
-restricted identifier. The built-in names `ssh`, `autossh`, and `et` are
+restricted identifier. The built-in names `ssh`, `autossh`, `et`, and `ettun` are
 reserved and cannot be shadowed.
 
 Core validates and copies the exact executable into the stable generation

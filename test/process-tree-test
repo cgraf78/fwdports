@@ -33,6 +33,43 @@ file_mode() {
   fi
 }
 
+stat_identity() {
+  local path=$1 output
+
+  if output=$(LC_ALL=C stat -c '%u %a %d %i %s %Y' -- "$path" \
+    2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  LC_ALL=C stat -f '%u %Lp %d %i %z %m' "$path"
+}
+
+write_session_enumerator_runtime() {
+  local runtime=$1 python_path=$2 record owner mode device inode size mtime
+  local python_digest helper_record helper_owner helper_mode helper_device
+  local helper_inode helper_size helper_mtime helper_digest
+
+  cp "$ROOT/lib/fwdports/session-enumerator.py" \
+    "$runtime/session-enumerator.py" || return 1
+  chmod 0600 "$runtime/session-enumerator.py" || return 1
+  record=$(stat_identity "$python_path") || return 1
+  read -r owner mode device inode size mtime <<<"$record"
+  python_digest=$(_fwdports_runtime_sha256_file "$python_path") || return 1
+  helper_record=$(stat_identity "$runtime/session-enumerator.py") || return 1
+  read -r helper_owner helper_mode helper_device helper_inode helper_size \
+    helper_mtime <<<"$helper_record"
+  helper_digest=$(_fwdports_runtime_sha256_file \
+    "$runtime/session-enumerator.py") || return 1
+  printf '%s\n' \
+    $'path\t'"$python_path" \
+    $'identity\t'"$owner:$mode:$device:$inode:$size:$mtime" \
+    $'digest\t'"$python_digest" \
+    $'helper-identity\t'"$helper_owner:$helper_mode:$helper_device:$helper_inode:$helper_size:$helper_mtime" \
+    $'helper-digest\t'"$helper_digest" \
+    >"$runtime/session-python" || return 1
+  chmod 0600 "$runtime/session-python"
+}
+
 wait_for_file() {
   local path=$1 attempts=0
   while [[ ! -s "$path" && $attempts -lt 200 ]]; do
@@ -57,8 +94,28 @@ kill_test_server() {
     kill-server 2>/dev/null || true
 }
 
+darwin_session_snapshot_fixture() {
+  local uid
+  uid=$(id -u) || return 1
+  printf '%s %s %s %s S\n' \
+    "$uid" "$PROC_LEADER" "$PROC_PGID" "${PROC_TTY#/dev/}"
+  printf '%s %s %s ? S\n' "$uid" "$PROC_CHILD" "$PROC_CHILD"
+}
+
+darwin_session_ps_fixture() {
+  local arg
+  for arg in "$@"; do
+    if [[ $arg == ruid= ]]; then
+      darwin_session_snapshot_fixture
+      return
+    fi
+  done
+  command ps "$@"
+}
+
 termination_fixture() {
   local tmp=$1 mode=$2 home state source start record
+  local driver=ssh graceful_delay='' python_path
   home=$tmp/home
   state=$tmp/state
   source=$tmp/resolved-profile
@@ -69,10 +126,13 @@ termination_fixture() {
   PROC_SCRIPT=$tmp/process-tree
   mkdir -p "$home" "$state"
   chmod 0700 "$home" "$state"
+  case "$mode" in
+    ettun-runner-graceful | ettun-runner-force) driver=ettun ;;
+  esac
   printf '%s\n' \
     $'version\t1' \
     $'profile\tdemo' \
-    $'leg\tweb\tssh' \
+    $'leg\tweb\t'"$driver" \
     $'set\tweb\thost\tshell.example.com' \
     $'set\tweb\tlocal-forward\t127.0.0.1:8080:127.0.0.1:80' \
     >"$source"
@@ -116,21 +176,129 @@ termination_fixture() {
         'while :; do sleep 0.02; done' \
         >"$PROC_SCRIPT"
       ;;
+    ettun-force)
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -m' \
+        'ids=$1; leader_marker=$2' \
+        'worker() {' \
+        '  trap '\'''\'' TERM HUP' \
+        '  while :; do sleep 0.02; done' \
+        '}' \
+        'worker &' \
+        'child=$!' \
+        'terms=0' \
+        'on_term() {' \
+        '  terms=$((terms + 1))' \
+        '  printf "%s\\n" "$terms" >"$leader_marker"' \
+        '  if [[ $terms -ge 2 ]]; then' \
+        '    kill -KILL -- "-$child" 2>/dev/null || true' \
+        '    wait "$child" 2>/dev/null || true' \
+        '    exit 0' \
+        '  fi' \
+        '}' \
+        'trap on_term TERM' \
+        'trap '\'''\'' HUP' \
+        'printf "%s %s\\n" "$$" "$child" >"$ids"' \
+        'while :; do sleep 0.02; done' \
+        >"$PROC_SCRIPT"
+      ;;
+    ettun-leak)
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -m' \
+        'ids=$1; leader_marker=$2' \
+        'worker() {' \
+        '  trap '\'''\'' TERM HUP' \
+        '  while :; do sleep 0.02; done' \
+        '}' \
+        'worker &' \
+        'child=$!' \
+        'trap '\''printf "term\\n" >"$leader_marker"; exit 0'\'' TERM' \
+        'trap '\'''\'' HUP' \
+        'printf "%s %s\\n" "$$" "$child" >"$ids"' \
+        'while :; do sleep 0.02; done' \
+        >"$PROC_SCRIPT"
+      ;;
+    ettun-runner-graceful | ettun-runner-force)
+      PROC_SCRIPT=$ROOT/lib/fwdports/builtin-runner.sh
+      PROC_GATE=$PROC_GENERATION/legs/web/ettun-gate
+      if [[ $mode == ettun-runner-graceful ]]; then
+        graceful_delay=0.02
+      else
+        graceful_delay=10
+      fi
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -u' \
+        'set -m' \
+        'worker() {' \
+        '  trap '\'''\'' TERM HUP' \
+        '  while :; do sleep 0.02; done' \
+        '}' \
+        'worker &' \
+        'child=$!' \
+        'force_stop() {' \
+        '  trap '\'''\'' TERM HUP' \
+        '  printf "2\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
+        '  kill -KILL -- "-$child" 2>/dev/null || true' \
+        '  wait "$child" 2>/dev/null || true' \
+        '  exit 143' \
+        '}' \
+        'graceful_stop() {' \
+        '  printf "1\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
+        '  trap force_stop TERM' \
+        '  sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"' \
+        '  kill -KILL -- "-$child" 2>/dev/null || true' \
+        '  wait "$child" 2>/dev/null || true' \
+        '  exit 143' \
+        '}' \
+        'trap graceful_stop TERM' \
+        'trap force_stop HUP INT' \
+        'printf "%s %s\\n" "$$" "$child" >"$FWDPORTS_TEST_PROC_IDS"' \
+        'while :; do sleep 0.02; done' \
+        >"$PROC_GATE"
+      chmod 0700 "$PROC_GATE"
+      printf '%s\n' ettun >"$PROC_GENERATION/legs/web/driver-kind"
+      chmod 0600 "$PROC_GENERATION/legs/web/driver-kind"
+      ;;
     *) return 1 ;;
   esac
-  chmod 0700 "$PROC_SCRIPT"
-  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$PROC_SOCKET" \
-    fwdports "${PROC_GENERATION##*/}" "$tmp" "$PROC_SCRIPT" "$PROC_IDS" \
-    "$PROC_LEADER_MARKER" "$PROC_CHILD_MARKER") || return 1
+  case "$mode" in
+    ettun-*)
+      python_path=$(python3 -c \
+        'import os, sys; print(os.path.realpath(sys.executable))') || return 1
+      write_session_enumerator_runtime \
+        "$PROC_GENERATION/legs/web" "$python_path" || return 1
+      ;;
+  esac
+  if [[ $mode == ettun-runner-graceful || $mode == ettun-runner-force ]]; then
+    record=$(fwdports_tmux_create_session "$TMUX_BIN" "$PROC_SOCKET" \
+      fwdports "${PROC_GENERATION##*/}" "$tmp" env \
+      "FWDPORTS_TEST_PROC_IDS=$PROC_IDS" \
+      "FWDPORTS_TEST_ENGINE_MARKER=$PROC_LEADER_MARKER" \
+      "FWDPORTS_TEST_GRACEFUL_DELAY=$graceful_delay" \
+      "$PROC_SCRIPT" "$PROC_GENERATION/legs/web") || return 1
+  else
+    chmod 0700 "$PROC_SCRIPT"
+    record=$(fwdports_tmux_create_session "$TMUX_BIN" "$PROC_SOCKET" \
+      fwdports "${PROC_GENERATION##*/}" "$tmp" "$PROC_SCRIPT" "$PROC_IDS" \
+      "$PROC_LEADER_MARKER" "$PROC_CHILD_MARKER") || return 1
+  fi
   IFS=$'\t' read -r PROC_SESSION PROC_PANE <<<"$record"
   wait_for_file "$PROC_IDS" || return 1
-  read -r PROC_LEADER PROC_CHILD <"$PROC_IDS"
+  if [[ $mode == ettun-runner-graceful || $mode == ettun-runner-force ]]; then
+    read -r PROC_ENGINE PROC_CHILD <"$PROC_IDS"
+  else
+    read -r PROC_LEADER PROC_CHILD <"$PROC_IDS"
+  fi
   fwdports_tmux_record_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_SESSION" \
     "$PROC_PANE" "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" ||
     return 1
   record=$(_fwdports_pane_evidence_read "$PROC_GENERATION" "$PROC_DIGEST" \
     "$PROC_EVIDENCE") || return 1
-  IFS=$'\t' read -r _ _ _ _ _ _ PROC_PGID _ _ <<<"$record"
+  IFS=$'\t' read -r _ _ PROC_LEADER _ PROC_TTY PROC_SID PROC_PGID _ _ \
+    <<<"$record"
   start=$(_fwdports_process_start_identity "$$")
   fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" running running \
     "$$" "$start" none || return 1
@@ -385,6 +553,602 @@ leader_missing_case() {
   kill_test_server "$PROC_SOCKET"
 }
 
+ettun_session_reap_handoff_case() {
+  local tmp rewritten count output error status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-leak || return 1
+  rewritten=$tmp/pane-rewritten
+  count=$tmp/count
+  output=$tmp/output
+  error=$tmp/error
+  printf '0\n' >"$count"
+  while IFS=$'\t' read -r key value; do
+    if [[ $key == leader-pid ]]; then
+      value=99999999
+    fi
+    printf '%s\t%s\n' "$key" "$value"
+  done <"$PROC_EVIDENCE" >"$rewritten"
+  chmod 0600 "$rewritten"
+  mv -f -- "$rewritten" "$PROC_EVIDENCE"
+
+  set +e
+  (
+    fwdports_tmux_verify_pane() { return 1; }
+    _fwdports_process_session_records() {
+      local current
+      current=$(<"$count")
+      current=$((current + 1))
+      printf '%s\n' "$current" >"$count"
+      [[ $current -gt 1 ]] || {
+        printf '99999998\t99999998\t?\tZ\n'
+        return 0
+      }
+      return 1
+    }
+    fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" \
+      "$PROC_ROOT" active "$PROC_GENERATION" "$PROC_DIGEST" \
+      "$PROC_EVIDENCE" 3 0 ettun-session >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+
+  _assert_exit \
+    "ettun session reap handoff: transient zombie cleanup succeeds" 0 \
+    "$status"
+  _assert_eq "ettun session reap handoff: reports an already-gone pane" \
+    gone "$(<"$output")"
+  _assert_eq \
+    "ettun session reap handoff: confirms the zombie-only snapshot twice" \
+    2 "$(<"$count")"
+  _assert_eq "ettun session reap handoff: emits no diagnostic" "" \
+    "$(<"$error")"
+
+  kill -TERM "$PROC_LEADER" 2>/dev/null || true
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  wait_for_process_exit "$PROC_LEADER" 100 0.01 || true
+  wait_for_process_exit "$PROC_CHILD" 100 0.01 || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_session_force_stop_case() {
+  local tmp output error status worker_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    20 0.02 ettun-session >"$output" 2>"$error"
+  status=$?
+  set -e
+  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+
+  _assert_exit "ettun session cleanup: second TERM completes shutdown" 0 \
+    "$status"
+  _assert_eq "ettun session cleanup: leader receives both TERM stages" 2 \
+    "$(<"$PROC_LEADER_MARKER")"
+  _assert_eq "ettun session cleanup: leaves no separately grouped worker" 0 \
+    "$worker_alive"
+  _assert_eq "ettun session cleanup: has no diagnostic" "" \
+    "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_session_signal_target_case() {
+  local tmp output error signals status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+  signals=$tmp/signals
+
+  set +e
+  (
+    kill() {
+      printf '%s\n' "$*" >>"$FWDPORTS_TEST_SIGNALS"
+      builtin kill "$@"
+    }
+    FWDPORTS_TEST_SIGNALS=$signals \
+      fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" \
+      "$PROC_ROOT" active "$PROC_GENERATION" "$PROC_DIGEST" \
+      "$PROC_EVIDENCE" 20 0.02 ettun-session >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+
+  _assert_exit "ettun session signal: cleanup succeeds" 0 "$status"
+  _assert_eq "ettun session signal: each TERM targets only the pane leader" \
+    $'-TERM -- '"$PROC_LEADER"$'\n-TERM -- '"$PROC_LEADER" \
+    "$(<"$signals")"
+  _assert_not_contains \
+    "ettun session signal: no TERM is duplicated across the runner group" \
+    "-$PROC_PGID" "$(<"$signals")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_session_getsid_scope_case() {
+  local tmp output error status
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  (
+    _fwdports_process_session_records() {
+      [[ $1 == "$PROC_LEADER" && $2 == "$PROC_EVIDENCE" ]] || return 2
+      printf '%s\t%s\t%s\tS\n' \
+        "$PROC_LEADER" "$PROC_PGID" "$PROC_TTY"
+      printf '99999\t99999\t??\tS\n'
+    }
+    _fwdports_verify_owned_session "$PROC_GENERATION" "$PROC_DIGEST" \
+      "$PROC_EVIDENCE" >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+
+  _assert_exit "ettun getsid session: accepts a member without a tty" 0 \
+    "$status"
+  _assert_eq "ettun getsid session: returns the authenticated scope" \
+    "$PROC_LEADER"$'\t'"$PROC_LEADER"$'\t'"$PROC_PGID" "$(<"$output")"
+  _assert_eq "ettun getsid session: has no tty-filter diagnostic" "" \
+    "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+darwin_session_enumerator_case() {
+  local tmp fake_bin output status wanted_sid test_pid test_pgid
+  local python_path test_uid foreign_uid snapshot
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  output=$tmp/output
+  python_path=$(python3 -c \
+    'import os, sys; print(os.path.realpath(sys.executable))') || return 1
+  test_pid=$$
+  test_uid=$(id -u) || return 1
+  if [[ $test_uid == 0 ]]; then foreign_uid=1; else foreign_uid=0; fi
+  wanted_sid=$("$python_path" -c \
+    'import os, sys; print(os.getsid(int(sys.argv[1])))' \
+    "$test_pid") || return 1
+  test_pgid=$("$python_path" -c \
+    'import os, sys; print(os.getpgid(int(sys.argv[1])))' \
+    "$test_pid") || return 1
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s 1 1 ?? Ss\n%s 99999999 99999999 ?? S\n%s %s %s ttys001 S\n" "$FWDPORTS_TEST_FOREIGN_UID" "$FWDPORTS_TEST_UID" "$FWDPORTS_TEST_UID" "$FWDPORTS_TEST_PID" "$FWDPORTS_TEST_PGID"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+  snapshot=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_UID=$test_uid \
+    FWDPORTS_TEST_FOREIGN_UID=$foreign_uid FWDPORTS_TEST_PID=$test_pid \
+    FWDPORTS_TEST_PGID=$test_pgid ps -e) || return 1
+
+  set +e
+  "$python_path" "$ROOT/lib/fwdports/session-enumerator.py" "$wanted_sid" \
+    <<<"$snapshot" \
+    >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "Darwin session enumeration: getsid selector succeeds" 0 \
+    "$status"
+  _assert_eq \
+    "Darwin session enumeration: tolerates ESRCH and excludes another UID" \
+    "$test_pid"$'\t'"$test_pgid"$'\t'"ttys001"$'\tS' "$(<"$output")"
+}
+
+session_enumerator_probe_case() {
+  local tmp output error status python_path
+  tmp=$(_tmpdir) || return 1
+  output=$tmp/output
+  error=$tmp/error
+  python_path=$(command -v python3) || return 1
+
+  set +e
+  "$python_path" -I -S -B \
+    "$ROOT/lib/fwdports/session-enumerator.py" --probe \
+    >"$output" 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "session enumerator probe: setsid child is queried and reaped" \
+    0 "$status"
+  _assert_eq "session enumerator probe: emits no data" "" "$(<"$output")"
+  _assert_eq "session enumerator probe: emits no diagnostic" "" \
+    "$(<"$error")"
+
+  set +e
+  "$python_path" -I -S -B "$TEST_DIR/session-enumerator-test.py" \
+    "$ROOT/lib/fwdports/session-enumerator.py" >"$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit \
+    "session enumerator probe: child exits when its owner is interrupted" \
+    0 "$status"
+  _assert_eq "session enumerator parent-death test: emits no data" "" \
+    "$(<"$output")"
+  _assert_eq \
+    "session enumerator parent-death test: emits no diagnostic" "" \
+    "$(<"$error")"
+}
+
+session_enumerator_integrity_case() {
+  local tmp runtime evidence output status python_path wrapper
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  evidence=$runtime/pane
+  output=$tmp/output
+  wrapper=$tmp/python3
+  python_path=$(python3 -c \
+    'import os, sys; print(os.path.realpath(sys.executable))') || return 1
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'exec "$FWDPORTS_TEST_REAL_PYTHON" "$@"' >"$wrapper"
+  chmod 0700 "$wrapper"
+  FWDPORTS_TEST_REAL_PYTHON=$python_path \
+    write_session_enumerator_runtime "$runtime" "$wrapper" || return 1
+
+  set +e
+  FWDPORTS_TEST_REAL_PYTHON=$python_path \
+    _fwdports_process_session_runtime "$evidence" >"$output"
+  status=$?
+  set -e
+  _assert_exit "session enumerator integrity: authentic runtime resolves" \
+    0 "$status"
+
+  printf '%s\n' '# drift' >>"$wrapper"
+  set +e
+  FWDPORTS_TEST_REAL_PYTHON=$python_path \
+    _fwdports_process_session_runtime "$evidence" >"$output"
+  status=$?
+  set -e
+  _assert_exit \
+    "session enumerator integrity: interpreter replacement fails closed" \
+    2 "$status"
+
+  write_session_enumerator_runtime "$runtime" "$wrapper" || return 1
+  printf '%s\n' '# drift' >>"$runtime/session-enumerator.py"
+  set +e
+  _fwdports_process_session_runtime "$evidence" >"$output"
+  status=$?
+  set -e
+  _assert_exit \
+    "session enumerator integrity: helper replacement fails closed" \
+    2 "$status"
+}
+
+darwin_recorded_sid_case() {
+  local tmp rewritten output error status session_arg
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-force || return 1
+  rewritten=$tmp/pane-rewritten
+  output=$tmp/output
+  error=$tmp/error
+  session_arg=$tmp/session-arg
+
+  while IFS=$'\t' read -r key value; do
+    if [[ $key == sid ]]; then
+      value=0
+    fi
+    printf '%s\t%s\n' "$key" "$value"
+  done <"$PROC_EVIDENCE" >"$rewritten"
+  chmod 0600 "$rewritten"
+  mv -f -- "$rewritten" "$PROC_EVIDENCE"
+
+  set +e
+  _fwdports_verify_owned_session "$PROC_GENERATION" "$PROC_DIGEST" \
+    "$PROC_EVIDENCE" >"$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "Darwin recorded sid: kernel session verification succeeds" 0 \
+    "$status"
+  _assert_eq "Darwin recorded sid: scope uses authenticated leader PID" \
+    "$PROC_LEADER"$'\t'"$PROC_LEADER"$'\t'"$PROC_PGID" \
+    "$(<"$output")"
+  _assert_eq "Darwin recorded sid: verification is quiet" "" "$(<"$error")"
+
+  set +e
+  (
+    _fwdports_process_session_live_records() {
+      printf '%s\t%s\n' "$1" "$2" >"$session_arg"
+      return 1
+    }
+    _fwdports_recorded_session_is_empty "$PROC_GENERATION" "$PROC_DIGEST" \
+      "$PROC_EVIDENCE"
+  )
+  status=$?
+  set -e
+  _assert_exit "Darwin recorded sid: empty-session check succeeds" 0 "$status"
+  _assert_eq "Darwin recorded sid: empty-session check uses evidence" \
+    "$PROC_LEADER"$'\t'"$PROC_EVIDENCE" "$(<"$session_arg")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+session_zombie_case() {
+  local tmp count output status
+  tmp=$(_tmpdir) || return 1
+  count=$tmp/count
+  output=$tmp/output
+  printf '0\n' >"$count"
+
+  set +e
+  (
+    _fwdports_process_session_records() {
+      local current
+      current=$(<"$count")
+      printf '%s\n' "$((current + 1))" >"$count"
+      printf '%s\t%s\t??\tZ\n' "$$" "$$"
+    }
+    _fwdports_process_session_live_records "$$" /fixture/evidence \
+      >"$output"
+  )
+  status=$?
+  set -e
+
+  _assert_exit "session zombie: zombie-only session is already empty" 1 \
+    "$status"
+  _assert_eq "session zombie: publishes no live member" "" "$(<"$output")"
+  _assert_eq "session zombie: emptiness requires two stable snapshots" 2 \
+    "$(<"$count")"
+}
+
+session_mixed_live_case() {
+  local tmp output status
+  tmp=$(_tmpdir) || return 1
+  output=$tmp/output
+
+  set +e
+  (
+    _fwdports_process_session_records() {
+      printf '4242\t4242\t??\tZ\n4243\t4243\t??\tS\n'
+    }
+    _fwdports_process_session_live_records 4242 /fixture/evidence >"$output"
+  )
+  status=$?
+  set -e
+
+  _assert_exit "mixed session: live member keeps the session active" 0 \
+    "$status"
+  _assert_eq "mixed session: publishes only the live member" \
+    $'4243\t4243\t??\tS' "$(<"$output")"
+}
+
+session_empty_stability_case() {
+  local tmp count output status
+  tmp=$(_tmpdir) || return 1
+  count=$tmp/count
+  output=$tmp/output
+  printf '0\n' >"$count"
+
+  set +e
+  (
+    _fwdports_process_session_records() {
+      local current
+      current=$(<"$count")
+      current=$((current + 1))
+      printf '%s\n' "$current" >"$count"
+      [[ $current -gt 1 ]] || return 1
+      printf '4243\t4243\t??\tS\n'
+    }
+    _fwdports_process_session_live_records 99999999 /fixture/evidence \
+      >"$output"
+  )
+  status=$?
+  set -e
+  _assert_exit "session empty stability: second-scan handoff remains live" 0 \
+    "$status"
+  _assert_eq "session empty stability: returns the appeared member" \
+    $'4243\t4243\t??\tS' "$(<"$output")"
+  _assert_eq "session empty stability: handoff uses two scans" 2 "$(<"$count")"
+
+  printf '0\n' >"$count"
+  set +e
+  (
+    _fwdports_process_session_records() {
+      local current
+      current=$(<"$count")
+      printf '%s\n' "$((current + 1))" >"$count"
+      return 1
+    }
+    _fwdports_process_session_live_records 99999999 /fixture/evidence \
+      >"$output"
+  )
+  status=$?
+  set -e
+  _assert_exit "session empty stability: two empty scans prove absence" 1 \
+    "$status"
+  _assert_eq "session empty stability: absence uses exactly two scans" 2 \
+    "$(<"$count")"
+}
+
+session_enumerator_failure_case() {
+  local tmp fake_bin runtime evidence output status python_path
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  runtime=$tmp/runtime
+  evidence=$runtime/pane
+  output=$tmp/output
+  python_path=$(python3 -c \
+    'import os, sys; print(os.path.realpath(sys.executable))') || return 1
+  mkdir -p "$fake_bin" "$runtime"
+  chmod 0700 "$runtime"
+  write_session_enumerator_runtime "$runtime" "$python_path"
+
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 2' >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+  set +e
+  (
+    _fwdports_tmux_platform_is_darwin() { return 0; }
+    PATH="$fake_bin:/usr/bin:/bin" \
+      _fwdports_process_session_records 4242 "$evidence" \
+      >"$output" 2>/dev/null
+  )
+  status=$?
+  set -e
+  _assert_exit "session enumeration failure: is not an empty session" 2 \
+    "$status"
+  _assert_eq "session enumeration failure: publishes no partial members" \
+    "" "$(<"$output")"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "malformed row\n"' >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+  set +e
+  (
+    _fwdports_tmux_platform_is_darwin() { return 0; }
+    PATH="$fake_bin:/usr/bin:/bin" \
+      _fwdports_process_session_records 4242 "$evidence" \
+      >"$output" 2>/dev/null
+  )
+  status=$?
+  set -e
+  _assert_exit "malformed session enumeration: fails closed" 2 "$status"
+  _assert_eq "malformed session enumeration: publishes no partial members" \
+    "" "$(<"$output")"
+}
+
+ettun_runner_graceful_case() {
+  local tmp output error status worker_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-runner-graceful || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    20 0.02 ettun-session >"$output" 2>"$error"
+  status=$?
+  set -e
+  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+
+  _assert_exit "ettun runner graceful stop: cleanup succeeds" 0 "$status"
+  _assert_eq \
+    "ettun runner graceful stop: first stage remains a graceful request" \
+    1 "$(<"$PROC_LEADER_MARKER")"
+  _assert_eq "ettun runner graceful stop: worker is reaped" 0 \
+    "$worker_alive"
+  _assert_eq "ettun runner graceful stop: has no diagnostic" "" \
+    "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_runner_force_case() {
+  local tmp output error status worker_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-runner-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    20 0.02 ettun-session >"$output" 2>"$error"
+  status=$?
+  set -e
+  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+
+  _assert_exit "ettun runner force stop: cleanup succeeds" 0 "$status"
+  _assert_eq "ettun runner force stop: second stage reaches ettun once" 2 \
+    "$(<"$PROC_LEADER_MARKER")"
+  _assert_eq "ettun runner force stop: worker is reaped" 0 "$worker_alive"
+  _assert_eq "ettun runner force stop: has no diagnostic" "" \
+    "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_session_survivor_case() {
+  local tmp output error status worker_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-leak || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    3 0.02 ettun-session >"$output" 2>"$error"
+  status=$?
+  set -e
+  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+
+  _assert_exit "ettun session cleanup: surviving worker fails closed" 74 \
+    "$status"
+  _assert_eq "ettun session cleanup: does not guess at survivor ownership" 1 \
+    "$worker_alive"
+  _assert_contains "ettun session cleanup: retained state is actionable" \
+    "recorded session remains" "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+darwin_ettun_session_survivor_case() {
+  local tmp output error records status records_status worker_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-leak || return 1
+  output=$tmp/output
+  error=$tmp/error
+  records=$tmp/records
+
+  set +e
+  (
+    _fwdports_tmux_platform_is_darwin() { return 0; }
+    if [[ $OSTYPE != darwin* ]]; then
+      # Non-Darwin ps dialects need not implement Darwin's output contract.
+      # Keep actual kernel PIDs and getsid calls while fixing only the snapshot.
+      ps() { darwin_session_ps_fixture "$@"; }
+    fi
+    fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+      active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+      3 0.02 ettun-session >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+  command kill -0 -- "$PROC_CHILD" 2>/dev/null && worker_alive=1
+  set +e
+  (
+    _fwdports_tmux_platform_is_darwin() { return 0; }
+    if [[ $OSTYPE != darwin* ]]; then
+      ps() { darwin_session_ps_fixture "$@"; }
+    fi
+    _fwdports_process_session_records "$PROC_LEADER" "$PROC_EVIDENCE" \
+      >"$records"
+  )
+  records_status=$?
+  set -e
+
+  _assert_exit "Darwin getsid cleanup: surviving worker fails closed" 74 \
+    "$status"
+  _assert_eq "Darwin getsid cleanup: detached worker remains observable" 1 \
+    "$worker_alive"
+  _assert_exit "Darwin getsid cleanup: session scan succeeds" 0 \
+    "$records_status"
+  _assert_contains "Darwin getsid cleanup: finds the original-session worker" \
+    "$PROC_CHILD"$'\t'"$PROC_CHILD"$'\t?' "$(<"$records")"
+  _assert_contains "Darwin getsid cleanup: retained state is actionable" \
+    "recorded session remains" "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
 failed_process_enumeration_case() {
   local tmp fake_bin output status
   tmp=$(_tmpdir) || return 1
@@ -518,8 +1282,24 @@ run_case already-exited-owned-group already_exited_owned_group_case
 run_case exited-before-escalation exited_before_escalation_case
 run_case kill-escalation kill_escalation_case
 run_case leader-missing leader_missing_case
+run_case ettun-session-reap-handoff ettun_session_reap_handoff_case
+run_case ettun-session-force-stop ettun_session_force_stop_case
+run_case ettun-session-signal-target ettun_session_signal_target_case
+run_case ettun-session-getsid-scope ettun_session_getsid_scope_case
+run_case ettun-runner-graceful ettun_runner_graceful_case
+run_case ettun-runner-force ettun_runner_force_case
+run_case ettun-session-survivor ettun_session_survivor_case
+run_case darwin-ettun-session-survivor darwin_ettun_session_survivor_case
 run_case failed-process-enumeration failed_process_enumeration_case
 run_case malformed-process-enumeration malformed_process_enumeration_case
+run_case darwin-session-enumerator darwin_session_enumerator_case
+run_case session-enumerator-probe session_enumerator_probe_case
+run_case session-enumerator-integrity session_enumerator_integrity_case
+run_case darwin-recorded-sid darwin_recorded_sid_case
+run_case session-zombie session_zombie_case
+run_case session-mixed-live session_mixed_live_case
+run_case session-empty-stability session_empty_stability_case
+run_case session-enumerator-failure session_enumerator_failure_case
 run_case zombie-only-process-group zombie_only_process_group_case
 run_case mixed-live-process-group mixed_live_process_group_case
 run_case list-panes-failure list_panes_failure_case

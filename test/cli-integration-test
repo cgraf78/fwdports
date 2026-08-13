@@ -23,6 +23,8 @@ run_fwdports() {
     FWDPORTS_SSH_COMMAND=$CASE_SSH FWDPORTS_TEST_SSH_LOG=$CASE_SSH_LOG \
     FWDPORTS_AUTOSSH_COMMAND=$CASE_AUTOSSH \
     FWDPORTS_ET_COMMAND=$CASE_ET \
+    FWDPORTS_ETTUN_COMMAND=$CASE_ETTUN \
+    FWDPORTS_ETTUN_ET_COMMAND=$CASE_ET \
     FWDPORTS_TEST_ET_LOG=${FWDPORTS_TEST_ET_LOG:-} \
     FWDPORTS_TEST_PANE_TITLE=${FWDPORTS_TEST_PANE_TITLE:-} \
     FWDPORTS_TEST_SSH_ONESHOT=${FWDPORTS_TEST_SSH_ONESHOT:-} \
@@ -41,7 +43,9 @@ configured_health_case() {
   setup_case_root "$tmp"
   config=$CASE_CONFIG/fwdports/tunnels.conf
   output=$tmp/output
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$tmp/bin/nc"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ " $* " != *" -w 1 "* ]]' >"$tmp/bin/nc"
   chmod 0700 "$tmp/bin/nc"
   printf '%s\n' \
     'profile default' \
@@ -449,6 +453,7 @@ setup_case_root() {
   CASE_SSH=$tmp/bin/ssh
   CASE_AUTOSSH=$tmp/bin/autossh
   CASE_ET=$tmp/bin/et
+  CASE_ETTUN=$tmp/bin/ettun
   CASE_SSH_LOG=$tmp/ssh.log
   mkdir -p "$CASE_HOME" "$CASE_CONFIG/fwdports" "$CASE_STATE" \
     "$CASE_RUNTIME" "$tmp/bin"
@@ -467,6 +472,261 @@ setup_case_root() {
     'trap "exit 0" INT TERM HUP' \
     'while :; do sleep 1; done' >"$CASE_SSH"
   chmod 0700 "$CASE_SSH"
+}
+
+later_builtin_dependency_failure_case() {
+  local tmp config output
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg stable' \
+    'set stable host shell.example.com' \
+    'set stable remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'leg relay ettun' \
+    'set relay host gateway.example.net' \
+    'set relay local-forward 127.0.0.1:18080:target.example.net:3389' \
+    'check relay loopback 18080 relay' >"$config"
+  chmod 0600 "$config"
+
+  run_fwdports "$output" start
+
+  if [[ $COMMAND_STATUS -ne 0 ]]; then
+    _pass "built-in dependency transaction: missing later dependency fails start"
+  else
+    _fail "built-in dependency transaction: missing later dependency fails start"
+  fi
+  _assert_contains "built-in dependency transaction: diagnostic names ettun" \
+    "ettun executable is not available" "$COMMAND_OUTPUT"
+  _assert_not_exists "built-in dependency transaction: earlier SSH leg never launches" \
+    "$CASE_SSH_LOG"
+  _assert_not_exists "built-in dependency transaction: no tmux server starts" \
+    "$CASE_SOCKET"
+  _assert_not_exists "built-in dependency transaction: no active generation publishes" \
+    "$CASE_STATE/fwdports/active"
+  _assert_not_exists "built-in dependency transaction: no pending generation remains" \
+    "$CASE_STATE/fwdports/pending"
+}
+
+custom_adapter_dependency_failure_case() {
+  local tmp config output adapter
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  adapter=$tmp/bin/relay-adapter
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$CASE_ETTUN"
+  chmod 0700 "$CASE_ETTUN"
+  printf '%s\n' \
+    'profile default' \
+    'leg stable' \
+    'set stable host shell.example.com' \
+    'set stable remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'leg relay ettun' \
+    'set relay host gateway.example.net' \
+    'set relay transport relay-adapter' \
+    'set relay local-forward 127.0.0.1:18080:target.example.net:3389' \
+    'check relay loopback 18080 relay' >"$config"
+  chmod 0600 "$config"
+
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" start
+
+  if [[ $COMMAND_STATUS -ne 0 ]]; then
+    _pass "adapter dependency transaction: missing adapter fails start"
+  else
+    _fail "adapter dependency transaction: missing adapter fails start"
+  fi
+  _assert_contains "adapter dependency transaction: missing diagnostic names adapter" \
+    "transport adapter is not available" "$COMMAND_OUTPUT"
+  _assert_not_exists "adapter dependency transaction: earlier SSH leg never launches" \
+    "$CASE_SSH_LOG"
+  _assert_not_exists "adapter dependency transaction: no tmux server starts" \
+    "$CASE_SOCKET"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ ${1:-} != --fwdports-validate ]]' >"$adapter"
+  chmod 0700 "$adapter"
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" start
+
+  if [[ $COMMAND_STATUS -ne 0 ]]; then
+    _pass "adapter dependency transaction: nested validation fails start"
+  else
+    _fail "adapter dependency transaction: nested validation fails start"
+  fi
+  _assert_contains "adapter dependency transaction: validation diagnostic is actionable" \
+    "adapter dependency validation failed" "$COMMAND_OUTPUT"
+  _assert_not_exists "adapter dependency transaction: failed validation launches no SSH" \
+    "$CASE_SSH_LOG"
+  _assert_not_exists "adapter dependency transaction: failed validation starts no tmux" \
+    "$CASE_SOCKET"
+  _assert_not_exists "adapter dependency transaction: no active generation publishes" \
+    "$CASE_STATE/fwdports/active"
+  _assert_not_exists "adapter dependency transaction: no pending generation remains" \
+    "$CASE_STATE/fwdports/pending"
+}
+
+force_dependency_preflight_preserves_active_case() {
+  local driver tmp config output active_before active_after generation_nonce
+  local generation_before observed expected_diagnostic
+
+  for driver in ssh autossh et ettun; do
+    tmp=$(_tmpdir) || return 1
+    setup_case_root "$tmp"
+    config=$CASE_CONFIG/fwdports/tunnels.conf
+    output=$tmp/output
+    printf '%s\n' \
+      'profile default' \
+      'leg shell' \
+      'set shell host shell.example.com' \
+      'set shell remote-forward 127.0.0.1:19090:127.0.0.1:9090' >"$config"
+    chmod 0600 "$config"
+
+    run_fwdports "$output" start
+    _assert_exit "forced $driver preflight: stable generation starts" 0 \
+      "$COMMAND_STATUS"
+    active_before=$(<"$CASE_STATE/fwdports/active")
+    generation_nonce=$(LC_ALL=C sed -n 's/^generation\t//p' \
+      "$CASE_STATE/fwdports/active")
+    generation_before=$CASE_STATE/fwdports/generations/$generation_nonce
+
+    case "$driver" in
+      ssh)
+        CASE_SSH=$tmp/bin/missing-ssh
+        expected_diagnostic='OpenSSH executable is not available'
+        printf '%s\n' \
+          'profile default' \
+          'leg replacement ssh' \
+          'set replacement host shell.example.com' \
+          'set replacement remote-forward 127.0.0.1:19091:127.0.0.1:9091' \
+          >"$config"
+        ;;
+      autossh)
+        expected_diagnostic='autossh is not available'
+        printf '%s\n' \
+          'profile default' \
+          'leg replacement autossh' \
+          'set replacement host shell.example.com' \
+          'set replacement remote-forward 127.0.0.1:19091:127.0.0.1:9091' \
+          >"$config"
+        ;;
+      et)
+        expected_diagnostic='Eternal Terminal executable is not available'
+        printf '%s\n' \
+          'profile default' \
+          'leg replacement et' \
+          'set replacement host gateway.example.net' \
+          'set replacement remote-forward 127.0.0.1:19091:target.example.net:9091' \
+          >"$config"
+        ;;
+      ettun)
+        expected_diagnostic='ettun executable is not available'
+        printf '%s\n' \
+          'profile default' \
+          'leg replacement ettun' \
+          'set replacement host gateway.example.net' \
+          'set replacement local-forward 127.0.0.1:18080:target.example.net:3389' \
+          'check replacement loopback 18080 relay' >"$config"
+        ;;
+    esac
+    chmod 0600 "$config"
+
+    run_fwdports "$output" start --force
+    if [[ $COMMAND_STATUS -ne 0 ]]; then
+      _pass "forced $driver preflight: replacement fails"
+    else
+      _fail "forced $driver preflight: replacement fails"
+    fi
+    _assert_contains "forced $driver preflight: diagnostic names dependency" \
+      "$expected_diagnostic" "$COMMAND_OUTPUT"
+    active_after=
+    [[ ! -f $CASE_STATE/fwdports/active ]] ||
+      active_after=$(<"$CASE_STATE/fwdports/active")
+    _assert_eq "forced $driver preflight: active pointer is unchanged" \
+      "$active_before" "$active_after"
+    _assert_file "forced $driver preflight: active manifest remains" \
+      "$generation_before/manifest"
+    _assert_not_exists "forced $driver preflight: no candidate is pending" \
+      "$CASE_STATE/fwdports/pending"
+
+    run_fwdports "$output" status
+    observed=$COMMAND_OUTPUT
+    _assert_exit "forced $driver preflight: old generation remains observable" \
+      0 "$COMMAND_STATUS"
+    _assert_eq "forced $driver preflight: old transport remains live" \
+      live/unverified "$observed"
+
+    run_fwdports "$output" stop
+    _assert_exit "forced $driver preflight: cleanup succeeds" 0 \
+      "$COMMAND_STATUS"
+  done
+}
+
+stopping_recovery_precedes_dependency_preflight_case() {
+  local tmp config output generation_nonce generation digest
+  local controller_pid controller_start probe
+
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19090:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  run_fwdports "$output" start
+  _assert_exit "stopping recovery: initial generation starts" 0 \
+    "$COMMAND_STATUS"
+  generation_nonce=$(LC_ALL=C sed -n 's/^generation\t//p' \
+    "$CASE_STATE/fwdports/active")
+  digest=$(LC_ALL=C sed -n 's/^manifest-digest\t//p' \
+    "$CASE_STATE/fwdports/active")
+  generation=$CASE_STATE/fwdports/generations/$generation_nonce
+  controller_pid=$(LC_ALL=C sed -n 's/^controller-pid\t//p' \
+    "$generation/control")
+  controller_start=$(LC_ALL=C sed -n 's/^controller-start\t//p' \
+    "$generation/control")
+  probe=$(LC_ALL=C sed -n 's/^probe\t//p' "$generation/control")
+
+  bash -c \
+    'source "$1"; fwdports_control_write "$2" "$3" stopping stopped "$4" "$5" "$6"' \
+    _ "$ROOT/lib/fwdports/runtime.sh" "$generation" "$digest" \
+    "$controller_pid" "$controller_start" "$probe" || return 1
+
+  printf '%s\n' \
+    'profile default' \
+    'leg replacement ssh' \
+    'set replacement host replacement.example.net' \
+    'set replacement remote-forward 127.0.0.1:19091:127.0.0.1:9091' \
+    >"$config"
+  chmod 0600 "$config"
+  CASE_SSH=$tmp/bin/missing-ssh
+
+  run_fwdports "$output" start --force
+  if [[ $COMMAND_STATUS -ne 0 ]]; then
+    _pass "stopping recovery: missing replacement dependency still fails"
+  else
+    _fail "stopping recovery: missing replacement dependency still fails"
+  fi
+  _assert_contains "stopping recovery: dependency diagnostic is preserved" \
+    "OpenSSH executable is not available" "$COMMAND_OUTPUT"
+  _assert_not_exists "stopping recovery: removes old active pointer first" \
+    "$CASE_STATE/fwdports/active"
+  _assert_not_exists "stopping recovery: removes old generation first" \
+    "$generation"
+  _assert_not_exists "stopping recovery: publishes no replacement candidate" \
+    "$CASE_STATE/fwdports/pending"
 }
 
 stock_et_lifecycle_case() {
@@ -530,6 +790,84 @@ stock_et_lifecycle_case() {
     "$COMMAND_OUTPUT"
   run_fwdports "$output" stop
   _assert_exit "stock ET lifecycle: authenticated stop succeeds" 0 \
+    "$COMMAND_STATUS"
+}
+
+ettun_lifecycle_case() {
+  local tmp config output log generation index=0 observed=''
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  log=$tmp/ettun.log
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'if [[ ${1:-} == --help ]]; then printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2; exit 0; fi' \
+    '{' \
+    '  printf "ETTUN_ET=%s\nTMPDIR=%s\n" "${ETTUN_ET:-}" "${TMPDIR:-}"' \
+    '  printf "ARG=%s\n" "$@"' \
+    '} >"$FWDPORTS_TEST_ETTUN_LOG"' \
+    'trap "exit 0" HUP INT TERM' \
+    'while :; do sleep 0.02; done' >"$CASE_ETTUN"
+  chmod 0700 "$CASE_ETTUN"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "%s\n" --port --tunnel --reversetunnel --logdir --logtostdout --no-terminal --telemetry' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$CASE_ET"
+  chmod 0700 "$CASE_ET"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$tmp/bin/lsof"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ " $* " != *" -w 1 "* ]]' >"$tmp/bin/nc"
+  chmod 0700 "$tmp/bin/lsof" "$tmp/bin/nc"
+  printf '%s\n' \
+    'profile default' \
+    'leg relay ettun' \
+    'set relay host gateway.example.net' \
+    'set relay local-forward 127.0.0.1:18080:target.example.net:3389' \
+    'check relay loopback 18080 relay' >"$config"
+  chmod 0600 "$config"
+
+  PATH="$tmp/bin:$PATH" FWDPORTS_TEST_ETTUN_LOG=$log \
+    FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+    FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+    FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" start
+  _assert_exit "ettun lifecycle: profile starts" 0 "$COMMAND_STATUS"
+  _assert_eq "ettun lifecycle: summary names driver and declared route" \
+    $'fwdports: started profile default\nfwdports: forwards\n  relay [ettun] local 127.0.0.1:18080:target.example.net:3389' \
+    "$COMMAND_OUTPUT"
+  while [[ ! -s $log && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_contains "ettun lifecycle: receives the declared route" \
+    $'ARG=gateway.example.net\nARG=18080\nARG=target.example.net\nARG=3389' \
+    "$(<"$log")"
+  generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
+  _assert_contains "ettun lifecycle: receives the hardened ET dependency" \
+    "ETTUN_ET=$generation/legs/relay/ettun-et-gate" "$(<"$log")"
+  _assert_contains "ettun lifecycle: temp state stays in the generation" \
+    "TMPDIR=$generation/legs/relay/ettun-tmp" "$(<"$log")"
+
+  index=0
+  while [[ $index -lt 200 ]]; do
+    PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+      FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+      FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" status
+    observed=$COMMAND_OUTPUT
+    [[ $observed == healthy ]] && break
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_eq "ettun lifecycle: configured listener check becomes healthy" \
+    healthy "$observed"
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
+  _assert_exit "ettun lifecycle: authenticated stop succeeds" 0 \
     "$COMMAND_STATUS"
 }
 
@@ -688,10 +1026,18 @@ default_ssh_lifecycle_case() {
 
 run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case stock-et-lifecycle stock_et_lifecycle_case
+run_case ettun-lifecycle ettun_lifecycle_case
 run_case configured-health configured_health_case
 run_case tmux-observability tmux_observability_case
 run_case inspect-observability inspect_observability_case
 run_case inspect-builtin-backoff inspect_builtin_backoff_case
+run_case later-builtin-dependency-failure later_builtin_dependency_failure_case
+run_case custom-adapter-dependency-failure \
+  custom_adapter_dependency_failure_case
+run_case force-dependency-preflight-preserves-active \
+  force_dependency_preflight_preserves_active_case
+run_case stopping-recovery-precedes-dependency-preflight \
+  stopping_recovery_precedes_dependency_preflight_case
 run_case shared-external-driver shared_external_driver_case
 run_case symlink-config-target-override symlink_config_target_override_case
 run_case later-pane-failure-reaps-autossh \

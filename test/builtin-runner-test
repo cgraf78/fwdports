@@ -147,8 +147,34 @@ et_signal_case() {
   fi
 }
 
+ettun_no_retry_case() {
+  local tmp runtime calls status count
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  calls=$tmp/calls
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' ettun >"$runtime/driver-kind"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "call\n" >>"$FWDPORTS_TEST_CALLS"' \
+    'exit 23' >"$runtime/ettun-gate"
+  chmod 0700 "$runtime/ettun-gate"
+
+  set +e
+  FWDPORTS_TEST_CALLS=$calls "$RUNNER" "$runtime"
+  status=$?
+  set -e
+  count=0
+  [[ ! -f $calls ]] || count=$(wc -l <"$calls" | tr -d ' ')
+
+  _assert_exit "built-in ettun: foreground status is preserved" 23 "$status"
+  _assert_eq "built-in ettun: fwdports adds no retry loop" 1 "$count"
+}
+
 run_case retry retry_case
 run_case drift drift_case
 run_case et-no-retry et_no_retry_case
 run_case et-signal et_signal_case
+run_case ettun-no-retry ettun_no_retry_case
 _test_summary

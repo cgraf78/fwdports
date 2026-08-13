@@ -18,6 +18,12 @@ source "$ROOT/lib/fwdports/runtime.sh"
 # shellcheck source=../lib/fwdports/tmux.sh
 source "$ROOT/lib/fwdports/tmux.sh"
 
+TMUX_TEST_HOME=$(_tmpdir)/home
+TMUX_TEST_CONFIG=$TMUX_TEST_HOME/config
+mkdir -p "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
+chmod 0700 "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
+export HOME=$TMUX_TEST_HOME XDG_CONFIG_HOME=$TMUX_TEST_CONFIG
+
 file_mode() {
   local path=$1 mode
   if mode=$(stat -c '%a' -- "$path" 2>/dev/null); then

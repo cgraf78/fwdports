@@ -14,15 +14,30 @@ fwdports_backoff_for_failures() {
   printf '%s\n' "$value"
 }
 
+fwdports_health_probe_local_tcp() {
+  local host=$1 port=$2 nc_path
+
+  [[ -n $host && $port =~ ^[0-9]+$ ]] || return 64
+  nc_path=$(type -P -- nc 2>/dev/null) || {
+    printf 'unavailable (nc not installed)\n'
+    return 2
+  }
+  # OpenBSD nc on macOS and common Linux nc variants all accept this narrow
+  # connect-only form. No payload is sent, and the timeout bounds each
+  # point-in-time observation independently.
+  if "$nc_path" -z -w 5 "$host" "$port" >/dev/null 2>&1; then
+    printf 'passing\n'
+    return 0
+  fi
+  printf 'failing\n'
+  return 1
+}
+
 fwdports_health_probe() {
   local manifest=$1 kind leg probe_type host port label extra found=0
-  local failed=0 nc_path
+  local failed=0
 
   [[ -f $manifest && ! -L $manifest ]] || return 1
-  nc_path=$(type -P -- nc 2>/dev/null) || {
-    printf 'failing\n'
-    return 1
-  }
   while IFS=$'\t' read -r kind leg probe_type host port label extra ||
     [[ -n ${kind:-} ]]; do
     [[ $kind == check ]] || continue
@@ -33,12 +48,12 @@ fwdports_health_probe() {
     }
     case "$probe_type" in
       loopback | tcp) ;;
-      *) failed=1; continue ;;
+      *)
+        failed=1
+        continue
+        ;;
     esac
-    # OpenBSD nc on macOS and common Linux nc variants all accept this narrow
-    # connect-only form.  No payload is sent; endpoint health is intentionally
-    # distinct from merely observing a live tunnel process.
-    "$nc_path" -z -w 5 "$host" "$port" >/dev/null 2>&1 || failed=1
+    fwdports_health_probe_local_tcp "$host" "$port" >/dev/null || failed=1
     : "$leg" "$label"
   done <"$manifest"
   if [[ $found -eq 0 ]]; then

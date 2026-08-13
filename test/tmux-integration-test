@@ -19,6 +19,12 @@ source "$ROOT/lib/fwdports/tmux.sh"
 # shellcheck source=../lib/fwdports/core.sh
 source "$ROOT/lib/fwdports/core.sh"
 
+TMUX_TEST_HOME=$(_tmpdir)/home
+TMUX_TEST_CONFIG=$TMUX_TEST_HOME/config
+mkdir -p "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
+chmod 0700 "$TMUX_TEST_HOME" "$TMUX_TEST_CONFIG"
+export HOME=$TMUX_TEST_HOME XDG_CONFIG_HOME=$TMUX_TEST_CONFIG
+
 wait_for_file() {
   local path=$1 attempts=0
   while [[ ! -s "$path" && $attempts -lt 200 ]]; do
@@ -109,6 +115,279 @@ session_nonce_case() {
   kill_test_server "$socket"
 }
 
+user_config_case() {
+  local tmp home socket fixture output release record session_id pane_id
+  local mouse mode_keys marker destroy_unattached exit_empty exit_unattached
+  tmp=$(_tmpdir) || return 1
+  home=$tmp/home
+  socket=$tmp/tmux.sock
+  fixture=$tmp/wait
+  output=$tmp/started
+  release=$tmp/release
+  mkdir -p "$home"
+  chmod 0700 "$home"
+  printf '%s\n' \
+    'set-option -g mouse on' \
+    'set-window-option -g mode-keys vi' \
+    'set-option -g @fwdports-test-config loaded' \
+    'set-option -g destroy-unattached on' \
+    'set-option -s exit-empty off' \
+    'set-option -s exit-unattached on' \
+    >"$home/.tmux.conf"
+  chmod 0600 "$home/.tmux.conf"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+
+  record=$(HOME="$home" XDG_CONFIG_HOME="$home/config" \
+    fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.config01 "$tmp" "$fixture" "$output" "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$output" || true
+  mouse=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    show-options -gqv mouse)
+  mode_keys=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    show-options -gwqv mode-keys)
+  marker=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    show-options -gqv @fwdports-test-config)
+  destroy_unattached=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" \
+    -f /dev/null show-options -gqv destroy-unattached)
+  exit_empty=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" \
+    -f /dev/null show-options -sqv exit-empty)
+  exit_unattached=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" \
+    -f /dev/null show-options -sqv exit-unattached)
+
+  _assert_eq "tmux user config: enables configured mouse behavior" on "$mouse"
+  _assert_eq "tmux user config: preserves configured copy-mode keys" \
+    vi "$mode_keys"
+  _assert_eq "tmux user config: loads the normal configuration file" \
+    loaded "$marker"
+  _assert_eq "tmux user config: detached supervision remains enabled" \
+    off "$destroy_unattached"
+  _assert_eq "tmux user config: server exits after the owned session" \
+    on "$exit_empty"
+  _assert_eq "tmux user config: detached client exit cannot end supervision" \
+    off "$exit_unattached"
+  _assert_contains "tmux user config: keeps the private session identity" \
+    '$' "$session_id"
+  _assert_contains "tmux user config: keeps the private pane identity" \
+    '%' "$pane_id"
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+focus_transport_case() {
+  local tmp socket fixture output release record session_id pane_id window_id
+  local selected focus_status
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/wait
+  output=$tmp/started
+  release=$tmp/release
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.focus01 "$tmp" "$fixture" "$output" "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$output" || true
+  window_id=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    display-message -p -t "$pane_id" '#{window_id}')
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    new-window -d -t "$session_id:" -n other -- "$fixture" \
+    "$tmp/other-started" "$release"
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    select-window -t "$session_id:other"
+
+  fwdports_tmux_focus_pane "$TMUX_BIN" "$socket" "$session_id" \
+    generation.focus01 "$pane_id"
+  selected=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    display-message -p -t "$session_id" '#{window_id}:#{pane_id}')
+
+  _assert_eq "tmux attach focus: selects the recorded transport window and pane" \
+    "$window_id:$pane_id" "$selected"
+
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    select-window -t "$session_id:other"
+  set +e
+  fwdports_tmux_focus_pane "$TMUX_BIN" "$socket" "$session_id" \
+    generation.wrong01 "$pane_id" >/dev/null 2>&1
+  focus_status=$?
+  set -e
+  selected=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    display-message -p -t "$session_id" '#{window_id}:#{pane_id}')
+  _assert_exit "tmux attach focus: rejects a different generation nonce" \
+    1 "$focus_status"
+  _assert_ne "tmux attach focus: nonce failure leaves transport unselected" \
+    "$window_id:$pane_id" "$selected"
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+layout_scaling_case() {
+  local tmp socket fixture release record session_id pane_id index summary
+  local count spread
+  local -a legs=(first second third fourth)
+  local -a drivers=(ssh autossh et example)
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/wait
+  release=$tmp/release
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.layout01 "$tmp" "$fixture" "$tmp/started-1" \
+    "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$tmp/started-1" || true
+  fwdports_tmux_configure_transport_pane "$TMUX_BIN" "$socket" \
+    "$session_id" generation.layout01 "$pane_id" \
+    "${legs[0]}" "${drivers[0]}"
+
+  for ((index = 1; index < 4; index++)); do
+    pane_id=$(fwdports_tmux_split_pane "$TMUX_BIN" "$socket" "$session_id" \
+      generation.layout01 "$tmp" "$fixture" "$tmp/started-$((index + 1))" \
+      "$release")
+    fwdports_tmux_configure_transport_pane "$TMUX_BIN" "$socket" \
+      "$session_id" generation.layout01 "$pane_id" \
+      "${legs[index]}" "${drivers[index]}"
+    summary=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+      list-panes -t "$session_id:forwards" -F '#{pane_height}' |
+      awk 'NR == 1 { min = max = $1 } { if ($1 < min) min = $1; if ($1 > max) max = $1 } END { printf "%d:%d", NR, max - min }')
+    count=${summary%%:*}
+    spread=${summary#*:}
+    _assert_eq "tmux layout: $((index + 1)) legs all remain visible" \
+      "$((index + 1))" "$count"
+    if [[ $spread =~ ^[0-9]+$ && $spread -le 1 ]]; then
+      _pass "tmux layout: $((index + 1)) legs share height evenly"
+    else
+      _fail "tmux layout: $((index + 1)) legs share height evenly (spread '$spread')"
+    fi
+  done
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+control_window_rollback_case() {
+  local tmp socket fixture output release record session_id pane_id fake_tmux
+  local status windows panes
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/wait
+  output=$tmp/started
+  release=$tmp/release
+  fake_tmux=$tmp/tmux-fail-control-option
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  [[ $arg != automatic-rename ]] || exit 1' \
+    'done' \
+    'exec "$FWDPORTS_TEST_REAL_TMUX" "$@"' \
+    >"$fake_tmux"
+  chmod 0700 "$fake_tmux"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.control01 "$tmp" "$fixture" "$output" "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$output" || true
+
+  set +e
+  FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN fwdports_tmux_create_control_window \
+    "$fake_tmux" "$socket" "$session_id" generation.control01 "$tmp" \
+    "$fixture" "$tmp/control-started" "$release" >/dev/null 2>&1
+  status=$?
+  set -e
+  windows=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    list-windows -t "$session_id" -F '#{window_name}')
+  panes=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    list-panes -s -t "$session_id" -F '#{pane_id}')
+
+  _assert_exit "controller window rollback: setup failure is preserved" \
+    1 "$status"
+  _assert_eq "controller window rollback: removes the unrecorded window" \
+    forwards "$windows"
+  _assert_eq "controller window rollback: preserves only the transport pane" \
+    "$pane_id" "$panes"
+
+  : >"$release"
+  kill_test_server "$socket"
+}
+
+control_window_identity_failure_case() {
+  local tmp socket fixture output release record session_id pane_id fake_tmux
+  local status session_live=0
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  fixture=$tmp/wait
+  output=$tmp/started
+  release=$tmp/release
+  fake_tmux=$tmp/tmux-corrupt-control-identity
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$1"' \
+    'while [[ ! -e "$2" ]]; do sleep 0.01; done' \
+    >"$fixture"
+  chmod 0700 "$fixture"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  if [[ $arg == new-window ]]; then' \
+    '    "$FWDPORTS_TEST_REAL_TMUX" "$@" >/dev/null || exit' \
+    '    printf "invalid-identity\n"' \
+    '    exit 0' \
+    '  fi' \
+    'done' \
+    'exec "$FWDPORTS_TEST_REAL_TMUX" "$@"' \
+    >"$fake_tmux"
+  chmod 0700 "$fake_tmux"
+
+  record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
+    fwdports generation.control02 "$tmp" "$fixture" "$output" "$release")
+  IFS=$'\t' read -r session_id pane_id <<<"$record"
+  wait_for_file "$output" || true
+
+  set +e
+  FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN fwdports_tmux_create_control_window \
+    "$fake_tmux" "$socket" "$session_id" generation.control02 "$tmp" \
+    "$fixture" "$tmp/control-started" "$release" >/dev/null 2>&1
+  status=$?
+  set -e
+  if TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
+    has-session -t "$session_id" 2>/dev/null; then
+    session_live=1
+  fi
+
+  _assert_exit "controller identity failure: setup failure is preserved" \
+    1 "$status"
+  _assert_eq "controller identity failure: aborts the exact owned session" \
+    0 "$session_live"
+
+  : >"$release"
+  kill_test_server "$socket"
+  : "$pane_id"
+}
+
 controller_record_abort_case() {
   local tmp generation marker status content=''
   tmp=$(_tmpdir) || return 1
@@ -119,7 +398,7 @@ controller_record_abort_case() {
   FWDPORTS_MODULE_DIR=$ROOT/lib/fwdports
   FWDPORTS_TEST_ABORT_MARKER=$marker
 
-  fwdports_tmux_split_pane() { printf '%%42\n'; }
+  fwdports_tmux_create_control_window() { printf '%%42\n'; }
   fwdports_tmux_record_pane() { return 1; }
   fwdports_tmux_abort_created_session() {
     printf '%s\t%s\n' "$3" "$4" >"$FWDPORTS_TEST_ABORT_MARKER"
@@ -139,5 +418,10 @@ controller_record_abort_case() {
 
 run_case direct-argv direct_argv_case
 run_case session-nonce session_nonce_case
+run_case user-config user_config_case
+run_case focus-transport focus_transport_case
+run_case layout-scaling layout_scaling_case
+run_case control-window-rollback control_window_rollback_case
+run_case control-window-identity-failure control_window_identity_failure_case
 run_case controller-record-abort controller_record_abort_case
 _test_summary

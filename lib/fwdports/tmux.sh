@@ -4,14 +4,18 @@
 # validation and would make process ownership evidence describe a shell rather
 # than the lifetime process fwdports actually intends to supervise.
 
+FWDPORTS_TMUX_TRANSPORT_WINDOW=forwards
+FWDPORTS_TMUX_CONTROL_WINDOW=control
+
 _fwdports_tmux_call() {
   local tmux_path=$1 socket=$2
   shift 2
 
   # Emptying these variables keeps an inherited client context from silently
   # selecting or nesting inside the user's live server. The explicit private
-  # socket and null configuration are the actual isolation boundary.
-  TMUX='' TMUX_PANE='' "$tmux_path" -S "$socket" -f /dev/null "$@"
+  # socket is the isolation boundary; omitting -f lets this independent server
+  # retain the user's normal mouse, copy-mode, key, and style configuration.
+  TMUX='' TMUX_PANE='' "$tmux_path" -S "$socket" "$@"
 }
 
 fwdports_tmux_create_session() {
@@ -50,10 +54,16 @@ fwdports_tmux_create_session() {
 
   # `new-session -e` installs the nonce in the same server transaction that
   # creates the session. A later set-environment call would leave a window in
-  # which a same-name session existed without ownership evidence.
+  # which a same-name session existed without ownership evidence. The command
+  # queue also pins detached-server lifecycle options after loading the user's
+  # config but before creating this deliberately detached supervision session.
   output=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    start-server \; set-option -g destroy-unattached off \; \
+    set-option -s exit-empty on \; \
+    set-option -s exit-unattached off \; \
     new-session -d -P -F '#{session_id}:#{pane_id}' \
-    -s "$session_name" -c "$start_directory" \
+    -s "$session_name" -n "$FWDPORTS_TMUX_TRANSPORT_WINDOW" \
+    -c "$start_directory" \
     -e "FWDPORTS_GENERATION=$nonce" -- "$@") || return 1
   case "$output" in
     \$[0-9]*:%[0-9]*) ;;
@@ -146,6 +156,180 @@ fwdports_tmux_split_pane() {
   _fwdports_tmux_call "$tmux_path" "$socket" set-option -p \
     -t "$pane_id" remain-on-exit on >/dev/null || return 1
   printf '%s\n' "$pane_id"
+}
+
+fwdports_tmux_configure_transport_pane() {
+  local tmux_path=$1 socket=$2 session_id=$3 nonce=$4 pane_id=$5
+  local leg=$6 driver=$7 recorded_nonce recorded_session window_id
+
+  [[ $session_id =~ ^\$[0-9]+$ &&
+    $nonce =~ ^generation\.[A-Za-z0-9]+$ &&
+    $pane_id =~ ^%[0-9]+$ &&
+    $leg =~ ^[A-Za-z][A-Za-z0-9_-]*$ &&
+    $driver =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 1
+  recorded_nonce=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    show-environment -t "$session_id" FWDPORTS_GENERATION) || return 1
+  [[ $recorded_nonce == "FWDPORTS_GENERATION=$nonce" ]] || return 1
+  recorded_session=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$pane_id" '#{session_id}') || return 1
+  [[ $recorded_session == "$session_id" ]] || return 1
+  window_id=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$pane_id" '#{window_id}') || return 1
+  [[ $window_id =~ ^@[0-9]+$ ]] || return 1
+
+  # A pane-scoped label makes similar transport logs distinguishable even when
+  # a child later emits a terminal-title escape sequence. Keep the user's
+  # border colors and other style choices while ensuring the label is visible
+  # on otherwise stock tmux configurations.
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -p \
+    -t "$pane_id" @fwdports_label "$leg [$driver]" || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" \
+    select-pane -t "$pane_id" -T "$leg [$driver]" || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" \
+    rename-window -t "$window_id" "$FWDPORTS_TMUX_TRANSPORT_WINDOW" ||
+    return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+    -t "$window_id" automatic-rename off || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+    -t "$window_id" allow-rename off || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+    -t "$window_id" pane-border-status top || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+    -t "$window_id" pane-border-format ' #{@fwdports_label} ' || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" select-layout \
+    -t "$window_id" even-vertical >/dev/null || return 1
+}
+
+fwdports_tmux_abort_created_window() {
+  local tmux_path=$1 socket=$2 session_id=$3 nonce=$4 window_id=$5 pane_id=$6
+  local recorded_nonce window_record pane_record
+
+  [[ $session_id =~ ^\$[0-9]+$ &&
+    $nonce =~ ^generation\.[A-Za-z0-9]+$ &&
+    $window_id =~ ^@[0-9]+$ && $pane_id =~ ^%[0-9]+$ ]] || return 1
+  recorded_nonce=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    show-environment -t "$session_id" FWDPORTS_GENERATION) || return 1
+  [[ $recorded_nonce == "FWDPORTS_GENERATION=$nonce" ]] || return 1
+  window_record=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$window_id" \
+    '#{session_id}:#{window_id}') || return 1
+  pane_record=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$pane_id" \
+    '#{session_id}:#{window_id}:#{pane_id}') || return 1
+  [[ $window_record == "$session_id:$window_id" &&
+    $pane_record == "$session_id:$window_id:$pane_id" ]] || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" kill-window -t "$window_id"
+}
+
+fwdports_tmux_create_control_window() {
+  local tmux_path=$1 socket=$2 session_id=$3 nonce=$4 start_directory=$5
+  local recorded_nonce output pane_id recorded_session window_id
+  local recorded_window
+  shift 5
+
+  [[ $session_id =~ ^\$[0-9]+$ &&
+    $nonce =~ ^generation\.[A-Za-z0-9]+$ && $# -gt 0 ]] || return 1
+  [[ -d "$start_directory" && ! -L "$start_directory" ]] || return 1
+  recorded_nonce=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    show-environment -t "$session_id" FWDPORTS_GENERATION) || return 1
+  [[ $recorded_nonce == "FWDPORTS_GENERATION=$nonce" ]] || {
+    printf 'fwdports: tmux session nonce changed before controller creation\n' \
+      >&2
+    return 1
+  }
+  output=$(_fwdports_tmux_call "$tmux_path" "$socket" new-window \
+    -d -P -F '#{window_id}:#{pane_id}' -t "$session_id:" \
+    -n "$FWDPORTS_TMUX_CONTROL_WINDOW" -c "$start_directory" -- \
+    "$@") || return 1
+  case "$output" in
+    @[0-9]*:%[0-9]*) ;;
+    *)
+      fwdports_tmux_abort_created_session "$tmux_path" "$socket" \
+        "$session_id" "$nonce" >/dev/null 2>&1 ||
+        printf 'fwdports: cannot abort session after invalid controller identity\n' \
+          >&2
+      return 1
+      ;;
+  esac
+  window_id=${output%%:*}
+  pane_id=${output#*:}
+  if [[ ! $window_id =~ ^@[0-9]+$ || ! $pane_id =~ ^%[0-9]+$ ]]; then
+    fwdports_tmux_abort_created_session "$tmux_path" "$socket" \
+      "$session_id" "$nonce" >/dev/null 2>&1 ||
+      printf 'fwdports: cannot abort session after malformed controller identity\n' \
+        >&2
+    return 1
+  fi
+  if recorded_session=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$pane_id" '#{session_id}') &&
+    recorded_window=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+      display-message -p -t "$pane_id" '#{window_id}') &&
+    [[ $recorded_session == "$session_id" &&
+      $recorded_window == "$window_id" ]] &&
+    _fwdports_tmux_call "$tmux_path" "$socket" \
+      rename-window -t "$window_id" "$FWDPORTS_TMUX_CONTROL_WINDOW" &&
+    _fwdports_tmux_call "$tmux_path" "$socket" \
+      select-pane -t "$pane_id" -T controller &&
+    _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+      -t "$window_id" automatic-rename off &&
+    _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+      -t "$window_id" allow-rename off &&
+    _fwdports_tmux_call "$tmux_path" "$socket" set-option -p \
+      -t "$pane_id" remain-on-exit on >/dev/null; then
+    printf '%s\n' "$pane_id"
+    return 0
+  fi
+  if ! fwdports_tmux_abort_created_window "$tmux_path" "$socket" \
+    "$session_id" "$nonce" "$window_id" "$pane_id"; then
+    fwdports_tmux_abort_created_session "$tmux_path" "$socket" \
+      "$session_id" "$nonce" >/dev/null 2>&1 ||
+      printf 'fwdports: cannot abort incomplete controller session\n' >&2
+  fi
+  return 1
+}
+
+fwdports_tmux_focus_pane() {
+  local tmux_path=$1 socket=$2 expected_session=$3 nonce=$4 expected_pane=$5
+  local recorded_nonce recorded_session window_id
+
+  [[ $expected_session =~ ^\$[0-9]+$ &&
+    $nonce =~ ^generation\.[A-Za-z0-9]+$ &&
+    $expected_pane =~ ^%[0-9]+$ ]] || return 1
+  recorded_nonce=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    show-environment -t "$expected_session" FWDPORTS_GENERATION) || return 1
+  [[ $recorded_nonce == "FWDPORTS_GENERATION=$nonce" ]] || return 1
+  recorded_session=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$expected_pane" '#{session_id}') || return 1
+  [[ $recorded_session == "$expected_session" ]] || return 1
+  window_id=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$expected_pane" '#{window_id}') || return 1
+  [[ $window_id =~ ^@[0-9]+$ ]] || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" \
+    select-window -t "$window_id" || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" \
+    select-pane -t "$expected_pane"
+}
+
+fwdports_tmux_pane_location() {
+  local tmux_path=$1 socket=$2 expected_session=$3 expected_pane=$4
+  local output session_id window_id window_name pane_id pane_dead extra
+
+  [[ $expected_session =~ ^\$[0-9]+$ &&
+    $expected_pane =~ ^%[0-9]+$ ]] || return 1
+  output=$(_fwdports_tmux_call "$tmux_path" "$socket" \
+    display-message -p -t "$expected_pane" \
+    $'#{session_id}\t#{window_id}\t#{window_name}\t#{pane_id}\t#{pane_dead}') ||
+    return 1
+  IFS=$'\t' read -r session_id window_id window_name pane_id pane_dead extra \
+    <<<"$output"
+  [[ -z $extra && $session_id == "$expected_session" &&
+    $pane_id == "$expected_pane" && $window_id =~ ^@[0-9]+$ &&
+    $pane_dead =~ ^[01]$ ]] || return 1
+  # A user may rename a window while attached. Keep the immutable tmux ID as
+  # identity and avoid reflecting control characters from a custom name into
+  # the human inspection report.
+  [[ $window_name =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || window_name=custom
+  printf '%s\t%s\t%s\n' "$window_id" "$window_name" "$pane_dead"
 }
 
 _fwdports_process_snapshot() {

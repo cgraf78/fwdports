@@ -301,6 +301,12 @@ _fwdports_start_generation() {
         return 1
       fi
     fi
+    if ! fwdports_tmux_configure_transport_pane "$tmux_path" "$socket" \
+      "$session" "${generation##*/}" "$pane" "$leg" "$driver"; then
+      fwdports_tmux_abort_created_session "$tmux_path" "$socket" "$session" \
+        "${generation##*/}" >/dev/null 2>&1 || true
+      return 1
+    fi
     if ! fwdports_tmux_record_pane "$tmux_path" "$socket" "$session" \
       "$pane" "$generation" "$digest" "$runtime/pane"; then
       fwdports_tmux_abort_created_session "$tmux_path" "$socket" "$session" \
@@ -318,7 +324,7 @@ _fwdports_start_controller() {
   local pane evidence=$generation/controller.pane index=0 record
   local controller_pid controller_start ready_pid ready_start
 
-  pane=$(fwdports_tmux_split_pane "$tmux_path" "$socket" "$session" \
+  pane=$(fwdports_tmux_create_control_window "$tmux_path" "$socket" "$session" \
     "${generation##*/}" "$generation" \
     "$FWDPORTS_MODULE_DIR/controller.sh" run "$root" "$generation" \
     "$digest") || return 1
@@ -596,8 +602,269 @@ fwdports_status_command() {
   fwdports_status "$root" "$tmux_path" "$socket" "$FWDPORTS_SESSION_NAME"
 }
 
+_fwdports_inspect_pane_observation() {
+  local tmux_path=$1 socket=$2 generation=$3 digest=$4 evidence=$5
+  local record session pane pid _ verify_status state location
+  local window_id window_name pane_dead
+
+  record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$evidence") || return 74
+  IFS=$'\t' read -r session pane pid _ <<<"$record"
+  if fwdports_tmux_verify_pane "$tmux_path" "$socket" "$generation" \
+    "$digest" "$evidence"; then
+    state=live
+  else
+    verify_status=$?
+    case "$verify_status" in
+      1) state=down ;;
+      *)
+        printf 'fwdports: pane ownership cannot be inspected safely\n' >&2
+        return 74
+        ;;
+    esac
+  fi
+  if location=$(fwdports_tmux_pane_location "$tmux_path" "$socket" \
+    "$session" "$pane" 2>/dev/null); then
+    IFS=$'\t' read -r window_id window_name pane_dead <<<"$location"
+    if [[ ($state == live && $pane_dead != 0) ||
+      ($state == down && $pane_dead != 1) ]]; then
+      printf 'fwdports: tmux pane state changed during inspection\n' >&2
+      return 74
+    fi
+  elif [[ $state == live ]]; then
+    printf 'fwdports: live tmux pane location is unavailable\n' >&2
+    return 74
+  else
+    window_id=unavailable
+    window_name=unavailable
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$state" "$session" "$window_id" "$window_name" "$pane" "$pid"
+}
+
+_fwdports_inspect_transport_state() {
+  local generation=$1 leg=$2 driver=$3 pane=$4 pane_state=$5
+  local runtime snapshot driver_status
+
+  if [[ $pane_state != live ]]; then
+    printf 'down (foreground pane)\n'
+    return 0
+  fi
+  if fwdports_driver_is_builtin "$driver"; then
+    printf 'not separately observed (supervisor live)\n'
+    return 0
+  fi
+  runtime=$generation/legs/$leg
+  snapshot=$generation/drivers/$driver
+  if fwdports_driver_operation "$snapshot" is-live \
+    "$generation/manifest" "$leg" "$runtime" "$pane" >/dev/null; then
+    driver_status=0
+  else
+    driver_status=$?
+  fi
+  case "$driver_status" in
+    0) printf 'live (driver-reported)\n' ;;
+    1) printf 'down (driver-reported)\n' ;;
+    2) printf 'not separately reported (pane live)\n' ;;
+    *)
+      printf 'fwdports: driver liveness check failed for %s\n' "$leg" >&2
+      return 74
+      ;;
+  esac
+}
+
+_fwdports_inspect_render_check() {
+  local probe_type=$1 host=$2 port=$3 label=$4 check_result check_status
+
+  [[ ($probe_type == loopback || $probe_type == tcp) && -n $host &&
+    $port =~ ^[0-9]+$ && -n $label ]] || return 74
+  if check_result=$(fwdports_health_probe_local_tcp "$host" "$port"); then
+    check_status=0
+  else
+    check_status=$?
+  fi
+  case "$check_status" in
+    0 | 1 | 2) ;;
+    *) return 74 ;;
+  esac
+  printf '      check: %s; point-in-time local TCP connect to %s port %s (%s; label %s)\n' \
+    "$check_result" "$host" "$port" "$probe_type" "$label"
+}
+
+_fwdports_inspect_render_leg() {
+  local tmux_path=$1 socket=$2 generation=$3 digest=$4 manifest=$5
+  local leg=$6 driver=$7 evidence observation pane_state session
+  local window_id window_name pane pid transport
+  local kind record_leg field value extra probe_type host port label
+  local forward_count=0 check_count=0
+
+  evidence=$generation/legs/$leg/pane
+  observation=$(_fwdports_inspect_pane_observation "$tmux_path" "$socket" \
+    "$generation" "$digest" "$evidence") || return $?
+  IFS=$'\t' read -r pane_state session window_id window_name pane pid \
+    <<<"$observation"
+  transport=$(_fwdports_inspect_transport_state "$generation" "$leg" \
+    "$driver" "$pane" "$pane_state") || return $?
+
+  printf '    %s [%s]\n' "$leg" "$driver"
+  if [[ $window_id == unavailable ]]; then
+    printf '      tmux: %s; session %s; window unavailable; pane %s; pid %s\n' \
+      "$pane_state" "$session" "$pane" "$pid"
+  else
+    printf '      tmux: %s; session %s; window %s (%s); pane %s; pid %s\n' \
+      "$pane_state" "$session" "$window_id" "$window_name" "$pane" "$pid"
+  fi
+  printf '      transport: %s\n' "$transport"
+
+  while IFS=$'\t' read -r kind record_leg field value extra ||
+    [[ -n ${kind:-} ]]; do
+    [[ $kind == set && $record_leg == "$leg" ]] || continue
+    case "$field" in
+      local-forward | remote-forward)
+        printf '      standard forward: %s %s\n' "${field%-forward}" "$value"
+        forward_count=$((forward_count + 1))
+        ;;
+    esac
+  done <"$manifest"
+  if [[ $forward_count -eq 0 ]]; then
+    printf '      standard forward: none declared\n'
+  fi
+
+  while IFS=$'\t' read -r kind record_leg probe_type host port label extra ||
+    [[ -n ${kind:-} ]]; do
+    [[ $kind == check && $record_leg == "$leg" ]] || continue
+    [[ -z $extra && ($probe_type == loopback || $probe_type == tcp) ]] ||
+      return 74
+    _fwdports_inspect_render_check "$probe_type" "$host" "$port" \
+      "$label" || return $?
+    check_count=$((check_count + 1))
+  done <"$manifest"
+  if [[ $check_count -eq 0 ]]; then
+    printf '      check: none configured\n'
+  fi
+}
+
+_fwdports_inspect_render_active() {
+  local tmux_path=$1 socket=$2 generation=$3 digest=$4 manifest=$5 overall=$6
+  local kind first second extra profile='' profile_count=0 index
+  local observation state session window_id window_name pane pid
+  local -a legs=() drivers=()
+
+  while IFS=$'\t' read -r kind first second extra || [[ -n ${kind:-} ]]; do
+    [[ $kind == profile ]] || continue
+    [[ -n $first && -z $second && -z $extra ]] || return 74
+    profile=$first
+    profile_count=$((profile_count + 1))
+  done <"$manifest"
+  [[ $profile_count -eq 1 ]] || return 74
+  observation=$(_fwdports_inspect_pane_observation "$tmux_path" "$socket" \
+    "$generation" "$digest" "$generation/controller.pane") || return $?
+  IFS=$'\t' read -r state session window_id window_name pane pid \
+    <<<"$observation"
+
+  printf 'fwdports inspect\n'
+  printf '  overall: %s\n' "$overall"
+  printf '  profile: %s\n' "$profile"
+  printf '  generation: %s\n' "${generation##*/}"
+  printf '  check semantics: local TCP connect only; not end-to-end destination proof\n'
+  if [[ $window_id == unavailable ]]; then
+    printf '  controller: %s; session %s; window unavailable; pane %s; pid %s\n' \
+      "$state" "$session" "$pane" "$pid"
+  else
+    printf '  controller: %s; session %s; window %s (%s); pane %s; pid %s\n' \
+      "$state" "$session" "$window_id" "$window_name" "$pane" "$pid"
+  fi
+  printf '  legs:\n'
+  while IFS=$'\t' read -r kind first second extra || [[ -n ${kind:-} ]]; do
+    [[ $kind == leg ]] || continue
+    [[ -n $first && -n $second && -z $extra ]] || return 74
+    legs+=("$first")
+    drivers+=("$second")
+  done <"$manifest"
+  [[ -n ${legs[0]+set} ]] || return 74
+  for ((index = 0; index < ${#legs[@]}; index++)); do
+    _fwdports_inspect_render_leg "$tmux_path" "$socket" "$generation" \
+      "$digest" "$manifest" "${legs[index]}" "${drivers[index]}" ||
+      return $?
+  done
+}
+
+fwdports_inspect() {
+  local root tmux_path socket overall status pointer generation digest
+  local workspace manifest report actual_digest current report_status
+
+  root=$(_fwdports_state_root_path) || return 1
+  tmux_path=$(_fwdports_command_path tmux) || return 69
+  if [[ ! -d $root || -L $root ]]; then
+    printf 'fwdports inspect\n'
+    printf '  overall: stopped\n'
+    printf '  active generation: none\n'
+    return 0
+  fi
+  socket=$(_fwdports_tmux_socket "$root") || return 1
+  if [[ ! -e $root/active && ! -L $root/active ]]; then
+    if overall=$(fwdports_status "$root" "$tmux_path" "$socket" \
+      "$FWDPORTS_SESSION_NAME"); then
+      status=0
+    else
+      status=$?
+    fi
+    [[ $status -eq 0 || $status -eq 1 ]] || return "$status"
+    printf 'fwdports inspect\n'
+    printf '  overall: %s\n' "$overall"
+    printf '  active generation: none\n'
+    return "$status"
+  fi
+
+  pointer=$(fwdports_pointer_read "$root" active) || return 74
+  IFS=$'\t' read -r generation digest <<<"$pointer"
+  overall=$(fwdports_status "$root" "$tmux_path" "$socket" \
+    "$FWDPORTS_SESSION_NAME") || return $?
+  workspace=$(mktemp -d "${TMPDIR:-/tmp}/fwdports-inspect.XXXXXXXX") ||
+    return 1
+  chmod 0700 "$workspace" || {
+    rm -rf -- "$workspace"
+    return 1
+  }
+  manifest=$workspace/manifest
+  report=$workspace/report
+  if ! fwdports_snapshot_trusted_file "$generation/manifest" "$manifest" \
+    "$generation" file "$generation"; then
+    rm -rf -- "$workspace"
+    return 74
+  fi
+  actual_digest=$(_fwdports_runtime_sha256_file "$manifest") || {
+    rm -rf -- "$workspace"
+    return 74
+  }
+  if [[ $actual_digest != "$digest" ]]; then
+    rm -rf -- "$workspace"
+    printf 'fwdports: generation manifest changed before inspection\n' >&2
+    return 74
+  fi
+  if _fwdports_inspect_render_active "$tmux_path" "$socket" "$generation" \
+    "$digest" "$manifest" "$overall" >"$report"; then
+    report_status=0
+  else
+    report_status=$?
+  fi
+  if [[ $report_status -eq 0 ]]; then
+    current=$(fwdports_pointer_read "$root" active) || report_status=74
+    [[ $report_status -ne 0 || $current == "$pointer" ]] || {
+      printf 'fwdports: active generation changed during inspection\n' >&2
+      report_status=74
+    }
+  fi
+  if [[ $report_status -eq 0 ]]; then
+    cat "$report" || report_status=$?
+  fi
+  rm -rf -- "$workspace"
+  return "$report_status"
+}
+
 fwdports_attach() {
-  local root tmux_path socket pointer generation digest evidence record session
+  local root tmux_path socket pointer generation digest evidence record
+  local session pane
   root=$(_fwdports_state_root_path) || return 1
   [[ -d $root && ! -L $root ]] || {
     printf 'fwdports: no active session\n' >&2
@@ -609,12 +876,14 @@ fwdports_attach() {
     [[ -f $evidence && ! -L $evidence ]] || continue
     record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
       "$evidence") || return 1
-    session=${record%%$'\t'*}
+    IFS=$'\t' read -r session pane _ <<<"$record"
     break
   done
   [[ -n ${session:-} ]] || return 1
   tmux_path=$(_fwdports_command_path tmux) || return 69
   socket=$(_fwdports_tmux_socket "$root") || return 1
-  TMUX='' TMUX_PANE='' exec "$tmux_path" -S "$socket" -f /dev/null \
+  fwdports_tmux_focus_pane "$tmux_path" "$socket" "$session" \
+    "${generation##*/}" "$pane" || return 1
+  TMUX='' TMUX_PANE='' exec "$tmux_path" -S "$socket" \
     attach-session -t "$session"
 }

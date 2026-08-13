@@ -273,7 +273,7 @@ inspect_builtin_backoff_case() {
   _assert_exit "inspect SSH backoff: profile starts" 0 "$COMMAND_STATUS"
   while [[ $index -lt 500 ]]; do
     if [[ -f $runs ]]; then
-      run_count=$(wc -l <"$runs")
+      run_count=$(wc -l <"$runs" | tr -d '[:space:]')
       [[ $run_count -ge 3 ]] && break
     fi
     sleep 0.01

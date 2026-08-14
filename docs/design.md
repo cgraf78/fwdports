@@ -239,10 +239,11 @@ probe child's lifetime is tied to a parent-owned pipe so interruption cannot
 leave a detached probe session behind. Two complete scans with no live member
 are required before absence is accepted. Zombie and dead rows remain ownership
 evidence but are excluded from liveness because they cannot execute or retain a
-forwarding socket. Cleanup then uses ettun's bounded first-TERM and second-TERM
-contract. The generation is removable only after two complete scans find no
-live session member. Ambiguous evidence is retained for manual diagnosis rather
-than guessed away.
+forwarding socket. Cleanup then uses ettun's bounded first- and second-Ctrl-C
+contract through the authenticated tmux pane. It exits copy mode before each
+interrupt so tmux cannot consume the stop request as a mode key. The generation
+is removable only after two complete scans find no live session member.
+Ambiguous evidence is retained for manual diagnosis rather than guessed away.
 
 The explicit tmux socket, cleared inherited client variables, session nonce,
 and recorded IDs provide isolation and lifecycle authority. The private server

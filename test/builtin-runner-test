@@ -173,6 +173,61 @@ ettun_no_retry_case() {
   _assert_eq "built-in ettun: fwdports adds no retry loop" 1 "$count"
 }
 
+ettun_int_disposition_case() {
+  local tmp runtime pid_file int_marker runner_pid gate_pid='' status index=0
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  pid_file=$tmp/ettun.pid
+  int_marker=$tmp/ettun.int
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' ettun >"$runtime/driver-kind"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$$" >"$FWDPORTS_TEST_ETTUN_PID"' \
+    'trap '\''printf "int\n" >"$FWDPORTS_TEST_ETTUN_INT"; exit 130'\'' INT' \
+    'trap '\''exit 143'\'' TERM' \
+    'while :; do sleep 0.02; done' \
+    >"$runtime/ettun-gate"
+  chmod 0700 "$runtime/ettun-gate"
+
+  # Job control keeps Bash from imposing SIG_IGN on this asynchronous test
+  # launch. Production starts the pane command directly with the same default
+  # disposition; the background form gives the test one exact, unreaped PID
+  # for bounded cleanup if the assertion fails.
+  set -m
+  FWDPORTS_TEST_ETTUN_PID=$pid_file \
+    FWDPORTS_TEST_ETTUN_INT=$int_marker "$RUNNER" "$runtime" &
+  runner_pid=$!
+  set +m
+  while [[ ! -s $pid_file && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  [[ ! -s $pid_file ]] || gate_pid=$(<"$pid_file")
+  [[ -z $gate_pid ]] || kill -INT "$gate_pid" 2>/dev/null || true
+  index=0
+  while [[ ! -e $int_marker && $index -lt 200 ]] &&
+    kill -0 "$runner_pid" 2>/dev/null; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  if [[ ! -e $int_marker ]] && kill -0 "$runner_pid" 2>/dev/null; then
+    kill -TERM "$runner_pid" 2>/dev/null || true
+  fi
+  set +e
+  wait "$runner_pid"
+  status=$?
+  set -e
+
+  _assert_eq "built-in ettun: runner exec preserves the pane PID" \
+    "$runner_pid" "${gate_pid:-missing}"
+  _assert_exit "built-in ettun: direct gate preserves catchable INT" 130 \
+    "$status"
+  _assert_file "built-in ettun: terminal interrupt reaches the gate" \
+    "$int_marker"
+}
+
 ettun_interactive_stdin_case() {
   local tmp runtime socket result ready output session pane expected actual
   local status index=0
@@ -245,5 +300,6 @@ run_case drift drift_case
 run_case et-no-retry et_no_retry_case
 run_case et-signal et_signal_case
 run_case ettun-no-retry ettun_no_retry_case
+run_case ettun-int-disposition ettun_int_disposition_case
 run_case ettun-interactive-stdin ettun_interactive_stdin_case
 _test_summary

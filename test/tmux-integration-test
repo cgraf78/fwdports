@@ -42,6 +42,7 @@ kill_test_server() {
 
 direct_argv_case() {
   local tmp socket fixture output release record session_id pane_id actual
+  local implementation
   tmp=$(_tmpdir) || return 1
   socket=$tmp/tmux.sock
   fixture=$tmp/record-argv
@@ -64,6 +65,7 @@ direct_argv_case() {
   IFS=$'\t' read -r session_id pane_id <<<"$record"
   wait_for_file "$output" || true
   actual=$(<"$output")
+  implementation=$(declare -f fwdports_tmux_create_session) || return 1
 
   _assert_contains "tmux direct argv: returns a session id" '$' "$session_id"
   _assert_contains "tmux direct argv: returns a pane id" '%' "$pane_id"
@@ -72,9 +74,9 @@ direct_argv_case() {
   _assert_not_exists "tmux direct argv: metacharacters execute no command" \
     "$tmp/colon"
   _assert_not_contains "tmux direct argv: implementation uses no send-keys" \
-    "send-keys" "$(<"$ROOT/lib/fwdports/tmux.sh")"
+    "send-keys" "$implementation"
   _assert_not_contains "tmux direct argv: implementation uses no shell -c" \
-    "sh -c" "$(<"$ROOT/lib/fwdports/tmux.sh")"
+    "sh -c" "$implementation"
 
   : >"$release"
   kill_test_server "$socket"

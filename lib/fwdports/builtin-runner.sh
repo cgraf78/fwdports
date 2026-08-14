@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generation-owned launcher for built-in transports. The controller passes
-# only stable file paths; this wrapper owns one direct child so tmux HUP can be
-# converted into a catchable TERM and the transport is always reaped.
+# only stable file paths. It owns and reaps one direct child where fwdports owns
+# supervision; ettun instead owns its terminal process groups and signal tree.
 
 set -u
 
@@ -35,10 +35,10 @@ case "$kind" in
     ;;
 esac
 
-# Keep one foreground supervisor for every built-in transport. tmux tears a
-# pane down with HUP, but autossh may deliberately ignore HUP while its SSH
-# child remains alive. Converting every catchable shutdown to TERM and reaping
-# the direct child prevents a failed startup rollback from orphaning a tunnel.
+# Keep one foreground process for every built-in transport. tmux tears a pane
+# down with HUP, but autossh may deliberately ignore HUP while its SSH child
+# remains alive. Drivers supervised here get catchable shutdown converted to
+# TERM and their direct child reaped. ettun owns that cleanup itself.
 child=
 signal_status=0
 
@@ -127,11 +127,10 @@ case "$kind" in
     [[ $signal_status -eq 0 ]] || exit "$signal_status"
     exit "$status"
     ;;
-  et | ettun)
-    # ET and ettun own reconnect behavior inside one foreground process. Adding the
-    # direct-SSH retry loop here would create competing policies and could
-    # repeatedly prompt for authentication after a deterministic ET failure.
-    gate=$runtime/$kind-gate
+  et)
+    # ET owns reconnect behavior inside one foreground process. Adding the
+    # direct-SSH retry loop here would create competing policies.
+    gate=$runtime/et-gate
     "$gate" <&0 &
     child=$!
     wait "$child"
@@ -140,5 +139,13 @@ case "$kind" in
     child=
     [[ $signal_status -eq 0 ]] || exit "$signal_status"
     exit "$status"
+    ;;
+  ettun)
+    # ettun owns reconnects, nested foreground process groups, and catchable
+    # signal cleanup. A non-job-control Bash supervisor would start an async
+    # gate with INT ignored, preventing terminal Ctrl-C from reaching those
+    # groups. Preserve the pane PID and default signal dispositions by replacing
+    # the runner after validation instead of creating another supervisor layer.
+    exec "$runtime/ettun-gate" <&0
     ;;
 esac

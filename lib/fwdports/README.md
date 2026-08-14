@@ -8,8 +8,9 @@ These Bash 3.2-compatible modules implement reusable `fwdports` behavior:
   generation-authenticated crash cleanup.
 - `drivers.sh` owns built-in SSH/autossh/ET/ettun validation and argv construction.
 - `driver-api.sh` owns trusted external-driver discovery and invocation.
-- `builtin-runner.sh` keeps direct SSH alive with bounded backoff and launches
-  explicitly selected autossh, ET, or ettun with one foreground supervised child.
+- `builtin-runner.sh` keeps direct SSH alive with bounded backoff, supervises
+  explicitly selected autossh and ET, and hands the pane process directly to
+  ettun so its foreground groups retain terminal signal ownership.
 - `ssh-gate.sh` binds OpenSSH identity and effective configuration at exec.
 - `et-gate.sh` revalidates ET bytes and sanitizes ET's environment at exec.
 - `et-ssh-wrapper.sh` pins ET's bootstrap to authenticated SSH gates.

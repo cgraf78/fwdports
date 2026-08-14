@@ -132,7 +132,7 @@ case "$kind" in
     # direct-SSH retry loop here would create competing policies and could
     # repeatedly prompt for authentication after a deterministic ET failure.
     gate=$runtime/$kind-gate
-    "$gate" &
+    "$gate" <&0 &
     child=$!
     wait "$child"
     status=$?

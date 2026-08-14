@@ -9,6 +9,7 @@ TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
 RUNNER=$ROOT/lib/fwdports/builtin-runner.sh
 TEST_CASE=${1:-}
+TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN-$(command -v tmux)}
 
 # shellcheck source=lib/test.sh
 source "$TEST_DIR/lib/test.sh"
@@ -172,9 +173,77 @@ ettun_no_retry_case() {
   _assert_eq "built-in ettun: fwdports adds no retry loop" 1 "$count"
 }
 
+ettun_interactive_stdin_case() {
+  local tmp runtime socket result ready output session pane expected actual
+  local status index=0
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  socket=$tmp/tmux.sock
+  result=$tmp/stdin.result
+  ready=$tmp/stdin.ready
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  printf '%s\n' ettun >"$runtime/driver-kind"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'mode=pipe' \
+    '[[ -t 0 ]] && mode=tty' \
+    ': >"$FWDPORTS_TEST_STDIN_READY"' \
+    'if ! IFS= read -r value; then' \
+    '  printf "unexpected-eof\n" >"$FWDPORTS_TEST_STDIN_RESULT"' \
+    '  exit 25' \
+    'fi' \
+    'printf "%s:%s\n" "$mode" "$value" >"$FWDPORTS_TEST_STDIN_RESULT"' \
+    >"$runtime/ettun-gate"
+  chmod 0700 "$runtime/ettun-gate"
+
+  if [[ -n $TMUX_BIN ]]; then
+    output=$(FWDPORTS_TEST_STDIN_RESULT=$result \
+      FWDPORTS_TEST_STDIN_READY=$ready \
+      "$TMUX_BIN" -S "$socket" -f /dev/null new-session -d -P \
+      -F '#{session_id}:#{pane_id}' -- "$RUNNER" "$runtime") || return 1
+    session=${output%%:*}
+    pane=${output#*:}
+    while [[ ! -e $ready && ! -e $result && $index -lt 200 ]]; do
+      sleep 0.01
+      index=$((index + 1))
+    done
+    if [[ -e $ready ]]; then
+      "$TMUX_BIN" -S "$socket" send-keys -l -t "$pane" 'from-pane'
+      "$TMUX_BIN" -S "$socket" send-keys -t "$pane" Enter
+      index=0
+      while [[ ! -e $result && $index -lt 200 ]]; do
+        sleep 0.01
+        index=$((index + 1))
+      done
+    fi
+    "$TMUX_BIN" -S "$socket" kill-session -t "$session" 2>/dev/null || true
+    expected=tty:from-pane
+  else
+    # The explicit stock macOS Bash job intentionally has no tmux. A pipe
+    # still exercises Bash's asynchronous-command stdin replacement rule.
+    printf '%s\n' from-stdin |
+      FWDPORTS_TEST_STDIN_RESULT=$result \
+        FWDPORTS_TEST_STDIN_READY=$ready \
+        "$RUNNER" "$runtime"
+    status=$?
+    _assert_exit "built-in ettun: stdin fallback runner succeeds" 0 "$status"
+    expected=pipe:from-stdin
+  fi
+  if [[ -r $result ]]; then
+    actual=$(<"$result")
+  else
+    actual=missing
+  fi
+
+  _assert_eq "built-in ettun: preserves pane stdin for interactive transport" \
+    "$expected" "$actual"
+}
+
 run_case retry retry_case
 run_case drift drift_case
 run_case et-no-retry et_no_retry_case
 run_case et-signal et_signal_case
 run_case ettun-no-retry ettun_no_retry_case
+run_case ettun-interactive-stdin ettun_interactive_stdin_case
 _test_summary

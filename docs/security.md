@@ -56,11 +56,12 @@ stable launcher cannot redirect later scans to replacement backend bytes. The
 probe's detached child also exits when its parent-liveness pipe closes. Every
 platform requires two complete scans with no live member. Zombie and dead rows
 remain ownership evidence but are inert for cleanup because they cannot execute,
-fork, receive another signal, or retain a forwarding socket. Its first TERM gets
-a bounded graceful wait, and a still-authenticated leader receives ettun's
-second-TERM force request. fwdports reports success only after two complete
-scans find no live session member and never substitutes KILL for ettun's cleanup
-contract. A missing leader, changed session scope,
+fork, receive another signal, or retain a forwarding socket. Its first terminal
+Ctrl-C gets a bounded graceful wait, and a still-authenticated pane receives
+ettun's second-Ctrl-C force request. Active copy mode is cancelled in the same
+tmux command sequence so it cannot swallow either interrupt. fwdports reports
+success only after two complete scans find no live session member and never
+substitutes KILL for ettun's cleanup contract. A missing leader, changed session scope,
 surviving session, or incomplete enumeration fails closed. An ettun adapter is
 trusted to remain foreground and must not call `setsid`, daemonize, change real
 user identity, or otherwise escape that process session.

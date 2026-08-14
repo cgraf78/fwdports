@@ -88,6 +88,19 @@ wait_for_process_exit() {
   ! kill -0 "$pid" 2>/dev/null
 }
 
+wait_for_foreground_group() {
+  local pid=$1 expected_pgid=$2 attempts=0 observed
+
+  while [[ $attempts -lt 200 ]]; do
+    observed=$(ps -o tpgid= -p "$pid" 2>/dev/null) || return 1
+    observed=${observed//[[:space:]]/}
+    [[ $observed == "$expected_pgid" ]] && return 0
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
 kill_test_server() {
   local socket=$1
   TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
@@ -127,7 +140,9 @@ termination_fixture() {
   mkdir -p "$home" "$state"
   chmod 0700 "$home" "$state"
   case "$mode" in
-    ettun-runner-graceful | ettun-runner-force) driver=ettun ;;
+    ettun-interrupt* | ettun-runner-*)
+      driver=ettun
+      ;;
   esac
   printf '%s\n' \
     $'version\t1' \
@@ -187,18 +202,18 @@ termination_fixture() {
         '}' \
         'worker &' \
         'child=$!' \
-        'terms=0' \
-        'on_term() {' \
-        '  terms=$((terms + 1))' \
-        '  printf "%s\\n" "$terms" >"$leader_marker"' \
-        '  if [[ $terms -ge 2 ]]; then' \
+        'interrupts=0' \
+        'on_interrupt() {' \
+        '  interrupts=$((interrupts + 1))' \
+        '  printf "%s\\n" "$interrupts" >"$leader_marker"' \
+        '  if [[ $interrupts -ge 2 ]]; then' \
         '    kill -KILL -- "-$child" 2>/dev/null || true' \
         '    wait "$child" 2>/dev/null || true' \
         '    exit 0' \
         '  fi' \
         '}' \
-        'trap on_term TERM' \
-        'trap '\'''\'' HUP' \
+        'trap on_interrupt INT' \
+        'trap '\'''\'' TERM HUP' \
         'printf "%s %s\\n" "$$" "$child" >"$ids"' \
         'while :; do sleep 0.02; done' \
         >"$PROC_SCRIPT"
@@ -220,6 +235,55 @@ termination_fixture() {
         'while :; do sleep 0.02; done' \
         >"$PROC_SCRIPT"
       ;;
+    ettun-interrupt)
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -m' \
+        'ids=$1; leader_marker=$2; child_marker=$3' \
+        'worker() {' \
+        '  trap '\''trap "" INT; printf "int\n" >"$child_marker"; kill -KILL 0 2>/dev/null || exit 130'\'' INT' \
+        '  trap '\'''\'' TERM HUP' \
+        '  while :; do sleep 0.02; done' \
+        '}' \
+        'worker &' \
+        'child=$!' \
+        'trap '\''printf "term\n" >>"$leader_marker"'\'' TERM' \
+        'trap '\'''\'' HUP' \
+        'printf "%s %s\n" "$$" "$child" >"$ids"' \
+        'fg %1 >/dev/null || true' \
+        'wait "$child" 2>/dev/null || true' \
+        'exit 0' \
+        >"$PROC_SCRIPT"
+      ;;
+    ettun-interrupt-force)
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -m' \
+        'ids=$1; leader_marker=$2; child_marker=$3' \
+        'worker() {' \
+        '  interrupts=0' \
+        '  on_interrupt() {' \
+        '    interrupts=$((interrupts + 1))' \
+        '    printf "%s\n" "$interrupts" >"$child_marker"' \
+        '    if [[ $interrupts -ge 2 ]]; then' \
+        '      trap "" INT' \
+        '      kill -KILL 0 2>/dev/null || exit 130' \
+        '    fi' \
+        '  }' \
+        '  trap on_interrupt INT' \
+        '  trap '\'''\'' TERM HUP' \
+        '  while :; do sleep 0.02; done' \
+        '}' \
+        'worker &' \
+        'child=$!' \
+        'trap '\''printf "term\n" >>"$leader_marker"'\'' TERM' \
+        'trap '\'''\'' HUP' \
+        'printf "%s %s\n" "$$" "$child" >"$ids"' \
+        'fg %1 >/dev/null || true' \
+        'wait "$child" 2>/dev/null || true' \
+        'exit 0' \
+        >"$PROC_SCRIPT"
+      ;;
     ettun-runner-graceful | ettun-runner-force)
       PROC_SCRIPT=$ROOT/lib/fwdports/builtin-runner.sh
       PROC_GATE=$PROC_GENERATION/legs/web/ettun-gate
@@ -232,31 +296,30 @@ termination_fixture() {
         '#!/usr/bin/env bash' \
         'set -u' \
         'set -m' \
-        'worker() {' \
-        '  trap '\'''\'' TERM HUP' \
-        '  while :; do sleep 0.02; done' \
-        '}' \
-        'worker &' \
-        'child=$!' \
         'force_stop() {' \
-        '  trap '\'''\'' TERM HUP' \
+        '  trap '\'''\'' HUP INT TERM' \
         '  printf "2\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '  kill -KILL -- "-$child" 2>/dev/null || true' \
-        '  wait "$child" 2>/dev/null || true' \
-        '  exit 143' \
+        '  kill -KILL 0 2>/dev/null || exit 130' \
         '}' \
         'graceful_stop() {' \
         '  printf "1\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '  trap force_stop TERM' \
+        '  trap force_stop INT' \
         '  sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"' \
-        '  kill -KILL -- "-$child" 2>/dev/null || true' \
-        '  wait "$child" 2>/dev/null || true' \
-        '  exit 143' \
+        '  trap '\'''\'' HUP INT TERM' \
+        '  kill -KILL 0 2>/dev/null || exit 130' \
         '}' \
-        'trap graceful_stop TERM' \
-        'trap force_stop HUP INT' \
+        'if [[ ${1:-} == worker ]]; then' \
+        '  set +m' \
+        '  trap graceful_stop INT' \
+        '  trap '\'''\'' TERM HUP' \
+        '  while :; do sleep 0.02; done' \
+        'fi' \
+        '"$BASH" "$0" worker &' \
+        'child=$!' \
         'printf "%s %s\\n" "$$" "$child" >"$FWDPORTS_TEST_PROC_IDS"' \
-        'while :; do sleep 0.02; done' \
+        'fg %1 >/dev/null || true' \
+        'wait "$child" 2>/dev/null || true' \
+        'exit 130' \
         >"$PROC_GATE"
       chmod 0700 "$PROC_GATE"
       printf '%s\n' ettun >"$PROC_GENERATION/legs/web/driver-kind"
@@ -292,6 +355,14 @@ termination_fixture() {
   else
     read -r PROC_LEADER PROC_CHILD <"$PROC_IDS"
   fi
+  case "$mode" in
+    ettun-interrupt*)
+      wait_for_foreground_group "$PROC_LEADER" "$PROC_CHILD" || return 1
+      ;;
+    ettun-runner-*)
+      wait_for_foreground_group "$PROC_ENGINE" "$PROC_CHILD" || return 1
+      ;;
+  esac
   fwdports_tmux_record_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_SESSION" \
     "$PROC_PANE" "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" ||
     return 1
@@ -611,9 +682,44 @@ ettun_session_reap_handoff_case() {
 }
 
 ettun_session_force_stop_case() {
+  local tmp output error pane_mode status worker_alive=0
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-interrupt-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$PROC_SOCKET" \
+    copy-mode -t "$PROC_PANE" || return 1
+  pane_mode=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$PROC_SOCKET" \
+    display-message -p -t "$PROC_PANE" '#{pane_in_mode}') || return 1
+  _assert_eq "ettun session cleanup: fixture enters copy mode" 1 "$pane_mode"
+
+  set +e
+  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+    active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+    20 0.02 ettun-session >"$output" 2>"$error"
+  status=$?
+  set -e
+  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+
+  _assert_exit "ettun session cleanup: second interrupt completes shutdown" 0 \
+    "$status"
+  _assert_eq "ettun session cleanup: worker receives both interrupt stages" 2 \
+    "$(<"$PROC_CHILD_MARKER")"
+  _assert_not_exists "ettun session cleanup: waiting leader receives no TERM" \
+    "$PROC_LEADER_MARKER"
+  _assert_eq "ettun session cleanup: leaves no separately grouped worker" 0 \
+    "$worker_alive"
+  _assert_eq "ettun session cleanup: has no diagnostic" "" \
+    "$(<"$error")"
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_terminal_interrupt_case() {
   local tmp output error status worker_alive=0
   tmp=$(_tmpdir) || return 1
-  termination_fixture "$tmp" ettun-force || return 1
+  termination_fixture "$tmp" ettun-interrupt || return 1
   output=$tmp/output
   error=$tmp/error
 
@@ -625,13 +731,15 @@ ettun_session_force_stop_case() {
   set -e
   kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
 
-  _assert_exit "ettun session cleanup: second TERM completes shutdown" 0 \
+  _assert_exit "ettun terminal cleanup: interrupt completes shutdown" 0 \
     "$status"
-  _assert_eq "ettun session cleanup: leader receives both TERM stages" 2 \
-    "$(<"$PROC_LEADER_MARKER")"
-  _assert_eq "ettun session cleanup: leaves no separately grouped worker" 0 \
+  _assert_eq "ettun terminal cleanup: foreground worker receives INT" int \
+    "$(<"$PROC_CHILD_MARKER")"
+  _assert_not_exists "ettun terminal cleanup: waiting leader receives no TERM" \
+    "$PROC_LEADER_MARKER"
+  _assert_eq "ettun terminal cleanup: leaves no foreground worker" 0 \
     "$worker_alive"
-  _assert_eq "ettun session cleanup: has no diagnostic" "" \
+  _assert_eq "ettun terminal cleanup: has no diagnostic" "" \
     "$(<"$error")"
 
   kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
@@ -639,34 +747,38 @@ ettun_session_force_stop_case() {
 }
 
 ettun_session_signal_target_case() {
-  local tmp output error signals status
+  local tmp output error signals fake_tmux expected status
   tmp=$(_tmpdir) || return 1
-  termination_fixture "$tmp" ettun-force || return 1
+  termination_fixture "$tmp" ettun-interrupt-force || return 1
   output=$tmp/output
   error=$tmp/error
   signals=$tmp/signals
+  fake_tmux=$tmp/tmux
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  if [[ $arg == send-keys ]]; then' \
+    '    printf "%s\n" "$*" >>"$FWDPORTS_TEST_SIGNALS"' \
+    '    break' \
+    '  fi' \
+    'done' \
+    'exec "$FWDPORTS_TEST_REAL_TMUX" "$@"' \
+    >"$fake_tmux"
+  chmod 0700 "$fake_tmux"
+  expected="-S $PROC_SOCKET copy-mode -q -t $PROC_PANE ; send-keys -t $PROC_PANE C-c"
 
   set +e
-  (
-    kill() {
-      printf '%s\n' "$*" >>"$FWDPORTS_TEST_SIGNALS"
-      builtin kill "$@"
-    }
-    FWDPORTS_TEST_SIGNALS=$signals \
-      fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" \
-      "$PROC_ROOT" active "$PROC_GENERATION" "$PROC_DIGEST" \
-      "$PROC_EVIDENCE" 20 0.02 ettun-session >"$output" 2>"$error"
-  )
+  FWDPORTS_TEST_SIGNALS=$signals FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN \
+    fwdports_tmux_terminate_pane "$fake_tmux" "$PROC_SOCKET" \
+    "$PROC_ROOT" active "$PROC_GENERATION" "$PROC_DIGEST" \
+    "$PROC_EVIDENCE" 20 0.02 ettun-session >"$output" 2>"$error"
   status=$?
   set -e
 
   _assert_exit "ettun session signal: cleanup succeeds" 0 "$status"
-  _assert_eq "ettun session signal: each TERM targets only the pane leader" \
-    $'-TERM -- '"$PROC_LEADER"$'\n-TERM -- '"$PROC_LEADER" \
+  _assert_eq "ettun session signal: each interrupt targets the exact pane" \
+    "$expected"$'\n'"$expected" \
     "$(<"$signals")"
-  _assert_not_contains \
-    "ettun session signal: no TERM is duplicated across the runner group" \
-    "-$PROC_PGID" "$(<"$signals")"
 
   kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
   kill_test_server "$PROC_SOCKET"
@@ -700,15 +812,33 @@ ettun_session_getsid_scope_case() {
   _assert_eq "ettun getsid session: has no tty-filter diagnostic" "" \
     "$(<"$error")"
 
+  set +e
+  (
+    _fwdports_process_session_records() { return 2; }
+    _fwdports_verify_owned_session "$PROC_GENERATION" "$PROC_DIGEST" \
+      "$PROC_EVIDENCE" >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+  _assert_exit "ettun getsid session: inspection failure is preserved" 2 \
+    "$status"
+  _assert_contains "ettun getsid session: inspection failure is actionable" \
+    "cannot inspect the recorded process session" "$(<"$error")"
+  _assert_not_contains \
+    "ettun getsid session: inspection failure is not reported as absence" \
+    "no longer live" "$(<"$error")"
+
   kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
   kill_test_server "$PROC_SOCKET"
 }
 
 darwin_session_enumerator_case() {
-  local tmp fake_bin output status wanted_sid test_pid test_pgid
-  local python_path test_uid foreign_uid snapshot
+  local tmp fake_bin runtime evidence output status wanted_sid test_pid
+  local test_pgid python_path test_uid foreign_uid
   tmp=$(_tmpdir) || return 1
   fake_bin=$tmp/bin
+  runtime=$tmp/runtime
+  evidence=$runtime/pane
   output=$tmp/output
   python_path=$(python3 -c \
     'import os, sys; print(os.path.realpath(sys.executable))') || return 1
@@ -721,27 +851,30 @@ darwin_session_enumerator_case() {
   test_pgid=$("$python_path" -c \
     'import os, sys; print(os.getpgid(int(sys.argv[1])))' \
     "$test_pid") || return 1
-  mkdir -p "$fake_bin"
+  mkdir -p "$fake_bin" "$runtime"
+  chmod 0700 "$runtime"
+  write_session_enumerator_runtime "$runtime" "$python_path" || return 1
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'printf "%s 1 1 ?? Ss\n%s 99999999 99999999 ?? S\n%s %s %s ttys001 S\n" "$FWDPORTS_TEST_FOREIGN_UID" "$FWDPORTS_TEST_UID" "$FWDPORTS_TEST_UID" "$FWDPORTS_TEST_PID" "$FWDPORTS_TEST_PGID"' \
+    'printf "%s 1 1 ?? Ss\n-2 99999998 99999998 ?? S\n%s 99999999 99999999 ?? S\n%s %s %s ttys001 S\n" "$FWDPORTS_TEST_FOREIGN_UID" "$FWDPORTS_TEST_UID" "$FWDPORTS_TEST_UID" "$FWDPORTS_TEST_PID" "$FWDPORTS_TEST_PGID"' \
     >"$fake_bin/ps"
   chmod 0700 "$fake_bin/ps"
-  snapshot=$(PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_UID=$test_uid \
-    FWDPORTS_TEST_FOREIGN_UID=$foreign_uid FWDPORTS_TEST_PID=$test_pid \
-    FWDPORTS_TEST_PGID=$test_pgid ps -e) || return 1
-
   set +e
-  "$python_path" "$ROOT/lib/fwdports/session-enumerator.py" "$wanted_sid" \
-    <<<"$snapshot" \
-    >"$output" 2>/dev/null
+  (
+    _fwdports_tmux_platform_is_darwin() { return 0; }
+    PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_UID=$test_uid \
+      FWDPORTS_TEST_FOREIGN_UID=$foreign_uid FWDPORTS_TEST_PID=$test_pid \
+      FWDPORTS_TEST_PGID=$test_pgid \
+      _fwdports_process_session_records "$wanted_sid" "$evidence" \
+      >"$output" 2>/dev/null
+  )
   status=$?
   set -e
 
   _assert_exit "Darwin session enumeration: getsid selector succeeds" 0 \
     "$status"
   _assert_eq \
-    "Darwin session enumeration: tolerates ESRCH and excludes another UID" \
+    "Darwin session enumeration: tolerates signed foreign UID and ESRCH" \
     "$test_pid"$'\t'"$test_pgid"$'\t'"ttys001"$'\tS' "$(<"$output")"
 }
 
@@ -1284,6 +1417,7 @@ run_case kill-escalation kill_escalation_case
 run_case leader-missing leader_missing_case
 run_case ettun-session-reap-handoff ettun_session_reap_handoff_case
 run_case ettun-session-force-stop ettun_session_force_stop_case
+run_case ettun-terminal-interrupt ettun_terminal_interrupt_case
 run_case ettun-session-signal-target ettun_session_signal_target_case
 run_case ettun-session-getsid-scope ettun_session_getsid_scope_case
 run_case ettun-runner-graceful ettun_runner_graceful_case

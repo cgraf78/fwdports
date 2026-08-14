@@ -116,11 +116,14 @@ et_signal_case() {
   mkdir -p "$runtime"
   chmod 0700 "$runtime"
   printf '%s\n' et >"$runtime/driver-kind"
+  # The parent treats PID publication as proof that the child can receive the
+  # forwarded TERM. Install every relevant trap first so scheduler timing
+  # cannot turn that readiness handshake into a false signal failure.
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'printf "%s\n" "$$" >"$FWDPORTS_TEST_ET_PID"' \
     'trap '\''printf "term\n" >"$FWDPORTS_TEST_ET_TERM"; exit 0'\'' TERM' \
     'trap "exit 0" HUP INT' \
+    'printf "%s\n" "$$" >"$FWDPORTS_TEST_ET_PID"' \
     'while :; do sleep 0.02; done' >"$runtime/et-gate"
   chmod 0700 "$runtime/et-gate"
 
@@ -182,11 +185,15 @@ ettun_int_disposition_case() {
   mkdir -p "$runtime"
   chmod 0700 "$runtime"
   printf '%s\n' ettun >"$runtime/driver-kind"
+  # The PID file doubles as the readiness signal below. Publish it only after
+  # both traps exist; otherwise the test can deliver INT in the small window
+  # between process discovery and trap installation and mistake normal signal
+  # termination for a failure of the runner's exec contract.
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'printf "%s\n" "$$" >"$FWDPORTS_TEST_ETTUN_PID"' \
     'trap '\''printf "int\n" >"$FWDPORTS_TEST_ETTUN_INT"; exit 130'\'' INT' \
     'trap '\''exit 143'\'' TERM' \
+    'printf "%s\n" "$$" >"$FWDPORTS_TEST_ETTUN_PID"' \
     'while :; do sleep 0.02; done' \
     >"$runtime/ettun-gate"
   chmod 0700 "$runtime/ettun-gate"

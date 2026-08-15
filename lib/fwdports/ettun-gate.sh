@@ -83,8 +83,26 @@ IFS=$'\t' read -r _ettun_source ettun_digest extra <<<"$ettun_record"
   publish_drift ettun-generation-drift
 ettun_path=$GATE_DIR/ettun-engine
 
+remote_port_slot=''
+remote_port_slot_records=0
+[[ -f $GATE_DIR/ettun-remote-port-slot-v1 &&
+  ! -L $GATE_DIR/ettun-remote-port-slot-v1 ]] ||
+  publish_drift ettun-generation-drift
+while IFS= read -r element || [[ -n $element ]]; do
+  remote_port_slot_records=$((remote_port_slot_records + 1))
+  [[ $remote_port_slot_records -eq 1 &&
+    $element =~ ^(0|[1-9][0-9]{0,2})$ ]] ||
+    publish_drift ettun-generation-drift
+  remote_port_slot=$element
+done <"$GATE_DIR/ettun-remote-port-slot-v1"
+[[ $remote_port_slot_records -eq 1 ]] ||
+  publish_drift ettun-generation-drift
+remote_port_slot=$((10#$remote_port_slot))
+((remote_port_slot <= 818)) || publish_drift ettun-generation-drift
+
 transport_name=''
 transport_records=0
+transport_single_invocation=0
 [[ -f $GATE_DIR/ettun-transport && ! -L $GATE_DIR/ettun-transport ]] ||
   publish_drift ettun-generation-drift
 while IFS= read -r element || [[ -n $element ]]; do
@@ -107,6 +125,24 @@ if [[ -n $transport_name ]]; then
     ! -L $GATE_DIR/ettun-transport-exec &&
     $(gate_sha256 "$GATE_DIR/ettun-transport-exec") == "$transport_digest" ]] ||
     publish_drift ettun-generation-drift
+  capabilities=()
+  capability_count=0
+  [[ -f $GATE_DIR/ettun-transport-capabilities &&
+    ! -L $GATE_DIR/ettun-transport-capabilities ]] ||
+    publish_drift ettun-generation-drift
+  while IFS= read -r capability || [[ -n $capability ]]; do
+    [[ $capability =~ ^[a-z][a-z0-9-]{0,63}$ ]] ||
+      publish_drift ettun-generation-drift
+    capability_count=$((capability_count + 1))
+    ((capability_count <= 32)) || publish_drift ettun-generation-drift
+    for prior in "${capabilities[@]+"${capabilities[@]}"}"; do
+      [[ $prior != "$capability" ]] ||
+        publish_drift ettun-generation-drift
+    done
+    capabilities+=("$capability")
+    [[ $capability != single-invocation-v1 ]] ||
+      transport_single_invocation=1
+  done <"$GATE_DIR/ettun-transport-capabilities"
   unset ETTUN_ET
   ETTUN_TRANSPORT=$GATE_DIR/ettun-transport-exec
   export ETTUN_TRANSPORT
@@ -130,13 +166,39 @@ while IFS= read -r element || [[ -n $element ]]; do
   argv+=("$element")
 done <"$GATE_DIR/ettun-argv"
 [[ -n ${argv[0]+set} ]] || publish_drift ettun-generation-drift
-[[ ${#argv[@]} -eq 4 && -d $GATE_DIR/ettun-tmp &&
+
+# The engine retains its original four-argument local-only contract. The
+# explicit contract is canonicalized by generation preparation: reverse-only
+# has one option group, while a mixed route always places local before reverse.
+# Accepting only those exact shapes prevents a tampered runtime record from
+# smuggling arbitrary engine flags through this privileged launch boundary.
+argv_shape_valid=0
+case ${#argv[@]} in
+  4)
+    argv_shape_valid=1
+    ;;
+  5)
+    [[ ${argv[1]} == --reverse ]] && argv_shape_valid=1
+    ;;
+  9)
+    [[ ${argv[1]} == --local && ${argv[5]} == --reverse ]] &&
+      argv_shape_valid=1
+    ;;
+esac
+[[ $argv_shape_valid -eq 1 && -d $GATE_DIR/ettun-tmp &&
   ! -L $GATE_DIR/ettun-tmp ]] || publish_drift ettun-generation-drift
 
 # Ambient knobs would change remote ownership without being present in the
 # immutable manifest. The selected transport was pinned above; temporary state
 # remains generation-private.
-unset ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT
+unset ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT ETTUN_REMOTE_PORT_SLOT_V1 \
+  ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
+ETTUN_REMOTE_PORT_SLOT_V1=$remote_port_slot
+export ETTUN_REMOTE_PORT_SLOT_V1
+if ((transport_single_invocation == 1)); then
+  ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1
+  export ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
+fi
 TMPDIR=$GATE_DIR/ettun-tmp
 TMP=$TMPDIR
 TEMP=$TMPDIR

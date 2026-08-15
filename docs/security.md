@@ -112,16 +112,24 @@ before/after identity and digest checks. The launch gate reauthenticates the
 installed sources immediately before launch, then executes the engine snapshot
 and exports only the adapter snapshot. Engine worker re-execs and repeated
 adapter calls therefore stay on the same reviewed bytes for the generation.
-The gate also removes ambient transport and client-identity overrides that are
-absent from the manifest and pins temporary state beneath the generation. Only
-a loopback-bound local forward is accepted by this built-in.
+Capability discovery and dependency validation are repeated against the
+immutable snapshot before it may receive a foreground preparation call.
+All legs validate before any such call, and all calls finish before tmux can
+start. The gate also removes ambient transport and client-identity overrides
+that are absent from the manifest, replaces any ambient remote-port slot with
+the generation-assigned value, pins an authenticated single-invocation adapter
+assertion, and keeps temporary state beneath the generation. Distinct slots are
+allocated without replacement and exclude declared route endpoint residues;
+malformed or missing slot evidence fails closed before the engine runs. Only
+loopback-bound local and reverse forwards are accepted by this built-in.
 
 The default stock-ET route never exposes the raw ET executable to ettun. It
 exports a generation-owned wrapper that accepts only ettun's reviewed ET 7.0.0
-argv shape, fixes `TERM`, disables telemetry, uses private temporary state, and
-places the same authenticated SSH shim used by the direct ET driver first on
-`PATH`. Ambient SSH forwarding, remote commands, agents, environment, and
-proxy routing are rejected before ET starts and rechecked at its bootstrap.
+local and reverse argv shapes, fixes `TERM`, disables telemetry, uses private
+temporary state, and places the same authenticated SSH shim used by the direct
+ET driver first on `PATH`. Ambient SSH forwarding, remote commands, agents,
+environment, and proxy routing are rejected before ET starts and rechecked at
+its bootstrap.
 
 ## Crash behavior
 

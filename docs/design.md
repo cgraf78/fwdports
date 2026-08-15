@@ -11,8 +11,9 @@ driver.
 The built-ins are `ssh`, explicit `autossh`, explicit stock Eternal Terminal
 (`et`), and explicit public `ettun`. Extensions are executable boundaries: the
 versioned driver API adds a complete driver, while an ettun `transport` adapter
-only supplies ettun's three-argument connection contract. There are no sourced
-plug-ins, raw shell command options, or evaluated configuration fragments.
+supplies ettun's legacy or capability-negotiated connection contract and may
+opt into one foreground preparation operation. There are no sourced plug-ins,
+raw shell command options, or evaluated configuration fragments.
 
 ## Commands
 
@@ -125,15 +126,19 @@ The `ettun` built-in understands:
 
 ```text
 host
-local-forward
+local-forward (optional)
+remote-forward (optional)
 transport (optional)
 ```
 
-`host` is the ET-accessible relay host. Exactly one `local-forward` is required
-in the explicit `127.0.0.1:LOCAL_PORT:TARGET:TARGET_PORT` form. Those four
-fields become the public `ettun VIA LOCAL_PORT TARGET TARGET_PORT` interface;
-non-loopback binds, reverse forwards, sockets, ranges, and raw IPv6 literals
-are rejected. A matching local check is required so process liveness cannot be
+`host` is the ET-accessible relay host. At most one `local-forward` and at most
+one `remote-forward` may use the explicit
+`127.0.0.1:BIND_PORT:TARGET:TARGET_PORT` form; at least one route is required.
+Local-only profiles retain the public
+`ettun VIA LOCAL_PORT TARGET TARGET_PORT` interface. Reverse-only and mixed
+profiles use ettun's explicit `--local` and `--reverse` groups. Non-loopback
+binds, sockets, ranges, and raw IPv6 literals are rejected. A matching local
+check is required whenever a local route exists so process liveness cannot be
 reported as endpoint health.
 
 Preparation resolves and authenticates both the public `ettun` executable and
@@ -156,13 +161,37 @@ otherwise escape the pane process session, and must implement a noninteractive
 dependencies are usable. Validation may write actionable diagnostics to
 standard error; its standard output is ignored.
 
+Adapter capabilities are queried noninteractively with
+`--ettun-capabilities` and retained as a bounded, validated generation record.
+A reverse route requires `connect-v2`. If the adapter also declares
+`fwdports-prepare-v1`, fwdports invokes the immutable adapter snapshot as
+`ADAPTER --fwdports-prepare-v1 MANIFEST LEG RUNTIME_DIR` after every leg has
+validated and before creating tmux. That operation inherits the invoking
+terminal, may write private state only beneath its runtime directory, and must
+return synchronously without surviving descendants. Adapters without the
+capability retain the existing noninteractive start path.
+
+The public engine must advertise `remote-port-slot-v1`. Before foreground
+preparation, fwdports assigns every ettun leg one distinct slot from 0 through
+818 in canonical manifest order. Assignment starts from the manifest digest,
+uses deterministic open addressing, and excludes the slot residue of every
+declared route endpoint port in the generated range. The engine maps
+attempt, role, and slot as
+`49152 + (attempt * 4 + role) * 819 + slot`, partitioning 16,380 ports across
+five attempts and four remote roles. Its local control listener remains in the
+same slot while avoiding the current remote tuple. Exhaustion fails before any
+interactive preparation or tmux creation.
+
 Preparation copies the engine and any selected adapter into generation-owned
 snapshots after before/after identity and digest checks. The generation gate
 rechecks the installed executable identities and hashes immediately before
 launch, executes the engine snapshot, removes ambient ettun transport and
-identity overrides, exports only the adapter snapshot, and keeps temporary
-state generation-private. That keeps worker re-execs and later adapter calls
-on one immutable set of bytes. The stock-ET path exports a generation-owned ET
+identity and allocation overrides, exports only the generation's slot and
+adapter snapshot, and keeps temporary state generation-private. An authenticated
+`single-invocation-v1` capability is converted into a pinned engine assertion;
+ambient assertions are removed. That keeps worker re-execs and later adapter
+calls on one immutable set of bytes and one prepared retry policy. The stock-ET
+path exports a generation-owned ET
 wrapper instead of the raw executable. That wrapper fixes `TERM`, disables
 telemetry, binds and rechecks ET's effective SSH view, and routes the reviewed
 bootstrap shape through the private hardened SSH shim. `ettun` owns its

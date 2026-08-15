@@ -13,6 +13,12 @@ TMUX_BIN=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux)}
 
 # shellcheck source=lib/test.sh
 source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
+# shellcheck source=../lib/fwdports/tmux.sh
+source "$ROOT/lib/fwdports/tmux.sh"
+# shellcheck source=../lib/fwdports/core.sh
+source "$ROOT/lib/fwdports/core.sh"
 
 run_fwdports() {
   local output=$1
@@ -77,7 +83,8 @@ configured_health_case() {
 }
 
 tmux_observability_case() {
-  local tmp config output generation session windows labels heights
+  local tmp config output generation session windows labels heights pointer
+  local digest attach_record expected_record attach_snapshot
   local border_status border_format selected_window first_height second_height
   tmp=$(_tmpdir) || return 1
   setup_case_root "$tmp"
@@ -85,12 +92,12 @@ tmux_observability_case() {
   output=$tmp/output
   printf '%s\n' \
     'profile default' \
-    'leg first' \
-    'set first host shell.example.com' \
-    'set first remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
-    'leg second' \
-    'set second host shell.example.com' \
-    'set second remote-forward 127.0.0.1:19091:127.0.0.1:9091' >"$config"
+    'leg z-first' \
+    'set z-first host shell.example.com' \
+    'set z-first remote-forward 127.0.0.1:19090:127.0.0.1:9090' \
+    'leg a-second' \
+    'set a-second host shell.example.com' \
+    'set a-second remote-forward 127.0.0.1:19091:127.0.0.1:9091' >"$config"
   chmod 0600 "$config"
 
   FWDPORTS_TEST_PANE_TITLE=transport-output run_fwdports "$output" start
@@ -98,7 +105,7 @@ tmux_observability_case() {
     0 "$COMMAND_STATUS"
   generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
   session=$(LC_ALL=C sed -n $'s/^session-id\t//p' \
-    "$generation/legs/first/pane")
+    "$generation/legs/z-first/pane")
   windows=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$CASE_SOCKET" \
     -f /dev/null list-windows -t "$session" \
     -F $'#{window_name}\t#{window_panes}\t#{window_active}' 2>/dev/null) ||
@@ -124,7 +131,7 @@ tmux_observability_case() {
   _assert_contains "tmux observability: controller has a separate window" \
     $'control\t1\t0' "$windows"
   _assert_eq "tmux observability: every transport pane names leg and driver" \
-    $'first [ssh]\nsecond [ssh]' "$labels"
+    $'z-first [ssh]\na-second [ssh]' "$labels"
   _assert_eq "tmux observability: transport labels are visible" \
     top "$border_status"
   _assert_eq "tmux observability: pane border renders the stable label" \
@@ -140,6 +147,16 @@ tmux_observability_case() {
   else
     _fail "tmux observability: transport panes share space evenly (heights '$heights')"
   fi
+
+  pointer=$(fwdports_pointer_read "$CASE_STATE/fwdports" active) || return 1
+  IFS=$'\t' read -r _ digest <<<"$pointer"
+  attach_snapshot=$tmp/attach-manifest
+  attach_record=$(_fwdports_attach_pane_record "$generation" "$digest" \
+    "$attach_snapshot") || return 1
+  expected_record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
+    "$generation/legs/z-first/pane") || return 1
+  _assert_eq "tmux attach: declaration order wins over lexical leg order" \
+    "$expected_record" "$attach_record"
 
   run_fwdports "$output" stop
   _assert_exit "tmux observability: split-window profile stops cleanly" \
@@ -520,7 +537,7 @@ custom_adapter_dependency_failure_case() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
     '  exit 0' \
     'fi' \
     'exit 0' >"$CASE_ETTUN"
@@ -803,7 +820,7 @@ ettun_lifecycle_case() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -u' \
-    'if [[ ${1:-} == --help ]]; then printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == --help ]]; then printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2; exit 0; fi' \
     '{' \
     '  printf "ETTUN_ET=%s\nTMPDIR=%s\n" "${ETTUN_ET:-}" "${TMPDIR:-}"' \
     '  printf "ARG=%s\n" "$@"' \

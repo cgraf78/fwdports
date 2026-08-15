@@ -91,6 +91,8 @@ _fwdports_executable_parent_chain_trusted() {
   # platform boundary; a caller-controlled PREFIX on ordinary Unix must not
   # excuse a writable ancestor.
   if _fwdports_termux_prefix_anchor; then
+    # The helper succeeds only in Termux, where PREFIX is an ambient contract.
+    # shellcheck disable=SC2153
     canonical_candidate=$(cd -P -- "$PREFIX" 2>/dev/null && pwd -P) ||
       return 1
     case "$directory" in
@@ -380,6 +382,73 @@ _fwdports_ettun_safe_destination() {
   [[ $1 =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]]
 }
 
+_fwdports_ettun_assign_remote_port_slot() {
+  local manifest=$1 requested_leg=$2 output=$3
+  local digest prefix origin kind leg key value _extra
+  local source_port destination_port port slot
+  local cursor candidate probe selected
+  local -a forbidden=() used=()
+
+  [[ -f $manifest && ! -L $manifest ]] || return 1
+  digest=$(_fwdports_sha256_file "$manifest") || return 1
+  [[ $digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  prefix=${digest:0:4}
+  origin=$((16#$prefix % 819))
+
+  # Every generated port for one slot has the same residue modulo 819. Generated
+  # listeners exist on both sides of the transport, so reserve both endpoints
+  # of every declared route before assigning a leg. This prevents a generated
+  # control/data listener from preempting a fixed service that starts later.
+  while IFS=$'\t' read -r kind leg key value _extra ||
+    [[ -n ${kind:-} ]]; do
+    [[ $kind == set &&
+      ($key == local-forward || $key == remote-forward) ]] || continue
+    source_port=$(_fwdports_local_forward_port "$value") || continue
+    destination_port=${value##*:}
+    if [[ ! $destination_port =~ ^[0-9]{1,5}$ ]] ||
+      ((10#$destination_port < 1 || 10#$destination_port > 65535)); then
+      destination_port=''
+    fi
+    for port in "$source_port" "$destination_port"; do
+      [[ -n $port ]] || continue
+      port=$((10#$port))
+      ((port >= 49152 && port <= 65531)) || continue
+      slot=$(((port - 49152) % 819))
+      forbidden[slot]=1
+    done
+  done <"$manifest"
+
+  # Assign without replacement in canonical manifest order. The digest-derived
+  # origin avoids making one slot a permanent hot spot while open addressing
+  # makes the result independent of per-leg preparation order.
+  cursor=$origin
+  while IFS=$'\t' read -r kind leg key _ || [[ -n ${kind:-} ]]; do
+    [[ $kind == leg && $key == ettun ]] || continue
+    selected=-1
+    for ((probe = 0; probe < 819; probe++)); do
+      candidate=$(((cursor + probe) % 819))
+      [[ ${forbidden[$candidate]:-0} -eq 0 &&
+        ${used[$candidate]:-0} -eq 0 ]] || continue
+      selected=$candidate
+      break
+    done
+    if ((selected < 0)); then
+      printf '%s\n' \
+        'fwdports: no remote port slot is available for ettun legs' >&2
+      return 1
+    fi
+    used[selected]=1
+    cursor=$(((selected + 1) % 819))
+    [[ $leg == "$requested_leg" ]] || continue
+    _fwdports_write_private_lines "$output" "$selected"
+    return
+  done <"$manifest"
+
+  printf 'fwdports: ettun leg is unavailable for remote port assignment: %s\n' \
+    "$requested_leg" >&2
+  return 1
+}
+
 _fwdports_ettun_local_forward_has_check() {
   local manifest=$1 leg_name=$2 bind_host=$3 bind_port=$4
   local kind leg probe_type host port _label _extra
@@ -399,8 +468,10 @@ fwdports_ettun_build_argv() {
   local manifest=$1 leg_name=$2 target_override=$3 argv_output=$4
   local transport_output=${5:-}
   local kind leg key value _extra driver='' host='' local_forward=''
-  local transport=''
+  local remote_forward='' transport=''
   local via record bind_host bind_port destination_host destination_port
+  local reverse_bind_host reverse_bind_port reverse_host reverse_port
+  local -a route_argv=()
 
   [[ -f $manifest && ! -L $manifest ]] || {
     printf 'fwdports: resolved manifest is unavailable\n' >&2
@@ -431,6 +502,14 @@ fwdports_ettun_build_argv() {
             }
             local_forward=$value
             ;;
+          remote-forward)
+            [[ -z $remote_forward ]] || {
+              printf 'fwdports: ettun accepts at most one remote-forward per leg\n' \
+                >&2
+              return 1
+            }
+            remote_forward=$value
+            ;;
           *)
             printf 'fwdports: unknown ettun key for leg %s: %s\n' \
               "$leg_name" "$key" >&2
@@ -451,30 +530,61 @@ fwdports_ettun_build_argv() {
       "$leg_name" >&2
     return 1
   }
-  [[ -n $local_forward ]] || {
-    printf 'fwdports: ettun requires exactly one local-forward per leg\n' >&2
+  [[ -n $local_forward || -n $remote_forward ]] || {
+    printf 'fwdports: ettun requires a local-forward or remote-forward per leg\n' \
+      >&2
     return 1
   }
-  record=$(_fwdports_et_forward_record "$local_forward") || {
-    printf 'fwdports: ettun local-forward must use four-part network syntax\n' >&2
-    return 1
-  }
-  IFS=$'\t' read -r bind_host bind_port destination_host destination_port \
-    <<<"$record"
-  [[ $bind_host == 127.0.0.1 ]] || {
-    printf 'fwdports: ettun local-forward must bind 127.0.0.1\n' >&2
-    return 1
-  }
-  _fwdports_ettun_safe_destination "$destination_host" || {
-    printf 'fwdports: ettun destination host is unsafe for leg %s\n' \
-      "$leg_name" >&2
-    return 1
-  }
-  _fwdports_ettun_local_forward_has_check "$manifest" "$leg_name" \
-    "$bind_host" "$bind_port" || return 1
+  if [[ -n $local_forward ]]; then
+    record=$(_fwdports_et_forward_record "$local_forward") || {
+      printf 'fwdports: ettun local-forward must use four-part network syntax\n' >&2
+      return 1
+    }
+    IFS=$'\t' read -r bind_host bind_port destination_host destination_port \
+      <<<"$record"
+    [[ $bind_host == 127.0.0.1 ]] || {
+      printf 'fwdports: ettun local-forward must bind 127.0.0.1\n' >&2
+      return 1
+    }
+    _fwdports_ettun_safe_destination "$destination_host" || {
+      printf 'fwdports: ettun destination host is unsafe for leg %s\n' \
+        "$leg_name" >&2
+      return 1
+    }
+    _fwdports_ettun_local_forward_has_check "$manifest" "$leg_name" \
+      "$bind_host" "$bind_port" || return 1
+  fi
+  if [[ -n $remote_forward ]]; then
+    record=$(_fwdports_et_forward_record "$remote_forward") || {
+      printf 'fwdports: ettun remote-forward must use four-part network syntax\n' >&2
+      return 1
+    }
+    IFS=$'\t' read -r reverse_bind_host reverse_bind_port reverse_host \
+      reverse_port <<<"$record"
+    [[ $reverse_bind_host == 127.0.0.1 ]] || {
+      printf 'fwdports: ettun remote-forward must bind 127.0.0.1\n' >&2
+      return 1
+    }
+    _fwdports_ettun_safe_destination "$reverse_host" || {
+      printf 'fwdports: ettun reverse destination is unsafe for leg %s\n' \
+        "$leg_name" >&2
+      return 1
+    }
+  fi
 
-  _fwdports_write_private_lines "$argv_output" "$via" "$bind_port" \
-    "$destination_host" "$destination_port" || return 1
+  if [[ -n $local_forward && -z $remote_forward ]]; then
+    # Preserve the original four-line engine contract for local-only profiles.
+    route_argv=("$via" "$bind_port" "$destination_host" "$destination_port")
+  else
+    route_argv=("$via")
+    if [[ -n $local_forward ]]; then
+      route_argv+=(--local "$bind_port" "$destination_host" "$destination_port")
+    fi
+    if [[ -n $remote_forward ]]; then
+      route_argv+=(--reverse "$reverse_bind_port" "$reverse_host" "$reverse_port")
+    fi
+  fi
+  _fwdports_write_private_lines "$argv_output" "${route_argv[@]}" || return 1
   if [[ -n $transport_output ]]; then
     if [[ -n $transport ]]; then
       _fwdports_write_private_lines "$transport_output" "$transport" || {
@@ -1133,6 +1243,12 @@ fwdports_ettun_resolve() {
       >&2
     return 1
   }
+  [[ $help_text == *'Provider contract: remote-port-slot-v1'* ]] || {
+    printf '%s\n' \
+      'fwdports: executable does not support the remote-port-slot-v1 contract' \
+      >&2
+    return 1
+  }
   fwdports_ettun_validate_local_dependencies || return 1
   digest=$(_fwdports_sha256_file "$path") || {
     printf 'fwdports: cannot hash ettun executable\n' >&2
@@ -1157,9 +1273,107 @@ fwdports_ettun_resolve() {
   fi
 }
 
+_fwdports_ettun_transport_validate() {
+  local path=$1
+
+  if ! (
+    unset ETTUN_ET ETTUN_TRANSPORT ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT \
+      ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
+    "$path" --fwdports-validate </dev/null >/dev/null
+  ); then
+    printf 'fwdports: ettun transport adapter dependency validation failed\n' \
+      >&2
+    return 1
+  fi
+}
+
+_fwdports_ettun_transport_query_capabilities() {
+  local path=$1 output_path=$2 output line prior count=0 query_status=0
+  local -a capabilities=()
+
+  # Capability discovery must not consume the caller's terminal. A legacy
+  # adapter which does not implement the query remains a valid local-only
+  # transport and is represented by an empty capability record.
+  output=$(
+    unset ETTUN_ET ETTUN_TRANSPORT ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT \
+      ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
+    "$path" --ettun-capabilities </dev/null 2>/dev/null
+  ) || query_status=$?
+  ((${#output} <= 4096)) || {
+    printf 'fwdports: ettun transport adapter capability output is invalid\n' \
+      >&2
+    return 1
+  }
+  ((query_status == 0)) || output=
+  if [[ -n $output ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line =~ ^[a-z][a-z0-9-]{0,63}$ ]] || {
+        printf 'fwdports: ettun transport adapter capability output is invalid\n' \
+          >&2
+        return 1
+      }
+      count=$((count + 1))
+      ((count <= 32)) || {
+        printf 'fwdports: ettun transport adapter capability output is invalid\n' \
+          >&2
+        return 1
+      }
+      for prior in "${capabilities[@]+"${capabilities[@]}"}"; do
+        [[ $prior != "$line" ]] || {
+          printf 'fwdports: ettun transport adapter capability output is invalid\n' \
+            >&2
+          return 1
+        }
+      done
+      capabilities+=("$line")
+    done <<<"$output"
+  fi
+  if ((count == 0)); then
+    _fwdports_write_private_lines "$output_path"
+  else
+    _fwdports_write_private_lines "$output_path" "${capabilities[@]}"
+  fi
+}
+
+_fwdports_ettun_capability_file_has() {
+  local capability_file=$1 requested=$2 line
+
+  [[ -f $capability_file && ! -L $capability_file ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line != "$requested" ]] || return 0
+  done <"$capability_file"
+  return 1
+}
+
+_fwdports_ettun_capability_files_equal() {
+  local left=$1 right=$2
+
+  [[ -f $left && ! -L $left && -f $right && ! -L $right ]] || return 1
+  [[ $(<"$left") == "$(<"$right")" ]]
+}
+
+_fwdports_ettun_argv_requires_connect_v2() {
+  local argv_file=$1 element
+
+  [[ -f $argv_file && ! -L $argv_file ]] || return 1
+  while IFS= read -r element || [[ -n $element ]]; do
+    [[ $element != --reverse ]] || return 0
+  done <"$argv_file"
+  return 1
+}
+
 fwdports_ettun_transport_resolve() {
-  local requested=$1 output=$2 path stat_record owner mode device inode size
-  local mtime digest old_umask tmp
+  local requested=$1 output=$2 required_capability=${3:-}
+  local capabilities_output=${4:-} capability_record path stat_record
+  local owner mode device inode size mtime digest old_umask tmp
+
+  [[ -z $required_capability ||
+    $required_capability =~ ^[a-z][a-z0-9-]{0,63}$ ]] || return 1
+  [[ -z $capabilities_output || $capabilities_output != "$output" ]] ||
+    return 1
+  rm -f -- "$output" || return 1
+  [[ -z $capabilities_output ]] ||
+    rm -f -- "$capabilities_output" || return 1
 
   path=$(_fwdports_canonical_executable "$requested") || {
     printf 'fwdports: ettun transport adapter is not available: %s\n' \
@@ -1176,16 +1390,24 @@ fwdports_ettun_transport_resolve() {
     printf 'fwdports: ettun transport adapter has untrusted metadata\n' >&2
     return 1
   fi
-  if ! (
-    unset ETTUN_ET ETTUN_TRANSPORT ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT
-    "$path" --fwdports-validate </dev/null >/dev/null
-  ); then
-    printf 'fwdports: ettun transport adapter dependency validation failed\n' \
-      >&2
+  _fwdports_ettun_transport_validate "$path" || return 1
+  capability_record=${capabilities_output:-${output}.capabilities}
+  _fwdports_ettun_transport_query_capabilities "$path" \
+    "$capability_record" || {
+    rm -f -- "$output" "$capability_record"
+    return 1
+  }
+  if [[ -n $required_capability ]] &&
+    ! _fwdports_ettun_capability_file_has "$capability_record" \
+      "$required_capability"; then
+    printf 'fwdports: ettun transport adapter required capability is unavailable: %s\n' \
+      "$required_capability" >&2
+    rm -f -- "$output" "$capability_record"
     return 1
   fi
   digest=$(_fwdports_sha256_file "$path") || {
     printf 'fwdports: cannot hash ettun transport adapter\n' >&2
+    rm -f -- "$capability_record"
     return 1
   }
 
@@ -1193,6 +1415,7 @@ fwdports_ettun_transport_resolve() {
   umask 077
   tmp=$(mktemp "${output}.tmp.XXXXXXXX") || {
     umask "$old_umask"
+    rm -f -- "$capability_record"
     return 1
   }
   umask "$old_umask"
@@ -1203,8 +1426,10 @@ fwdports_ettun_transport_resolve() {
     printf 'digest\t%s\n' "$digest"
   } >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
     rm -f -- "$tmp"
+    rm -f -- "$capability_record"
     return 1
   fi
+  [[ -n $capabilities_output ]] || rm -f -- "$capability_record"
 }
 
 fwdports_ettun_snapshot_executable() {
@@ -1820,40 +2045,48 @@ _fwdports_builtin_prepare_ssh() {
   fi
 }
 
-_fwdports_builtin_prepare_et() {
-  local manifest=$1 leg=$2 runtime=$3 target_override=$4 ssh_path
-  local et_source=$runtime/et-source et_argv=$runtime/et-argv
-  local et_target=$runtime/et-target et_log=$runtime/et-log
+_fwdports_prepare_et_ssh_gates() {
+  local runtime=$1 target=$2 ssh_path
   local ssh_source=$runtime/et-ssh-source
   local ambient_argv=$runtime/et-ssh-ambient-argv
   local ambient_digest=$runtime/et-ssh-ambient-digest
   local bootstrap_argv=$runtime/et-ssh-argv
   local bootstrap_digest=$runtime/et-ssh-bootstrap-digest
 
-  fwdports_et_resolve "${FWDPORTS_ET_COMMAND:-et}" "$et_source" || return 1
-  fwdports_et_build_argv "$manifest" "$leg" "$target_override" \
-    "$et_argv" "$et_target" "$et_log" || return 1
-  fwdports_et_preflight_local_ports "$manifest" "$leg" || return 1
-
-  # ET invokes an ambient command literally named `ssh`. Resolve the same
-  # trusted executable as the SSH built-ins, then route ET through private
-  # generation gates rather than whichever PATH entry appears later.
+  # Both direct ET and stock-ET-backed ettun invoke an ambient command named
+  # `ssh`. Publish the same trusted executable plus ambient and hardened
+  # bootstrap gates for either outer driver. Their ET engine gates remain
+  # separate because those have different argv and lifecycle contracts.
   fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" "$ssh_source" ||
     return 1
   ssh_path=$(LC_ALL=C sed -n 's/^path\t//p' "$ssh_source") || return 1
   [[ -n $ssh_path ]] || return 1
 
   _fwdports_write_private_lines "$ambient_argv" || return 1
-  fwdports_ssh_effective_digest "$ssh_path" "$(<"$et_target")" \
-    "$ambient_argv" "$ambient_digest" et || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$target" "$ambient_argv" \
+    "$ambient_digest" et || return 1
   fwdports_ssh_prepare_gate "$runtime/et-ssh-ambient" "$ssh_source" \
     "$ambient_digest" || return 1
 
   fwdports_et_write_ssh_argv "$bootstrap_argv" || return 1
-  fwdports_ssh_effective_digest "$ssh_path" "$(<"$et_target")" \
-    "$bootstrap_argv" "$bootstrap_digest" || return 1
-  fwdports_ssh_prepare_gate "$runtime/et-ssh-bootstrap" "$ssh_source" \
+  fwdports_ssh_effective_digest "$ssh_path" "$target" "$bootstrap_argv" \
     "$bootstrap_digest" || return 1
+  fwdports_ssh_prepare_gate "$runtime/et-ssh-bootstrap" "$ssh_source" \
+    "$bootstrap_digest"
+}
+
+_fwdports_builtin_prepare_et() {
+  local manifest=$1 leg=$2 runtime=$3 target_override=$4
+  local et_source=$runtime/et-source et_argv=$runtime/et-argv
+  local et_target=$runtime/et-target et_log=$runtime/et-log
+
+  fwdports_et_resolve "${FWDPORTS_ET_COMMAND:-et}" "$et_source" || return 1
+  fwdports_et_build_argv "$manifest" "$leg" "$target_override" \
+    "$et_argv" "$et_target" "$et_log" || return 1
+  fwdports_et_preflight_local_ports "$manifest" "$leg" || return 1
+
+  _fwdports_prepare_et_ssh_gates "$runtime" "$(<"$et_target")" ||
+    return 1
   fwdports_et_prepare_runtime "$runtime"
 }
 
@@ -1872,45 +2105,31 @@ _fwdports_ettun_default_et_via() {
 }
 
 _fwdports_ettun_prepare_stock_et() {
-  local runtime=$1 via ssh_path
-  local ssh_source=$runtime/et-ssh-source
-  local ambient_argv=$runtime/et-ssh-ambient-argv
-  local ambient_digest=$runtime/et-ssh-ambient-digest
-  local bootstrap_argv=$runtime/et-ssh-argv
-  local bootstrap_digest=$runtime/et-ssh-bootstrap-digest
+  local runtime=$1 via
 
   via=$(_fwdports_ettun_default_et_via "$runtime/ettun-argv") || return 1
   _fwdports_write_private_lines "$runtime/et-target" "$via" || return 1
-  fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" "$ssh_source" ||
-    return 1
-  ssh_path=$(LC_ALL=C sed -n 's/^path\t//p' "$ssh_source") || return 1
-  [[ -n $ssh_path ]] || return 1
-
-  _fwdports_write_private_lines "$ambient_argv" || return 1
-  fwdports_ssh_effective_digest "$ssh_path" "$via" "$ambient_argv" \
-    "$ambient_digest" et || return 1
-  fwdports_ssh_prepare_gate "$runtime/et-ssh-ambient" "$ssh_source" \
-    "$ambient_digest" || return 1
-
-  fwdports_et_write_ssh_argv "$bootstrap_argv" || return 1
-  fwdports_ssh_effective_digest "$ssh_path" "$via" "$bootstrap_argv" \
-    "$bootstrap_digest" || return 1
-  fwdports_ssh_prepare_gate "$runtime/et-ssh-bootstrap" "$ssh_source" \
-    "$bootstrap_digest"
+  _fwdports_prepare_et_ssh_gates "$runtime" "$via"
 }
 
 _fwdports_builtin_prepare_ettun() {
   local manifest=$1 leg=$2 runtime=$3 target_override=$4 transport
-  local stock_et=0
+  local stock_et=0 required_capability='' snapshot_capabilities
 
   fwdports_ettun_resolve "${FWDPORTS_ETTUN_COMMAND:-ettun}" \
     "$runtime/ettun-source" || return 1
   fwdports_ettun_build_argv "$manifest" "$leg" "$target_override" \
     "$runtime/ettun-argv" "$runtime/ettun-transport" || return 1
+  _fwdports_ettun_assign_remote_port_slot "$manifest" "$leg" \
+    "$runtime/ettun-remote-port-slot-v1" || return 1
+  if _fwdports_ettun_argv_requires_connect_v2 "$runtime/ettun-argv"; then
+    required_capability=connect-v2
+  fi
   transport=$(<"$runtime/ettun-transport") || return 1
   if [[ -n $transport ]]; then
     fwdports_ettun_transport_resolve "$transport" \
-      "$runtime/ettun-transport-source" || return 1
+      "$runtime/ettun-transport-source" "$required_capability" \
+      "$runtime/ettun-transport-capabilities" || return 1
   else
     stock_et=1
     # The public ettun command uses ET unless a manifest-selected adapter owns
@@ -1926,6 +2145,22 @@ _fwdports_builtin_prepare_ettun() {
   if [[ -n $transport ]]; then
     fwdports_ettun_snapshot_executable "$runtime/ettun-transport-source" \
       "$runtime/ettun-transport-exec" 'ettun transport adapter' || return 1
+    # The capability and dependency probes happened before the mutable source
+    # was hashed. Repeat both against the immutable generation snapshot so a
+    # source replacement during preparation cannot change the selected
+    # contract after validation.
+    _fwdports_ettun_transport_validate \
+      "$runtime/ettun-transport-exec" || return 1
+    snapshot_capabilities=$runtime/ettun-transport-snapshot-capabilities
+    _fwdports_ettun_transport_query_capabilities \
+      "$runtime/ettun-transport-exec" "$snapshot_capabilities" || return 1
+    if ! _fwdports_ettun_capability_files_equal \
+      "$runtime/ettun-transport-capabilities" "$snapshot_capabilities"; then
+      printf '%s\n' \
+        'fwdports: ettun transport adapter capabilities changed during snapshot' \
+        >&2
+      return 1
+    fi
   fi
   _fwdports_ettun_prepare_session_enumerator "$runtime" || return 1
   fwdports_ettun_prepare_runtime "$runtime" "$stock_et"
@@ -1972,7 +2207,7 @@ fwdports_autossh_resolve() {
 
 fwdports_builtin_preflight_dependencies() {
   local manifest=$1 preflight_root=$2 target_override=${3:-}
-  local kind leg driver _ runtime transport via index
+  local kind leg driver _ runtime transport via index required_capability
   local -a legs=() drivers=()
 
   [[ -f $manifest && ! -L $manifest ]] || {
@@ -2029,10 +2264,16 @@ fwdports_builtin_preflight_dependencies() {
           "$runtime/ettun-source" || return 1
         fwdports_ettun_build_argv "$manifest" "$leg" "$target_override" \
           "$runtime/ettun-argv" "$runtime/ettun-transport" || return 1
+        required_capability=
+        if _fwdports_ettun_argv_requires_connect_v2 \
+          "$runtime/ettun-argv"; then
+          required_capability=connect-v2
+        fi
         transport=$(<"$runtime/ettun-transport") || return 1
         if [[ -n $transport ]]; then
           fwdports_ettun_transport_resolve "$transport" \
-            "$runtime/ettun-transport-source" || return 1
+            "$runtime/ettun-transport-source" "$required_capability" \
+            "$runtime/ettun-transport-capabilities" || return 1
         else
           via=$(_fwdports_ettun_default_et_via "$runtime/ettun-argv") ||
             return 1
@@ -2084,4 +2325,30 @@ fwdports_builtin_prepare() {
     rm -f -- "$tmp"
     return 1
   fi
+}
+
+fwdports_builtin_interactive_prepare() {
+  local manifest=$1 leg=$2 driver=$3 runtime=$4
+  local capability_file=$runtime/ettun-transport-capabilities
+  local adapter=$runtime/ettun-transport-exec
+
+  fwdports_driver_is_builtin "$driver" || return 1
+  [[ -f $manifest && ! -L $manifest && -d $runtime && ! -L $runtime ]] ||
+    return 1
+  [[ $driver == ettun ]] || return 0
+
+  # Stock ET and legacy local-only adapters have no foreground preparation
+  # operation. Only a capability authenticated before snapshotting grants the
+  # immutable adapter permission to interact with the user's terminal here.
+  _fwdports_ettun_capability_file_has "$capability_file" \
+    fwdports-prepare-v1 || return 0
+  [[ -f $adapter && -x $adapter && ! -L $adapter ]] || {
+    printf 'fwdports: prepared ettun transport adapter is unavailable\n' >&2
+    return 1
+  }
+  (
+    unset ETTUN_ET ETTUN_TRANSPORT ETTUN_CLIENT_ID ETTUN_BOOTSTRAP_TIMEOUT \
+      ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
+    "$adapter" --fwdports-prepare-v1 "$manifest" "$leg" "$runtime"
+  )
 }

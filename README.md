@@ -51,7 +51,8 @@ check web loopback 8080 web
 Configuration is parsed as records, never evaluated as shell. Omitted drivers
 mean `ssh`; select `autossh` explicitly when its monitor semantics are wanted,
 select `et` for an Eternal Terminal 7.0.0-compatible direct connection, or
-select `ettun` for a relay-backed local forward through an ET host.
+select `ettun` for relay-backed local and/or reverse forwards through an ET
+host.
 See [the design contract](docs/design.md) and the directly tested
 [examples](examples/README.md) for the complete grammar.
 
@@ -118,9 +119,11 @@ ET uses an explicit four-part network form and is deliberately direct-host only
 in its first version; its SSH bootstrap rejects ambient proxy routing and
 other configuration that ET would turn into undeclared forwarding behavior.
 Literal IPv6 targets are deferred; use an SSH alias for an IPv6 host. The
-`ettun` built-in accepts exactly one loopback-bound `local-forward`; its four
-fields map to `ettun VIA LOCAL_PORT TARGET TARGET_PORT`. It resolves and pins
-both `ettun` and its selected transport before creating a tmux session. The
+`ettun` built-in accepts at most one loopback-bound `local-forward` and at most
+one loopback-bound `remote-forward`, with at least one route required.
+Local-only profiles retain `ettun VIA LOCAL_PORT TARGET TARGET_PORT`; reverse
+or mixed profiles use ettun's explicit route form. It resolves and pins both
+`ettun` and its selected transport before creating a tmux session. The
 engine and any custom adapter run from generation-owned snapshots, so worker
 re-execs and later reconnects cannot adopt an upgrade halfway through the
 generation. By default the transport is stock ET 7.0.0 behind the same fixed
@@ -128,6 +131,17 @@ generation. By default the transport is stock ET 7.0.0 behind the same fixed
 as the direct ET built-in. An optional `transport` setting may name an
 executable adapter that supports the noninteractive
 `--fwdports-validate` dependency check described in the design contract.
+Reverse routes additionally require the adapter's `connect-v2` capability.
+An adapter may declare `fwdports-prepare-v1` to receive a foreground
+preparation call after every leg validates and before tmux starts; this keeps
+interactive authentication on the invoking terminal.
+For every generation, fwdports assigns each ettun leg a distinct version-one
+remote-port slot and excludes slots implied by every declared route endpoint
+port. The immutable launch gate pins that allocation, so concurrently started
+legs cannot select overlapping generated relay/control palettes. Adapters that
+declare `single-invocation-v1` are also pinned to one invocation; an external
+authenticated collision then asks the owning command to restart instead of
+repeating adapter authentication.
 See the exact transport limits in [the design contract](docs/design.md).
 Additional drivers are trusted, single-file executables under
 `${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/drivers.d/`. Their versioned argv

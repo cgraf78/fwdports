@@ -84,13 +84,22 @@ while IFS= read -r element || [[ -n $element ]]; do
   target=$element
 done <"$GATE_DIR/et-target"
 
-# This is the reviewed stock-ET call shape from the authenticated public ettun
-# launcher. A future shape fails closed until its SSH/configuration behavior is
-# reviewed, instead of being guessed through the private shim.
-[[ $# -eq 8 && ${1:-} == -N && ${2:-} == --keepalive && ${3:-} == 5 &&
-  ${4:-} == -t && -n ${5:-} && ${6:-} == --command && -n ${7:-} &&
-  ${8:-} == "$target" ]] ||
-  publish_drift ettun-et-generation-drift
+# These are the reviewed stock-ET call shapes from the authenticated public
+# ettun launcher. Every route carries the private ordinary tunnel used for
+# lifecycle control; a reverse route adds one fixed-position -r pair. A future
+# shape fails closed until its SSH/configuration behavior is reviewed.
+et_shape_valid=0
+if [[ $# -eq 8 && ${1:-} == -N && ${2:-} == --keepalive &&
+  ${3:-} == 5 && ${4:-} == -t && -n ${5:-} &&
+  ${6:-} == --command && -n ${7:-} && ${8:-} == "$target" ]]; then
+  et_shape_valid=1
+elif [[ $# -eq 10 && ${1:-} == -N && ${2:-} == --keepalive &&
+  ${3:-} == 5 && ${4:-} == -t && -n ${5:-} &&
+  ${6:-} == -r && -n ${7:-} && ${8:-} == --command &&
+  -n ${9:-} && ${10:-} == "$target" ]]; then
+  et_shape_valid=1
+fi
+[[ $et_shape_valid -eq 1 ]] || publish_drift ettun-et-generation-drift
 
 "$GATE_DIR/et-ssh-ambient/ssh-gate" --check-only "$target" || exit $?
 

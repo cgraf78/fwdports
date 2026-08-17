@@ -255,7 +255,14 @@ _fwdports_start_generation() {
   done
   for ((index = 0; index < ${#legs[@]}; index++)); do
     driver=${drivers[index]}
-    if ! fwdports_driver_is_builtin "$driver"; then
+    if fwdports_driver_is_builtin "$driver"; then
+      # Built-in adapters may opt into a foreground-only preparation phase.
+      # It runs after every leg has validated, but before tmux exists, so an
+      # authentication prompt stays on the invoking terminal and a failure
+      # cannot leave an earlier transport running unattended.
+      fwdports_builtin_interactive_prepare "$generation/manifest" \
+        "${legs[index]}" "$driver" "${runtimes[index]}" || return 1
+    else
       fwdports_driver_operation "${snapshots[index]}" prepare \
         "$generation/manifest" "${legs[index]}" "${runtimes[index]}" ||
         return 1
@@ -885,9 +892,38 @@ fwdports_inspect() {
   return "$report_status"
 }
 
+_fwdports_attach_pane_record() {
+  local generation=$1 expected_digest=$2 snapshot=$3 manifest actual_digest
+  local kind leg _ evidence
+
+  manifest=$generation/manifest
+  fwdports_snapshot_trusted_file "$manifest" "$snapshot" "$generation" \
+    file "$generation" || return 74
+  actual_digest=$(_fwdports_runtime_sha256_file "$snapshot") || return 74
+  if [[ $actual_digest != "$expected_digest" ]]; then
+    printf 'fwdports: generation manifest changed before attach\n' >&2
+    return 74
+  fi
+
+  # The manifest is the user-visible declaration order. Filesystem glob order
+  # is unrelated and could focus a later pane merely because its leg name sorts
+  # first. Skip a leg whose pane was never published, but fail closed on
+  # malformed evidence for any published pane.
+  while IFS=$'\t' read -r kind leg _ || [[ -n ${kind:-} ]]; do
+    [[ $kind == leg ]] || continue
+    [[ $leg =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 74
+    evidence=$generation/legs/$leg/pane
+    [[ -f $evidence && ! -L $evidence ]] || continue
+    _fwdports_pane_evidence_read "$generation" "$expected_digest" \
+      "$evidence"
+    return $?
+  done <"$snapshot"
+  return 1
+}
+
 fwdports_attach() {
-  local root tmux_path socket pointer generation digest evidence record
-  local session pane
+  local root tmux_path socket pointer generation digest record record_status
+  local workspace session pane
   root=$(_fwdports_state_root_path) || return 1
   [[ -d $root && ! -L $root ]] || {
     printf 'fwdports: no active session\n' >&2
@@ -895,13 +931,21 @@ fwdports_attach() {
   }
   pointer=$(fwdports_pointer_read "$root" active) || return 1
   IFS=$'\t' read -r generation digest <<<"$pointer"
-  for evidence in "$generation"/legs/*/pane; do
-    [[ -f $evidence && ! -L $evidence ]] || continue
-    record=$(_fwdports_pane_evidence_read "$generation" "$digest" \
-      "$evidence") || return 1
-    IFS=$'\t' read -r session pane _ <<<"$record"
-    break
-  done
+  workspace=$(mktemp -d "${TMPDIR:-/tmp}/fwdports-attach.XXXXXXXX") ||
+    return 1
+  chmod 0700 "$workspace" || {
+    rm -rf -- "$workspace"
+    return 1
+  }
+  if record=$(_fwdports_attach_pane_record "$generation" "$digest" \
+    "$workspace/manifest"); then
+    record_status=0
+  else
+    record_status=$?
+  fi
+  rm -rf -- "$workspace"
+  [[ $record_status -eq 0 ]] || return "$record_status"
+  IFS=$'\t' read -r session pane _ <<<"$record"
   [[ -n ${session:-} ]] || return 1
   tmux_path=$(_fwdports_command_path tmux) || return 69
   socket=$(_fwdports_tmux_socket "$root") || return 1

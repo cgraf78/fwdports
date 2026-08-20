@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@53b11877db22bac7c070abc200c03e8991408389
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@9b9c023fbe5f47be5f70f5a82bd8e2f298f6a1b1
     with:
       # Process groups, tmux direct argv, and BSD command adapters materially
       # differ on macOS, Linux, and Termux, so every PR gets the full shared
@@ -138,4 +138,4 @@ jobs:
 
       # Workflow `uses:` refs must be literals. This gate proves those literals
       # still match the repository's one reviewed actions dependency lock.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@53b11877db22bac7c070abc200c03e8991408389
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@9b9c023fbe5f47be5f70f5a82bd8e2f298f6a1b1

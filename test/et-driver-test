@@ -99,13 +99,29 @@ resolve_case() {
     "" "$(<"$error")"
 }
 
-compatibility_rejected_case() {
-  local tmp fake output error status
+compatibility_case() {
+  local tmp fake output error status content version
   tmp=$(_tmpdir) || return 1
   fake=$tmp/et
   output=$tmp/source
   error=$tmp/error
 
+  for version in 7.0.0+1 7.0.1 7.1.0 8.0.0; do
+    write_fake_et "$fake" "$version"
+    set +e
+    fwdports_et_resolve "$fake" "$output" 2>"$error"
+    status=$?
+    set -e
+    content=
+    [[ ! -f $output ]] || content=$(<"$output")
+    _assert_exit "stock ET compatibility: $version is accepted" 0 "$status"
+    _assert_contains "stock ET compatibility: $version is recorded" \
+      $'version\t'"$version" "$content"
+    _assert_eq "stock ET compatibility: $version emits no diagnostic" \
+      "" "$(<"$error")"
+  done
+
+  rm -f -- "$output"
   write_fake_et "$fake" 6.2.9
   set +e
   fwdports_et_resolve "$fake" "$output" 2>"$error"
@@ -113,28 +129,9 @@ compatibility_rejected_case() {
   set -e
   _assert_exit "stock ET compatibility: pre-v7 is rejected" 1 "$status"
   _assert_contains "stock ET compatibility: minimum is actionable" \
-    "ET 7.0.0 is required" "$(<"$error")"
+    "ET 7.0.0 or newer is required" "$(<"$error")"
   _assert_not_exists "stock ET compatibility: old version publishes nothing" \
     "$output"
-
-  write_fake_et "$fake" 8.0.0
-  set +e
-  fwdports_et_resolve "$fake" "$output" 2>"$error"
-  status=$?
-  set -e
-  _assert_exit "stock ET compatibility: future major fails closed" 1 "$status"
-  _assert_contains "stock ET compatibility: future major is actionable" \
-    "ET 7.0.0 is required" "$(<"$error")"
-
-  write_fake_et "$fake" 7.0.1
-  set +e
-  fwdports_et_resolve "$fake" "$output" 2>"$error"
-  status=$?
-  set -e
-  _assert_exit "stock ET compatibility: unreviewed v7 patch fails closed" \
-    1 "$status"
-  _assert_contains "stock ET compatibility: reviewed release is named" \
-    "ET 7.0.0 is required" "$(<"$error")"
 
   write_fake_et "$fake" 7.0.0.1
   set +e
@@ -146,7 +143,16 @@ compatibility_rejected_case() {
   _assert_contains "stock ET compatibility: suffixed version is unrecognized" \
     "unrecognized Eternal Terminal version" "$(<"$error")"
 
-  write_fake_et "$fake" 7.0.0 --telemetry
+  write_fake_et "$fake" 7.1.0-rc.1
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: prerelease is rejected" 1 "$status"
+  _assert_contains "stock ET compatibility: prerelease is unrecognized" \
+    "unrecognized Eternal Terminal version" "$(<"$error")"
+
+  write_fake_et "$fake" 8.0.0 --telemetry
   set +e
   fwdports_et_resolve "$fake" "$output" 2>"$error"
   status=$?
@@ -550,7 +556,7 @@ local_port_conflict_case() {
 }
 
 run_case resolve resolve_case
-run_case compatibility-rejected compatibility_rejected_case
+run_case compatibility compatibility_case
 run_case argv argv_case
 run_case invalid-records invalid_records_case
 run_case overflow-records overflow_records_case

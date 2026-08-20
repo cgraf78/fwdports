@@ -1560,22 +1560,25 @@ fwdports_et_resolve() {
     printf 'fwdports: cannot query Eternal Terminal version\n' >&2
     return 1
   }
-  if [[ $version_text =~ ^et[[:space:]]+version[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  if [[ $version_text =~ ^et[[:space:]]+version[[:space:]]+(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([+]([0-9A-Za-z-]+([.][0-9A-Za-z-]+)*))?$ ]]; then
     major=${BASH_REMATCH[1]}
     minor=${BASH_REMATCH[2]}
     patch=${BASH_REMATCH[3]}
-    version=$major.$minor.$patch
+    version=$major.$minor.$patch${BASH_REMATCH[4]:-}
   else
     printf 'fwdports: unrecognized Eternal Terminal version output\n' >&2
     return 1
   fi
-  # The private SSH interception contract is based on tagged 7.0.0 source,
-  # not merely public flags. Even a later patch can change PATH lookup or the
-  # bootstrap argv shape, so each newly supported release needs fresh proof.
-  if [[ $version != 7.0.0 ]]; then
-    printf 'fwdports: ET 7.0.0 is required (found %s)\n' "$version" >&2
-    return 1
-  fi
+  # ET 7.0.0 established the command surface and PATH-based SSH bootstrap
+  # contract used below. Treat stable newer releases as backward compatible,
+  # while retaining the capability, executable identity, and digest gates.
+  case "$major" in
+    0 | 1 | 2 | 3 | 4 | 5 | 6)
+      printf 'fwdports: ET 7.0.0 or newer is required (found %s)\n' \
+        "$version" >&2
+      return 1
+      ;;
+  esac
   help_text=$(LC_ALL=C "$path" --help 2>&1) || {
     printf 'fwdports: cannot query Eternal Terminal capabilities\n' >&2
     return 1

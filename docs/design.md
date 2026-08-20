@@ -108,9 +108,10 @@ or `tcp` check for its bind host and port. ET can remain alive after a local
 bind error, so requiring that check prevents process liveness from being
 mistaken for endpoint health.
 
-The driver is implemented and tested against the public tagged ET 7.0.0
-contract. Later releases fail closed until their internal SSH launch behavior
-is reviewed as well. It runs with no terminal, disables telemetry, sends logs
+The driver requires stable ET 7.0.0 or newer and treats later releases as
+backward compatible with that command and SSH-bootstrap contract. It rejects
+older, prerelease, and malformed versions, then verifies every required public
+option before launch. It runs with no terminal, disables telemetry, sends logs
 to the owned tmux pane, and keeps temporary state under the private generation.
 Hostnames, IPv4 addresses, SSH aliases, users, and an optional ET server `port`
 are supported. Raw IPv6 literals are deliberately deferred; an SSH alias may

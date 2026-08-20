@@ -84,6 +84,31 @@ while IFS= read -r element || [[ -n $element ]]; do
   target=$element
 done <"$GATE_DIR/et-target"
 
+jump_selector=
+[[ -f $GATE_DIR/et-ssh-proxyjump && ! -L $GATE_DIR/et-ssh-proxyjump ]] ||
+  publish_drift ettun-et-generation-drift
+if [[ -s $GATE_DIR/et-ssh-proxyjump ]]; then
+  plan_target=
+  destination_endpoint=
+  jump_endpoint=
+  plan_records=0
+  while IFS=$'\t' read -r kind value || [[ -n ${kind:-} ]]; do
+    plan_records=$((plan_records + 1))
+    case "$kind" in
+      target) plan_target=$value ;;
+      destination) destination_endpoint=$value ;;
+      jump-selector) jump_selector=$value ;;
+      jump-endpoint) jump_endpoint=$value ;;
+      *) publish_drift ettun-et-generation-drift ;;
+    esac
+  done <"$GATE_DIR/et-ssh-proxyjump"
+  [[ $plan_records -eq 4 && $plan_target == "$target" &&
+    -n $destination_endpoint && -n $jump_selector && -n $jump_endpoint &&
+    $jump_selector != *$'\t'* &&
+    $jump_selector != *$'\r'* ]] ||
+    publish_drift ettun-et-generation-drift
+fi
+
 # These are the reviewed stock-ET call shapes from the authenticated public
 # ettun launcher. Every route carries the private ordinary tunnel used for
 # lifecycle control; a reverse route adds one fixed-position -r pair. A future
@@ -102,6 +127,10 @@ fi
 [[ $et_shape_valid -eq 1 ]] || publish_drift ettun-et-generation-drift
 
 "$GATE_DIR/et-ssh-ambient/ssh-gate" --check-only "$target" || exit $?
+if [[ -n $jump_selector ]]; then
+  "$GATE_DIR/et-ssh-jump-ambient/ssh-gate" --check-only \
+    "$jump_selector" || exit $?
+fi
 
 [[ -d $GATE_DIR/et-bin && ! -L $GATE_DIR/et-bin &&
   -x $GATE_DIR/et-bin/ssh && ! -L $GATE_DIR/et-bin/ssh &&
@@ -116,4 +145,7 @@ PATH=$GATE_DIR/et-bin:${PATH:-/usr/bin:/bin}
 export TERM TMPDIR TMP TEMP PATH
 
 rm -f -- "$DRIFT_FILE"
+if [[ -n $jump_selector ]]; then
+  exec "$et_path" --telemetry=false --jumphost "$jump_selector" "$@"
+fi
 exec "$et_path" --telemetry=false "$@"

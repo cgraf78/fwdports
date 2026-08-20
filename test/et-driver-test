@@ -25,7 +25,7 @@ write_fake_et() {
     printf 'if [[ ${1:-} == --version ]]; then printf "et version %s\\n"; exit 0; fi\n' \
       "$version"
     printf 'if [[ ${1:-} == --help ]]; then\n'
-    for capability in --port --tunnel --reversetunnel --logdir \
+    for capability in --port --tunnel --reversetunnel --jumphost --logdir \
       --logtostdout --no-terminal --telemetry; do
       [[ $capability == "$omit_capability" ]] ||
         printf '  printf "  %s\\n"\n' "$capability"
@@ -161,6 +161,16 @@ compatibility_case() {
     1 "$status"
   _assert_contains "stock ET compatibility: missing flag is named" \
     "--telemetry" "$(<"$error")"
+
+  write_fake_et "$fake" 8.0.0 --jumphost
+  set +e
+  fwdports_et_resolve "$fake" "$output" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET compatibility: missing jump support is rejected" \
+    1 "$status"
+  _assert_contains "stock ET compatibility: jump capability is named" \
+    "--jumphost" "$(<"$error")"
 }
 
 argv_case() {
@@ -411,6 +421,211 @@ EOF
     "jump.example.com" "$(<"$error")"
 }
 
+proxy_jump_generation_case() {
+  local tmp manifest runtime unsupported_runtime fake_et fake_ssh
+  local target_config jump_config
+  local et_log ssh_log error status before
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_et=$tmp/et
+  fake_ssh=$tmp/ssh
+  target_config=$tmp/target-config
+  jump_config=$tmp/jump-config
+  et_log=$tmp/et.log
+  ssh_log=$tmp/ssh.log
+  error=$tmp/error
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  write_et_manifest "$tmp/full-manifest"
+  sed -e '/local-forward/d' -e '/^check/d' \
+    -e 's/shell\.example\.com/edge-alias/' \
+    "$tmp/full-manifest" >"$manifest"
+  chmod 0600 "$manifest"
+  write_fake_et "$fake_et"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == -G ]]; then' \
+    '  selected=jump' \
+    '  for argument in "$@"; do' \
+    '    case "$argument" in' \
+    '      edge-alias | example@edge-alias) selected=target ;;' \
+    '    esac' \
+    '  done' \
+    '  if [[ $selected == target ]]; then' \
+    '    cat "$FWDPORTS_TEST_TARGET_SSH_CONFIG"' \
+    '  else' \
+    '    cat "$FWDPORTS_TEST_JUMP_SSH_CONFIG"' \
+    '  fi' \
+    '  exit 0' \
+    'fi' \
+    '{ printf "CALL\n"; printf "ARG=%s\n" "$@"; } >>"$FWDPORTS_TEST_SSH_LOG"' \
+    'exit 0' >"$fake_ssh"
+  chmod 0700 "$fake_ssh"
+  printf '%s\n' \
+    'hostname gateway.example.net' \
+    'user example' \
+    'port 22' \
+    'clearallforwardings yes' \
+    'forwardagent no' \
+    'proxyjump jump' >"$target_config"
+  printf '%s\n' \
+    'hostname jump.example.net' \
+    'user jumper' \
+    'port 22' \
+    'forwardagent no' >"$jump_config"
+
+  set +e
+  FWDPORTS_ET_COMMAND=$fake_et FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    fwdports_builtin_prepare "$manifest" edge et "$runtime" '' 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "stock ET ProxyJump: built-in prepare succeeds" 0 "$status"
+  [[ $status -eq 0 ]] || return
+  _assert_eq "stock ET ProxyJump: route metadata is exact" \
+    $'target\tedge-alias\ndestination\texample@edge-alias\njump-selector\tjump\njump-endpoint\tjumper@jump.example.net' \
+    "$(<"$runtime/et-ssh-proxyjump")"
+  _assert_file "stock ET ProxyJump: jump ambient gate exists" \
+    "$runtime/et-ssh-jump-ambient/ssh-gate"
+  _assert_file "stock ET ProxyJump: jump bootstrap gate exists" \
+    "$runtime/et-ssh-jump-bootstrap/ssh-gate"
+
+  set +e
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=23 \
+    "$runtime/et-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET ProxyJump: launch gate preserves ET status" 23 \
+    "$status"
+  _assert_contains "stock ET ProxyJump: launch gate selects the jump" \
+    $'ARG=--jumphost\nARG=jump' "$(<"$et_log")"
+
+  before=$(<"$et_log")
+  printf '%s\n' \
+    'hostname changed.example.net' \
+    'user jumper' \
+    'port 22' \
+    'forwardagent no' >"$jump_config"
+  set +e
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/et-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET ProxyJump: launch rejects jump route drift" 78 \
+    "$status"
+  _assert_eq "stock ET ProxyJump: jump drift launches no ET" \
+    "$before" "$(<"$et_log")"
+  printf '%s\n' \
+    'hostname jump.example.net' \
+    'user jumper' \
+    'port 22' \
+    'forwardagent no' >"$jump_config"
+
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" -J jumper@jump.example.net \
+    example@edge-alias 'echo destination-bootstrap'
+  _assert_contains "stock ET ProxyJump: destination call is preserved" \
+    $'ARG=-J\nARG=jumper@jump.example.net\nARG=example@edge-alias\nARG=echo destination-bootstrap' \
+    "$(<"$ssh_log")"
+
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" jumper@jump.example.net 'echo jump-relay'
+  _assert_contains "stock ET ProxyJump: relay call is preserved" \
+    $'ARG=jumper@jump.example.net\nARG=echo jump-relay' "$(<"$ssh_log")"
+
+  before=$(<"$ssh_log")
+  set +e
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" -J attacker.example.net \
+    example@edge-alias 'echo destination-bootstrap' 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET ProxyJump: unexpected jump fails closed" 78 "$status"
+  _assert_eq "stock ET ProxyJump: rejected call launches no SSH" \
+    "$before" "$(<"$ssh_log")"
+
+  printf '%s\n' \
+    'hostname gateway.example.net' \
+    'user example' \
+    'port 22' \
+    'clearallforwardings yes' \
+    'forwardagent no' \
+    'proxyjump changed' >"$target_config"
+  set +e
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" -J jumper@jump.example.net \
+    example@edge-alias 'echo destination-bootstrap' 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET ProxyJump: target route drift fails closed" 78 \
+    "$status"
+  _assert_eq "stock ET ProxyJump: drift launches no SSH" \
+    "$before" "$(<"$ssh_log")"
+
+  printf '%s\n' \
+    'hostname gateway.example.net' \
+    'user example' \
+    'port 22' \
+    'clearallforwardings yes' \
+    'forwardagent no' \
+    'proxyjump jump' >"$target_config"
+  printf '%s\n' \
+    'hostname changed.example.net' \
+    'user jumper' \
+    'port 22' \
+    'forwardagent no' >"$jump_config"
+  set +e
+  FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_SSH_LOG=$ssh_log \
+    "$runtime/et-bin/ssh" jumper@jump.example.net 'echo jump-relay' \
+    2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET ProxyJump: jump route drift fails closed" 78 \
+    "$status"
+  _assert_eq "stock ET ProxyJump: jump drift launches no SSH" \
+    "$before" "$(<"$ssh_log")"
+
+  unsupported_runtime=$tmp/unsupported-runtime
+  mkdir "$unsupported_runtime"
+  chmod 0700 "$unsupported_runtime"
+  printf '%s\n' \
+    'hostname gateway.example.net' \
+    'user example' \
+    'port 22' \
+    'clearallforwardings yes' \
+    'forwardagent no' \
+    'proxyjump jump,other' >"$target_config"
+  set +e
+  FWDPORTS_ET_COMMAND=$fake_et FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    fwdports_builtin_prepare "$manifest" edge et "$unsupported_runtime" '' \
+    2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET ProxyJump: multiple jumps are rejected" 1 "$status"
+  _assert_contains "stock ET ProxyJump: single-hop limit is actionable" \
+    'supports one ProxyJump SSH alias' "$(<"$error")"
+}
+
 generation_gates_case() {
   local tmp manifest runtime fake_et fake_ssh config et_log ssh_log error status
   local before after
@@ -516,6 +731,18 @@ generation_gates_case() {
     "ARG=--telemetry=false" "$(<"$et_log")"
   before=$(<"$et_log")
 
+  rm -f -- "$runtime/et-ssh-proxyjump"
+  set +e
+  FWDPORTS_TEST_SSH_CONFIG=$config FWDPORTS_TEST_ET_LOG=$et_log \
+    FWDPORTS_TEST_ET_STATUS=0 "$runtime/et-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "stock ET gate: missing route plan fails closed" 78 "$status"
+  _assert_eq "stock ET gate: missing plan launches no ET" \
+    "$before" "$(<"$et_log")"
+  : >"$runtime/et-ssh-proxyjump"
+  chmod 0600 "$runtime/et-ssh-proxyjump"
+
   printf '\n# changed after prepare\n' >>"$fake_et"
   set +e
   FWDPORTS_TEST_SSH_CONFIG=$config FWDPORTS_TEST_ET_LOG=$et_log \
@@ -563,6 +790,7 @@ run_case overflow-records overflow_records_case
 run_case target-grammar target_grammar_case
 run_case publication-rollback publication_rollback_case
 run_case ambient-policy ambient_policy_case
+run_case proxy-jump-generation proxy_jump_generation_case
 run_case generation-gates generation_gates_case
 run_case local-port-conflict local_port_conflict_case
 _test_summary

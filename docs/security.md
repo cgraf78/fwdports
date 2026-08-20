@@ -94,13 +94,18 @@ remain visible in its tmux pane.
 
 ET parses SSH configuration itself and later invokes a command named `ssh`.
 Preparation therefore rejects ambient configuration that ET would turn into
-undeclared forwarding, environment, agent, remote-command, or proxy behavior.
-The plain effective SSH view is bound before launch and checked both before ET
-exec and again after ET has parsed it. A private PATH shim then passes ET's argv
+undeclared forwarding, environment, agent, or remote-command behavior. The
+plain effective SSH view is bound before launch and checked both before ET exec
+and again after ET has parsed it. A private PATH shim then passes ET's argv
 unchanged to a second gate for the exact trusted OpenSSH executable with
 forwarding, local commands, multiplexing, agent forwarding, and tunnel devices
-disabled. Proxy routing is not guessed into this model; it is rejected until a
-future implementation can authenticate ET's two separate jump-host calls.
+disabled.
+
+A single `ProxyJump` alias receives a narrower equivalent treatment. The
+destination and jump-host effective configurations are authenticated
+separately, and the shim accepts only ET's reviewed destination-bootstrap and
+jump-relay argument shapes. The jump must itself be direct and use its default
+SSH port; `ProxyCommand`, nested routes, and multi-hop lists remain rejected.
 
 ## ettun consistency
 

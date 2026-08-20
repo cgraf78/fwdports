@@ -188,7 +188,7 @@ fwdports_ssh_effective_digest() {
   local line status index skip=0 keyword remainder ambient_error=''
   local -a argv=() probe_argv=()
 
-  [[ $policy == ssh || $policy == et ]] || {
+  [[ $policy == ssh || $policy == et || $policy == et-proxy ]] || {
     printf 'fwdports: invalid SSH configuration policy\n' >&2
     return 1
   }
@@ -279,23 +279,28 @@ fwdports_ssh_effective_digest() {
         fi
         ;;
       forwardagent)
-        if [[ $policy == et && $remainder == yes ]]; then
+        if [[ $policy == et* && $remainder == yes ]]; then
           ambient_error='ambient SSH agent forwarding is not allowed for ET'
           break
         fi
         ;;
       setenv)
-        if [[ $policy == et ]]; then
+        if [[ $policy == et* ]]; then
           ambient_error='ambient SSH SetEnv is not allowed for ET'
           break
         fi
         ;;
-      proxyjump | proxycommand)
+      proxyjump)
         if [[ $policy == et && -n $remainder && $remainder != none ]]; then
-          # ET consumes jump routing itself and launches a second, materially
-          # different SSH command. Supporting that safely needs two separately
-          # bound targets, so the first built-in deliberately stays direct.
+          # Callers must first resolve and bind ET's destination and jump-host
+          # call shapes. A plain ET policy has no such route plan.
           ambient_error='ambient SSH proxy routing is not supported for ET'
+          break
+        fi
+        ;;
+      proxycommand)
+        if [[ $policy == et* && -n $remainder && $remainder != none ]]; then
+          ambient_error='ambient SSH proxy commands are not supported for ET'
           break
         fi
         ;;
@@ -342,6 +347,114 @@ fwdports_ssh_effective_digest() {
   umask "$old_umask"
   if ! printf '%s\n' "$digest" >"$tmp" || ! chmod 0600 "$tmp" ||
     ! mv -f -- "$tmp" "$output"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+_fwdports_et_proxyjump_plan() {
+  local ssh_path=$1 target=$2 output=$3 output_dir old_umask raw jump_raw tmp
+  local keyword remainder target_user='' proxyjump='' proxycommand=''
+  local jump_user='' jump_hostname='' jump_port='' jump_proxyjump=''
+  local jump_proxycommand='' destination_endpoint jump_endpoint
+
+  output_dir=${output%/*}
+  [[ $output_dir != "$output" && -d $output_dir && ! -L $output_dir ]] ||
+    return 1
+  old_umask=$(umask)
+  umask 077
+  raw=$(mktemp "$output_dir/.et-ssh-target.XXXXXXXX") || {
+    umask "$old_umask"
+    return 1
+  }
+  jump_raw=$(mktemp "$output_dir/.et-ssh-jump.XXXXXXXX") || {
+    umask "$old_umask"
+    rm -f -- "$raw"
+    return 1
+  }
+  tmp=$(mktemp "$output_dir/.${output##*/}.XXXXXXXX") || {
+    umask "$old_umask"
+    rm -f -- "$raw" "$jump_raw"
+    return 1
+  }
+  umask "$old_umask"
+
+  if ! LC_ALL=C "$ssh_path" -G "$target" >"$raw" 2>/dev/null; then
+    rm -f -- "$raw" "$jump_raw" "$tmp"
+    printf 'fwdports: OpenSSH ProxyJump configuration failed\n' >&2
+    return 1
+  fi
+  while read -r keyword remainder; do
+    case "$keyword" in
+      user) target_user=$remainder ;;
+      proxyjump) proxyjump=$remainder ;;
+      proxycommand) proxycommand=$remainder ;;
+    esac
+  done <"$raw"
+  if [[ -z $proxyjump || $proxyjump == none ]]; then
+    rm -f -- "$raw" "$jump_raw"
+    if ! : >"$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+    return 0
+  fi
+  if [[ -n $proxycommand && $proxycommand != none ]]; then
+    rm -f -- "$raw" "$jump_raw" "$tmp"
+    printf 'fwdports: ET ProxyJump cannot be combined with ProxyCommand\n' >&2
+    return 1
+  fi
+  if [[ ! $proxyjump =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    rm -f -- "$raw" "$jump_raw" "$tmp"
+    printf 'fwdports: ET supports one ProxyJump SSH alias\n' >&2
+    return 1
+  fi
+  if [[ ! $target_user =~ ^[A-Za-z0-9._-]+$ ]]; then
+    rm -f -- "$raw" "$jump_raw" "$tmp"
+    printf 'fwdports: ET ProxyJump destination user is unsupported\n' >&2
+    return 1
+  fi
+
+  if ! LC_ALL=C "$ssh_path" -G "$proxyjump" >"$jump_raw" 2>/dev/null; then
+    rm -f -- "$raw" "$jump_raw" "$tmp"
+    printf 'fwdports: OpenSSH jump-host configuration failed\n' >&2
+    return 1
+  fi
+  while read -r keyword remainder; do
+    case "$keyword" in
+      user) jump_user=$remainder ;;
+      hostname) jump_hostname=$remainder ;;
+      port) jump_port=$remainder ;;
+      proxyjump) jump_proxyjump=$remainder ;;
+      proxycommand) jump_proxycommand=$remainder ;;
+    esac
+  done <"$jump_raw"
+  rm -f -- "$raw" "$jump_raw"
+
+  if [[ -n $jump_proxyjump && $jump_proxyjump != none ]] ||
+    [[ -n $jump_proxycommand && $jump_proxycommand != none ]]; then
+    rm -f -- "$tmp"
+    printf 'fwdports: nested ET ProxyJump routing is not supported\n' >&2
+    return 1
+  fi
+  if [[ ! $jump_user =~ ^[A-Za-z0-9._-]+$ ||
+    ! $jump_hostname =~ ^[A-Za-z0-9._%-]+$ || $jump_port != 22 ]]; then
+    rm -f -- "$tmp"
+    printf 'fwdports: ET ProxyJump endpoint is unsupported\n' >&2
+    return 1
+  fi
+
+  case "$target" in
+    *@*) destination_endpoint=$target ;;
+    *) destination_endpoint=$target_user@$target ;;
+  esac
+  jump_endpoint=$jump_user@$jump_hostname
+  if ! printf '%s\n' \
+    $'target\t'"$target" \
+    $'destination\t'"$destination_endpoint" \
+    $'jump-selector\t'"$proxyjump" \
+    $'jump-endpoint\t'"$jump_endpoint" >"$tmp" ||
+    ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$output"; then
     rm -f -- "$tmp"
     return 1
   fi
@@ -1583,7 +1696,7 @@ fwdports_et_resolve() {
     printf 'fwdports: cannot query Eternal Terminal capabilities\n' >&2
     return 1
   }
-  for capability in --port --tunnel --reversetunnel --logdir \
+  for capability in --port --tunnel --reversetunnel --jumphost --logdir \
     --logtostdout --no-terminal --telemetry; do
     [[ $help_text == *"$capability"* ]] || {
       printf 'fwdports: Eternal Terminal lacks required option %s\n' \
@@ -2055,6 +2168,14 @@ _fwdports_prepare_et_ssh_gates() {
   local ambient_digest=$runtime/et-ssh-ambient-digest
   local bootstrap_argv=$runtime/et-ssh-argv
   local bootstrap_digest=$runtime/et-ssh-bootstrap-digest
+  local proxyjump_plan=$runtime/et-ssh-proxyjump
+  local jump_ambient_argv=$runtime/et-ssh-jump-ambient-argv
+  local jump_ambient_digest=$runtime/et-ssh-jump-ambient-digest
+  local jump_bootstrap_argv=$runtime/et-ssh-jump-argv
+  local jump_bootstrap_digest=$runtime/et-ssh-jump-bootstrap-digest
+  local kind value plan_target='' destination_endpoint=''
+  local jump_selector='' jump_endpoint='' plan_records=0
+  local -a bootstrap_options=()
 
   # Both direct ET and stock-ET-backed ettun invoke an ambient command named
   # `ssh`. Publish the same trusted executable plus ambient and hardened
@@ -2066,16 +2187,64 @@ _fwdports_prepare_et_ssh_gates() {
   [[ -n $ssh_path ]] || return 1
 
   _fwdports_write_private_lines "$ambient_argv" || return 1
+  fwdports_et_write_ssh_argv "$bootstrap_argv" || return 1
+  _fwdports_et_proxyjump_plan "$ssh_path" "$target" "$proxyjump_plan" ||
+    return 1
+
+  if [[ ! -s $proxyjump_plan ]]; then
+    fwdports_ssh_effective_digest "$ssh_path" "$target" "$ambient_argv" \
+      "$ambient_digest" et || return 1
+    fwdports_ssh_prepare_gate "$runtime/et-ssh-ambient" "$ssh_source" \
+      "$ambient_digest" || return 1
+    fwdports_ssh_effective_digest "$ssh_path" "$target" "$bootstrap_argv" \
+      "$bootstrap_digest" || return 1
+    fwdports_ssh_prepare_gate "$runtime/et-ssh-bootstrap" "$ssh_source" \
+      "$bootstrap_digest"
+    return
+  fi
+
+  while IFS=$'\t' read -r kind value || [[ -n ${kind:-} ]]; do
+    plan_records=$((plan_records + 1))
+    case "$kind" in
+      target) plan_target=$value ;;
+      destination) destination_endpoint=$value ;;
+      jump-selector) jump_selector=$value ;;
+      jump-endpoint) jump_endpoint=$value ;;
+      *) return 1 ;;
+    esac
+  done <"$proxyjump_plan"
+  [[ $plan_records -eq 4 && $plan_target == "$target" &&
+    -n $destination_endpoint && -n $jump_selector && -n $jump_endpoint ]] ||
+    return 1
+
   fwdports_ssh_effective_digest "$ssh_path" "$target" "$ambient_argv" \
-    "$ambient_digest" et || return 1
+    "$ambient_digest" et-proxy || return 1
   fwdports_ssh_prepare_gate "$runtime/et-ssh-ambient" "$ssh_source" \
     "$ambient_digest" || return 1
+  _fwdports_write_private_lines "$jump_ambient_argv" || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$jump_selector" \
+    "$jump_ambient_argv" "$jump_ambient_digest" et || return 1
+  fwdports_ssh_prepare_gate "$runtime/et-ssh-jump-ambient" "$ssh_source" \
+    "$jump_ambient_digest" || return 1
 
-  fwdports_et_write_ssh_argv "$bootstrap_argv" || return 1
-  fwdports_ssh_effective_digest "$ssh_path" "$target" "$bootstrap_argv" \
-    "$bootstrap_digest" || return 1
+  while IFS= read -r value || [[ -n $value ]]; do
+    [[ -n $value && $value != *$'\t'* && $value != *$'\r'* ]] || return 1
+    bootstrap_options+=("$value")
+  done <"$bootstrap_argv"
+  [[ -n ${bootstrap_options[0]+set} ]] || return 1
+  _fwdports_write_private_lines "$runtime/et-ssh-target-argv" \
+    "${bootstrap_options[@]}" -J "$jump_endpoint" || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$destination_endpoint" \
+    "$runtime/et-ssh-target-argv" "$bootstrap_digest" et-proxy || return 1
   fwdports_ssh_prepare_gate "$runtime/et-ssh-bootstrap" "$ssh_source" \
-    "$bootstrap_digest"
+    "$bootstrap_digest" || return 1
+
+  _fwdports_write_private_lines "$jump_bootstrap_argv" \
+    "${bootstrap_options[@]}" || return 1
+  fwdports_ssh_effective_digest "$ssh_path" "$jump_endpoint" \
+    "$jump_bootstrap_argv" "$jump_bootstrap_digest" et || return 1
+  fwdports_ssh_prepare_gate "$runtime/et-ssh-jump-bootstrap" "$ssh_source" \
+    "$jump_bootstrap_digest"
 }
 
 _fwdports_builtin_prepare_et() {

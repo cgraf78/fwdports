@@ -88,6 +88,26 @@ wait_for_process_exit() {
   ! kill -0 "$pid" 2>/dev/null
 }
 
+wait_for_process_inert() {
+  local pid=$1 attempts=$2 delay=$3 index=0 state
+
+  while [[ $index -lt $attempts ]]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    state=
+    if state=$(LC_ALL=C ps -o stat= -p "$pid" 2>/dev/null); then
+      state=${state//[[:space:]]/}
+      [[ $state != Z* && $state != X* ]] || return 0
+    elif ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep "$delay"
+    index=$((index + 1))
+  done
+  return 1
+}
+
 wait_for_foreground_group() {
   local pid=$1 expected_pgid=$2 attempts=0 observed
 
@@ -1177,6 +1197,47 @@ ettun_runner_graceful_case() {
   kill_test_server "$PROC_SOCKET"
 }
 
+zombie_process_is_inert_case() {
+  local tmp count status live_status
+
+  tmp=$(_tmpdir) || return 1
+  count=$tmp/polls
+  printf '0\n' >"$count"
+
+  set +e
+  (
+    kill() { return 0; }
+    ps() {
+      local current
+      current=$(<"$count")
+      current=$((current + 1))
+      printf '%s\n' "$current" >"$count"
+      if [[ $current -eq 1 ]]; then
+        printf 'S\n'
+      else
+        printf 'Z\n'
+      fi
+    }
+    sleep() { :; }
+    wait_for_process_inert 4242 3 0
+  )
+  status=$?
+  (
+    kill() { return 0; }
+    ps() { printf 'S\n'; }
+    sleep() { :; }
+    wait_for_process_inert 4242 2 0
+  )
+  live_status=$?
+  set -e
+
+  _assert_exit "process liveness: waits until a zombie is inert" 0 "$status"
+  _assert_eq "process liveness: observes the state transition" 2 \
+    "$(<"$count")"
+  _assert_exit "process liveness: bounded wait rejects a live worker" 1 \
+    "$live_status"
+}
+
 ettun_runner_force_case() {
   local tmp output error status worker_alive=0
   tmp=$(_tmpdir) || return 1
@@ -1192,12 +1253,13 @@ ettun_runner_force_case() {
     2 0.02 ettun-session >"$output" 2>"$error"
   status=$?
   set -e
-  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+  wait_for_process_inert "$PROC_CHILD" 100 0.01 || worker_alive=1
 
   _assert_exit "ettun runner force stop: cleanup succeeds" 0 "$status"
   _assert_eq "ettun runner force stop: second stage reaches ettun once" 2 \
     "$(<"$PROC_LEADER_MARKER")"
-  _assert_eq "ettun runner force stop: worker is reaped" 0 "$worker_alive"
+  _assert_eq "ettun runner force stop: worker has no live execution" 0 \
+    "$worker_alive"
   _assert_eq "ettun runner force stop: has no diagnostic" "" \
     "$(<"$error")"
 
@@ -1420,6 +1482,7 @@ run_case ettun-terminal-interrupt ettun_terminal_interrupt_case
 run_case ettun-session-signal-target ettun_session_signal_target_case
 run_case ettun-session-getsid-scope ettun_session_getsid_scope_case
 run_case ettun-runner-graceful ettun_runner_graceful_case
+run_case zombie-process-is-inert zombie_process_is_inert_case
 run_case ettun-runner-force ettun_runner_force_case
 run_case ettun-session-survivor ettun_session_survivor_case
 run_case darwin-ettun-session-survivor darwin_ettun_session_survivor_case

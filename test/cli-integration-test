@@ -758,7 +758,7 @@ stock_et_lifecycle_case() {
     'set -u' \
     'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "%s\n" --port --tunnel --reversetunnel --logdir --logtostdout --no-terminal --telemetry' \
+    '  printf "%s\n" --port --tunnel --reversetunnel --jumphost --logdir --logtostdout --no-terminal --telemetry' \
     '  exit 0' \
     'fi' \
     '{' \
@@ -832,7 +832,7 @@ ettun_lifecycle_case() {
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "%s\n" --port --tunnel --reversetunnel --logdir --logtostdout --no-terminal --telemetry' \
+    '  printf "%s\n" --port --tunnel --reversetunnel --jumphost --logdir --logtostdout --no-terminal --telemetry' \
     '  exit 0' \
     'fi' \
     'exit 0' >"$CASE_ET"

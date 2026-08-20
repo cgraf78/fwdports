@@ -116,10 +116,11 @@ to the owned tmux pane, and keeps temporary state under the private generation.
 Hostnames, IPv4 addresses, SSH aliases, users, and an optional ET server `port`
 are supported. Raw IPv6 literals are deliberately deferred; an SSH alias may
 resolve to IPv6 without exposing ET's ambiguous literal parsing to the
-configuration surface. Ambient `ProxyJump`, `ProxyCommand`, forwarding, remote
-commands, agent forwarding, and `SetEnv` are rejected: ET consumes those itself,
-outside the manifest. Jump-host support is deferred until both ET SSH bootstrap
-calls can be bound and tested independently.
+configuration surface. One single-hop `ProxyJump` SSH alias is supported when
+the jump resolves directly over its default SSH port. The destination and jump
+configurations are bound independently, as are ET's destination-bootstrap and
+jump-relay SSH call shapes. `ProxyCommand`, nested or multi-hop jumps,
+forwarding, remote commands, agent forwarding, and `SetEnv` remain rejected.
 
 ## Built-in ettun records
 

@@ -21,7 +21,7 @@ version=$(LC_ALL=C "$et_path" --version 2>&1) ||
 [[ $version == *'et version 7.0.0'* ]] ||
   fail 'publisher artifact is not ET 7.0.0'
 help=$(LC_ALL=C "$et_path" --help 2>&1) || fail 'help query failed'
-for option in --port --tunnel --reversetunnel --no-terminal --logdir \
+for option in --port --tunnel --reversetunnel --jumphost --no-terminal --logdir \
   --logtostdout --telemetry; do
   [[ $help == *"$option"* ]] || fail "missing required option: $option"
 done

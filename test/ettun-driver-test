@@ -114,7 +114,7 @@ write_fake_et() {
     printf '%s\n' \
       'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
       'if [[ ${1:-} == --help ]]; then'
-    for capability in --port --tunnel --reversetunnel --logdir \
+    for capability in --port --tunnel --reversetunnel --jumphost --logdir \
       --logtostdout --no-terminal --telemetry; do
       printf '  printf "  %s\\n"\n' "$capability"
     done
@@ -1105,7 +1105,7 @@ generation_gate_case() {
 
 default_et_hardening_case() {
   local tmp manifest runtime fake_bin fake_ettun fake_et fake_ssh
-  local ssh_config et_log ssh_log error status before_et before_ssh
+  local ssh_config et_log ssh_log jump_gate_log error status before_et before_ssh
   tmp=$(_tmpdir) || return 1
   manifest=$tmp/manifest
   runtime=$tmp/runtime
@@ -1116,6 +1116,7 @@ default_et_hardening_case() {
   ssh_config=$tmp/ssh-config
   et_log=$tmp/et.log
   ssh_log=$tmp/ssh.log
+  jump_gate_log=$tmp/jump-gate.log
   error=$tmp/error
   mkdir -p "$runtime" "$fake_bin"
   chmod 0700 "$runtime" "$fake_bin"
@@ -1177,6 +1178,72 @@ default_et_hardening_case() {
     24 "$status"
   _assert_contains "ettun nested ET gate: reverse mapping reaches ET" \
     $'ARG=-r\nARG=127.0.0.1:49154:127.0.0.1:22' "$(<"$et_log")"
+
+  printf '%s\n' \
+    $'target\tgateway.example.net' \
+    $'destination\texample@gateway.example.net' \
+    $'jump-selector\tjump' \
+    $'jump-endpoint\tjumper@jump.example.net' \
+    >"$runtime/et-ssh-proxyjump"
+  mkdir -p "$runtime/et-ssh-jump-ambient"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$@" >"$FWDPORTS_TEST_JUMP_GATE_LOG"' \
+    'exit "${FWDPORTS_TEST_JUMP_GATE_STATUS:-0}"' \
+    >"$runtime/et-ssh-jump-ambient/ssh-gate"
+  chmod 0700 "$runtime/et-ssh-jump-ambient/ssh-gate"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=24 \
+    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: ProxyJump status is preserved" 24 \
+    "$status"
+  _assert_contains "ettun nested ET gate: ProxyJump selects the jump" \
+    $'ARG=--jumphost\nARG=jump' "$(<"$et_log")"
+  _assert_eq "ettun nested ET gate: ProxyJump validates the jump route" \
+    $'--check-only\njump' "$(<"$jump_gate_log")"
+
+  before_et=$(<"$et_log")
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
+    FWDPORTS_TEST_JUMP_GATE_STATUS=78 \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: jump route drift fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: jump drift launches no ET" \
+    "$before_et" "$(<"$et_log")"
+  : >"$runtime/et-ssh-proxyjump"
+
+  before_et=$(<"$et_log")
+  rm -f -- "$runtime/et-ssh-proxyjump"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: missing route plan fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: missing plan launches no ET" \
+    "$before_et" "$(<"$et_log")"
+  : >"$runtime/et-ssh-proxyjump"
+  chmod 0600 "$runtime/et-ssh-proxyjump"
 
   before_et=$(<"$et_log")
   before_ssh=$(<"$ssh_log")

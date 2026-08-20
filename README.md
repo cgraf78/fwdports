@@ -115,9 +115,11 @@ reached a tunnel's final destination or exercised an application protocol.
 
 Built-in `ssh`, `autossh`, `et`, and `ettun` share the standard forward record
 names where their transport semantics overlap.
-ET uses an explicit four-part network form and is deliberately direct-host only
-in its first version; its SSH bootstrap rejects ambient proxy routing and
-other configuration that ET would turn into undeclared forwarding behavior.
+ET uses an explicit four-part network form. It accepts a direct host or one
+single-hop `ProxyJump` SSH alias; the destination and jump-host configurations
+and ET's two SSH call shapes are bound separately. `ProxyCommand`, multi-hop
+jumps, and other configuration that ET would turn into undeclared behavior are
+rejected.
 Literal IPv6 targets are deferred; use an SSH alias for an IPv6 host. The
 `ettun` built-in accepts at most one loopback-bound `local-forward` and at most
 one loopback-bound `remote-forward`, with at least one route required.

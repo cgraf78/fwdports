@@ -290,36 +290,33 @@ termination_fixture() {
       if [[ $mode == ettun-runner-graceful ]]; then
         graceful_delay=0.02
       else
-        graceful_delay=10
+        graceful_delay=60
       fi
+      # Model the post-gate exec directly. The graceful timer must not block
+      # the signal handler, or Bash cannot observe the second terminal INT.
       printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -u' \
         'set -m' \
-        'force_stop() {' \
-        '  trap '\'''\'' HUP INT TERM' \
-        '  printf "2\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '  kill -KILL 0 2>/dev/null || exit 130' \
-        '}' \
-        'graceful_stop() {' \
-        '  printf "1\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '  trap force_stop INT' \
-        '  sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"' \
+        'complete_stop() {' \
         '  trap '\'''\'' HUP INT TERM' \
         '  kill -KILL 0 2>/dev/null || exit 130' \
         '}' \
-        'if [[ ${1:-} == worker ]]; then' \
-        '  set +m' \
-        '  trap graceful_stop INT' \
-        '  trap '\'''\'' TERM HUP' \
-        '  while :; do sleep 0.02; done' \
-        'fi' \
-        '"$BASH" "$0" worker &' \
-        'child=$!' \
-        'printf "%s %s\\n" "$$" "$child" >"$FWDPORTS_TEST_PROC_IDS"' \
-        'fg %1 >/dev/null || true' \
-        'wait "$child" 2>/dev/null || true' \
-        'exit 130' \
+        'interrupts=0' \
+        'on_interrupt() {' \
+        '  interrupts=$((interrupts + 1))' \
+        '  printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
+        '  if [[ $interrupts -ge 2 ]]; then' \
+        '    complete_stop' \
+        '  fi' \
+        '  (sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"; kill -TERM "$$") &' \
+        '}' \
+        'set +m' \
+        'trap on_interrupt INT' \
+        'trap complete_stop TERM' \
+        'trap '\'''\'' HUP' \
+        'printf "%s %s\\n" "$$" "$$" >"$FWDPORTS_TEST_PROC_IDS"' \
+        'while :; do read -r -t 1 _ || true; done' \
         >"$PROC_GATE"
       chmod 0700 "$PROC_GATE"
       printf '%s\n' ettun >"$PROC_GENERATION/legs/web/driver-kind"
@@ -1187,10 +1184,12 @@ ettun_runner_force_case() {
   output=$tmp/output
   error=$tmp/error
 
+  # Two authenticated scans reach the force stage before the 60-second
+  # fixture grace period even on platforms with expensive session queries.
   set +e
   fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
     active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
-    20 0.02 ettun-session >"$output" 2>"$error"
+    2 0.02 ettun-session >"$output" 2>"$error"
   status=$?
   set -e
   kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1

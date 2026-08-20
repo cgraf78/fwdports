@@ -11,8 +11,8 @@ the host, ports, and labels with your own values after copying the file to
 
 The `ssh-default` profile demonstrates the default driver. `ssh-resilient`
 selects autossh explicitly; installing autossh never changes another profile's
-driver. `et-direct` uses the stock Eternal Terminal 7.0.0 built-in with one local
-and one remote forward; its local endpoint has the required matching health
+driver. `et-direct` uses the Eternal Terminal 7.0.0-or-newer built-in with one
+local and one remote forward; its local endpoint has the required matching health
 check. `ettun-relay` demonstrates one loopback-only local endpoint and one
 loopback-only reverse endpoint sharing the public ettun relay engine.
 `executable-driver` demonstrates the fixed single-file extension protocol.

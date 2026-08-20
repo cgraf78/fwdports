@@ -7,7 +7,7 @@
 
 `fwdports` keeps a declared set of port forwards alive in one inspectable tmux
 session. It uses ordinary foreground OpenSSH by default, supports autossh when
-explicitly selected, supports stock Eternal Terminal 7.0.0 for resilient
+explicitly selected, supports Eternal Terminal 7.0.0 or newer for resilient
 direct-host tunnels, supports the public `ettun` relay engine for destinations
 reached through an ET host, and lets trusted local executables provide other
 transport drivers without putting consumer policy in the core.
@@ -50,7 +50,7 @@ check web loopback 8080 web
 
 Configuration is parsed as records, never evaluated as shell. Omitted drivers
 mean `ssh`; select `autossh` explicitly when its monitor semantics are wanted,
-select `et` for an Eternal Terminal 7.0.0-compatible direct connection, or
+select `et` for an Eternal Terminal 7.0.0-or-newer direct connection, or
 select `ettun` for relay-backed local and/or reverse forwards through an ET
 host.
 See [the design contract](docs/design.md) and the directly tested
@@ -164,9 +164,9 @@ name, port, or a stale PID. See [docs/security.md](docs/security.md).
 - netcat
 - `lsof` or `ss` for local-listener diagnostics
 - autossh only for profiles that select it
-- Eternal Terminal 7.0.0 only for profiles that select `et`
-- `ettun` and either Eternal Terminal 7.0.0 or a validated adapter only for
-  profiles that select `ettun`
+- Eternal Terminal 7.0.0 or newer only for profiles that select `et`
+- `ettun` and either Eternal Terminal 7.0.0 or newer, or a validated adapter,
+  only for profiles that select `ettun`
 - base64, gzip, mkfifo, od, and tee for profiles that select `ettun`
 - Python 3.9 or newer with `os.getsid` support on macOS only for profiles that select
   `ettun`

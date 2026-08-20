@@ -86,10 +86,11 @@ constructed.
 
 ## Eternal Terminal consistency
 
-The stock ET built-in records one canonical ET 7.0.0 executable identity and
-SHA-256 digest. A generation-owned gate rechecks both immediately before exec,
-forces a fixed safe `TERM`, disables telemetry, and points generic temporary
-state into a private directory. ET logs remain visible in its tmux pane.
+The ET built-in accepts stable releases from 7.0.0 onward, then records one
+canonical executable identity and SHA-256 digest. A generation-owned gate
+rechecks both immediately before exec, forces a fixed safe `TERM`, disables
+telemetry, and points generic temporary state into a private directory. ET logs
+remain visible in its tmux pane.
 
 ET parses SSH configuration itself and later invokes a command named `ssh`.
 Preparation therefore rejects ambient configuration that ET would turn into

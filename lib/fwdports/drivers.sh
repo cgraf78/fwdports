@@ -1362,6 +1362,11 @@ fwdports_ettun_resolve() {
       >&2
     return 1
   }
+  [[ $help_text == *'ettun VIA [--jump-host JUMP_HOST]'* ]] || {
+    printf '%s\n' \
+      'fwdports: executable does not support the jump-host contract' >&2
+    return 1
+  }
   fwdports_ettun_validate_local_dependencies || return 1
   digest=$(_fwdports_sha256_file "$path") || {
     printf 'fwdports: cannot hash ettun executable\n' >&2
@@ -2276,12 +2281,65 @@ _fwdports_ettun_default_et_via() {
   printf '%s\n' "$via"
 }
 
+_fwdports_ettun_apply_proxyjump() {
+  local runtime=$1
+  local plan=$runtime/et-ssh-proxyjump
+  local argv_file=$runtime/ettun-argv kind value
+  local plan_target='' destination_endpoint='' jump_selector=''
+  local jump_endpoint='' plan_records=0 element
+  local -a argv=() routed_argv=()
+
+  [[ -f $plan && ! -L $plan && -f $argv_file && ! -L $argv_file ]] ||
+    return 1
+  [[ -s $plan ]] || return 0
+  while IFS=$'\t' read -r kind value || [[ -n ${kind:-} ]]; do
+    plan_records=$((plan_records + 1))
+    case "$kind" in
+      target) plan_target=$value ;;
+      destination) destination_endpoint=$value ;;
+      jump-selector) jump_selector=$value ;;
+      jump-endpoint) jump_endpoint=$value ;;
+      *) return 1 ;;
+    esac
+  done <"$plan"
+  [[ $plan_records -eq 4 && -n $plan_target &&
+    -n $destination_endpoint && -n $jump_selector && -n $jump_endpoint ]] ||
+    return 1
+  _fwdports_ettun_safe_via "$jump_selector" || return 1
+
+  while IFS= read -r element || [[ -n $element ]]; do
+    [[ -n $element && $element != *$'\t'* && $element != *$'\r'* ]] ||
+      return 1
+    argv+=("$element")
+  done <"$argv_file"
+  [[ -n ${argv[0]+set} && ${argv[0]} == "$plan_target" ]] || return 1
+  case ${#argv[@]} in
+    4)
+      routed_argv=("${argv[0]}" --jump-host "$jump_selector" --local
+        "${argv[1]}" "${argv[2]}" "${argv[3]}")
+      ;;
+    5)
+      [[ ${argv[1]} == --reverse ]] || return 1
+      routed_argv=("${argv[0]}" --jump-host "$jump_selector"
+        "${argv[@]:1}")
+      ;;
+    9)
+      [[ ${argv[1]} == --local && ${argv[5]} == --reverse ]] || return 1
+      routed_argv=("${argv[0]}" --jump-host "$jump_selector"
+        "${argv[@]:1}")
+      ;;
+    *) return 1 ;;
+  esac
+  _fwdports_write_private_lines "$argv_file" "${routed_argv[@]}"
+}
+
 _fwdports_ettun_prepare_stock_et() {
   local runtime=$1 via
 
   via=$(_fwdports_ettun_default_et_via "$runtime/ettun-argv") || return 1
   _fwdports_write_private_lines "$runtime/et-target" "$via" || return 1
-  _fwdports_prepare_et_ssh_gates "$runtime" "$via"
+  _fwdports_prepare_et_ssh_gates "$runtime" "$via" || return 1
+  _fwdports_ettun_apply_proxyjump "$runtime"
 }
 
 _fwdports_builtin_prepare_ettun() {

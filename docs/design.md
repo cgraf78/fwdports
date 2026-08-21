@@ -136,9 +136,9 @@ transport (optional)
 `host` is the ET-accessible relay host. At most one `local-forward` and at most
 one `remote-forward` may use the explicit
 `127.0.0.1:BIND_PORT:TARGET:TARGET_PORT` form; at least one route is required.
-Local-only profiles retain the public
-`ettun VIA LOCAL_PORT TARGET TARGET_PORT` interface. Reverse-only and mixed
-profiles use ettun's explicit `--local` and `--reverse` groups. Non-loopback
+Direct local-only profiles retain the public
+`ettun VIA LOCAL_PORT TARGET TARGET_PORT` interface. ProxyJump, reverse-only,
+and mixed profiles use ettun's explicit option groups. Non-loopback
 binds, sockets, ranges, and raw IPv6 literals are rejected. A matching local
 check is required whenever a local route exists so process liveness cannot be
 reported as endpoint health.
@@ -146,7 +146,11 @@ reported as endpoint health.
 Preparation resolves and authenticates both the public `ettun` executable and
 its selected transport before any tmux session or earlier leg starts. With no
 `transport` record, fwdports selects stock ET 7.0.0 plus the exact OpenSSH
-bootstrap and requires a direct-host-safe `host`. It also checks ettun's
+bootstrap and requires a direct-host-safe `host`. When that host resolves to a
+validated single-hop `ProxyJump`, fwdports records `--jump-host` in the public
+ettun argv rather than hiding route selection inside the nested ET executable.
+The nested gate still verifies that ettun's resulting `--jumphost` argument
+and both SSH configurations match the prepared route. It also checks ettun's
 non-core local commands (base64, gzip, mkfifo, od, and tee) during dependency
 preflight. On macOS it additionally resolves the exact Python 3.9-or-newer
 backend reported by an isolated interpreter, runs the installed session

@@ -537,7 +537,7 @@ custom_adapter_dependency_failure_case() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2' \
     '  exit 0' \
     'fi' \
     'exit 0' >"$CASE_ETTUN"
@@ -820,7 +820,7 @@ ettun_lifecycle_case() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -u' \
-    'if [[ ${1:-} == --help ]]; then printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == --help ]]; then printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2; exit 0; fi' \
     '{' \
     '  printf "ETTUN_ET=%s\nTMPDIR=%s\n" "${ETTUN_ET:-}" "${TMPDIR:-}"' \
     '  printf "ARG=%s\n" "$@"' \

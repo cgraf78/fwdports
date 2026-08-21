@@ -123,16 +123,20 @@ rejected.
 Literal IPv6 targets are deferred; use an SSH alias for an IPv6 host. The
 `ettun` built-in accepts at most one loopback-bound `local-forward` and at most
 one loopback-bound `remote-forward`, with at least one route required.
-Local-only profiles retain `ettun VIA LOCAL_PORT TARGET TARGET_PORT`; reverse
-or mixed profiles use ettun's explicit route form. It resolves and pins both
+Direct local-only profiles retain `ettun VIA LOCAL_PORT TARGET TARGET_PORT`;
+ProxyJump, reverse, and mixed profiles use ettun's explicit route form. It
+resolves and pins both
 `ettun` and its selected transport before creating a tmux session. The
 engine and any custom adapter run from generation-owned snapshots, so worker
 re-execs and later reconnects cannot adopt an upgrade halfway through the
 generation. By default the transport is stock ET 7.0.0 behind the same fixed
 `TERM`, private SSH gate, ambient-configuration checks, and telemetry controls
-as the direct ET built-in. An optional `transport` setting may name an
-executable adapter that supports the noninteractive
-`--fwdports-validate` dependency check described in the design contract.
+as the direct ET built-in. A validated single-hop `ProxyJump` is passed through
+ettun's public `--jump-host` option; the generation gates still bind and check
+the destination and jump-host SSH configurations before ET runs. An optional
+`transport` setting may name an executable adapter that supports the
+noninteractive `--fwdports-validate` dependency check described in the design
+contract.
 Reverse routes additionally require the adapter's `connect-v2` capability.
 An adapter may declare `fwdports-prepare-v1` to receive a foreground
 preparation call after every leg validates and before tmux starts; this keeps

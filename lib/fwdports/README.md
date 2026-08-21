@@ -18,7 +18,8 @@ These Bash 3.2-compatible modules implement reusable `fwdports` behavior:
 - `ettun-gate.sh` reauthenticates installed sources, pins the generation's
   disjoint provider-assigned remote-port slot and adapter retry contract, and
   launches the generation-owned relay engine and transport snapshots.
-- `ettun-et-gate.sh` hardens and authenticates ettun's default ET transport.
+- `ettun-et-gate.sh` hardens and authenticates ettun's default ET transport,
+  including the jump selected through ettun's public `--jump-host` option.
 - `health.sh` owns pure health and backoff state transitions.
 - `runtime.sh` owns XDG state, generations, locks, manifests, and pointers.
 - `tmux.sh` owns direct-argv session and pane operations.

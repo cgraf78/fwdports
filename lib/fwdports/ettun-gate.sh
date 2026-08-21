@@ -167,24 +167,66 @@ while IFS= read -r element || [[ -n $element ]]; do
 done <"$GATE_DIR/ettun-argv"
 [[ -n ${argv[0]+set} ]] || publish_drift ettun-generation-drift
 
-# The engine retains its original four-argument local-only contract. The
-# explicit contract is canonicalized by generation preparation: reverse-only
-# has one option group, while a mixed route always places local before reverse.
-# Accepting only those exact shapes prevents a tampered runtime record from
-# smuggling arbitrary engine flags through this privileged launch boundary.
+jump_host=''
+if [[ -z $transport_name ]]; then
+  plan_target=''
+  destination_endpoint=''
+  jump_endpoint=''
+  plan_records=0
+  [[ -f $GATE_DIR/et-ssh-proxyjump &&
+    ! -L $GATE_DIR/et-ssh-proxyjump ]] ||
+    publish_drift ettun-generation-drift
+  if [[ -s $GATE_DIR/et-ssh-proxyjump ]]; then
+    while IFS=$'\t' read -r kind value || [[ -n ${kind:-} ]]; do
+      plan_records=$((plan_records + 1))
+      case "$kind" in
+        target) plan_target=$value ;;
+        destination) destination_endpoint=$value ;;
+        jump-selector) jump_host=$value ;;
+        jump-endpoint) jump_endpoint=$value ;;
+        *) publish_drift ettun-generation-drift ;;
+      esac
+    done <"$GATE_DIR/et-ssh-proxyjump"
+    [[ $plan_records -eq 4 && $plan_target == "${argv[0]}" &&
+      -n $destination_endpoint && -n $jump_host && -n $jump_endpoint ]] ||
+      publish_drift ettun-generation-drift
+  fi
+fi
+
+# Direct local-only routes retain the original four-argument contract. A
+# validated ProxyJump is always explicit in the public ettun argv, and other
+# explicit routes are canonicalized by generation preparation: local precedes
+# reverse when both are present. Accepting only those exact shapes prevents a
+# tampered runtime record from smuggling arbitrary engine flags through this
+# privileged launch boundary.
 argv_shape_valid=0
-case ${#argv[@]} in
-  4)
-    argv_shape_valid=1
-    ;;
-  5)
-    [[ ${argv[1]} == --reverse ]] && argv_shape_valid=1
-    ;;
-  9)
-    [[ ${argv[1]} == --local && ${argv[5]} == --reverse ]] &&
+if [[ -n $jump_host ]]; then
+  case ${#argv[@]} in
+    7)
+      [[ ${argv[1]} == --jump-host && ${argv[2]} == "$jump_host" &&
+        (${argv[3]} == --local || ${argv[3]} == --reverse) ]] &&
+        argv_shape_valid=1
+      ;;
+    11)
+      [[ ${argv[1]} == --jump-host && ${argv[2]} == "$jump_host" &&
+        ${argv[3]} == --local && ${argv[7]} == --reverse ]] &&
+        argv_shape_valid=1
+      ;;
+  esac
+else
+  case ${#argv[@]} in
+    4)
       argv_shape_valid=1
-    ;;
-esac
+      ;;
+    5)
+      [[ ${argv[1]} == --reverse ]] && argv_shape_valid=1
+      ;;
+    9)
+      [[ ${argv[1]} == --local && ${argv[5]} == --reverse ]] &&
+        argv_shape_valid=1
+      ;;
+  esac
+fi
 [[ $argv_shape_valid -eq 1 && -d $GATE_DIR/ettun-tmp &&
   ! -L $GATE_DIR/ettun-tmp ]] || publish_drift ettun-generation-drift
 

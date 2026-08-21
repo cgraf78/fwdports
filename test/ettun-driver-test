@@ -33,7 +33,7 @@ write_fake_ettun() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2' \
     '  exit 0' \
     'fi' \
     '{' \
@@ -55,10 +55,17 @@ write_fake_ettun_passthrough() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2' \
     '  exit 0' \
     'fi' \
-    '"$ETTUN_ET" -N --keepalive 5 -t "18080:49152,18081:49153" --command "echo safe-bootstrap" "$1"' \
+    'via=$1' \
+    'shift' \
+    'jump_argv=()' \
+    'if [[ ${1:-} == --jump-host ]]; then' \
+    '  jump_argv=(--jumphost "$2")' \
+    '  shift 2' \
+    'fi' \
+    '"$ETTUN_ET" "${jump_argv[@]}" -N --keepalive 5 -t "18080:49152,18081:49153" --command "echo safe-bootstrap" "$via"' \
     >"$path"
   chmod 0700 "$path"
 }
@@ -68,7 +75,7 @@ write_reexec_ettun() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2' \
     '  exit 0' \
     'fi' \
     'if [[ ${1:-} == --fwdports-test-worker ]]; then' \
@@ -87,7 +94,7 @@ write_delayed_adapter_ettun() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == --help ]]; then' \
-    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2' \
     '  exit 0' \
     'fi' \
     ': >"$FWDPORTS_TEST_ETTUN_READY"' \
@@ -245,7 +252,8 @@ missing_dependency_case() {
 }
 
 resolve_case() {
-  local tmp fake unsupported output error status expected_digest content=''
+  local tmp fake unsupported no_jump output error status expected_digest
+  local content=''
   tmp=$(_tmpdir) || return 1
   fake=$tmp/ettun
   output=$tmp/source
@@ -286,6 +294,25 @@ resolve_case() {
     'remote-port-slot-v1 contract' "$(<"$error")"
   _assert_not_exists "ettun dependency: unsupported version publishes nothing" \
     "$output"
+
+  no_jump=$tmp/ettun-without-jump-host
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nProvider contract: remote-port-slot-v1\n" >&2' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$no_jump"
+  chmod 0700 "$no_jump"
+  rm -f "$output"
+  status=0
+  fwdports_ettun_resolve "$no_jump" "$output" 2>"$error" || status=$?
+  _assert_exit "ettun dependency: old jump-host contract is rejected" 1 \
+    "$status"
+  _assert_contains "ettun dependency: jump-host requirement is actionable" \
+    'jump-host contract' "$(<"$error")"
+  _assert_not_exists \
+    "ettun dependency: old jump-host contract publishes nothing" "$output"
 }
 
 local_dependencies_case() {
@@ -907,6 +934,126 @@ generation_prepare_case() {
     "$(<"$runtime/ettun-argv")"
 }
 
+proxyjump_public_cli_case() {
+  local tmp manifest runtime fake_bin fake_ettun fake_et fake_ssh
+  local target_config jump_config et_log error status jump_count before
+  tmp=$(_tmpdir) || return 1
+  manifest=$tmp/manifest
+  runtime=$tmp/runtime
+  fake_bin=$tmp/bin
+  fake_ettun=$fake_bin/ettun
+  fake_et=$fake_bin/et
+  fake_ssh=$fake_bin/ssh
+  target_config=$tmp/target-config
+  jump_config=$tmp/jump-config
+  et_log=$tmp/et.log
+  error=$tmp/error
+  mkdir -p "$runtime" "$fake_bin"
+  chmod 0700 "$runtime" "$fake_bin"
+  write_ettun_manifest "$tmp/base-manifest"
+  sed 's/gateway\.example\.net/edge-alias/' "$tmp/base-manifest" >"$manifest"
+  chmod 0600 "$manifest"
+  write_fake_ettun_passthrough "$fake_ettun"
+  write_fake_et "$fake_et"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  chmod 0700 "$fake_bin/lsof"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
+    'if [[ ${1:-} == -G ]]; then' \
+    '  selected=jump' \
+    '  for argument in "$@"; do' \
+    '    case "$argument" in' \
+    '      edge-alias | example@edge-alias) selected=target ;;' \
+    '    esac' \
+    '  done' \
+    '  if [[ $selected == target ]]; then' \
+    '    cat "$FWDPORTS_TEST_TARGET_SSH_CONFIG"' \
+    '  else' \
+    '    cat "$FWDPORTS_TEST_JUMP_SSH_CONFIG"' \
+    '  fi' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$fake_ssh"
+  chmod 0700 "$fake_ssh"
+  printf '%s\n' \
+    'hostname gateway.example.net' \
+    'user example' \
+    'port 22' \
+    'clearallforwardings yes' \
+    'forwardagent no' \
+    'proxyjump jump' >"$target_config"
+  printf '%s\n' \
+    'hostname jump.example.net' \
+    'user jumper' \
+    'port 22' \
+    'forwardagent no' >"$jump_config"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_ETTUN_COMMAND=$fake_ettun \
+    FWDPORTS_ETTUN_ET_COMMAND=$fake_et \
+    FWDPORTS_SSH_COMMAND=$fake_ssh \
+    FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    fwdports_builtin_prepare "$manifest" relay ettun "$runtime" '' \
+    2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "ettun ProxyJump: built-in prepare succeeds" 0 "$status"
+  [[ $status -eq 0 ]] || return
+  _assert_eq "ettun ProxyJump: route is explicit in the public CLI" \
+    $'edge-alias\n--jump-host\njump\n--local\n18080\ndesktop.example.net\n3389' \
+    "$(<"$runtime/ettun-argv")"
+
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=23 \
+    "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun ProxyJump: foreground status is preserved" 23 "$status"
+  _assert_contains "ettun ProxyJump: public option reaches stock ET" \
+    $'ARG=--jumphost\nARG=jump' "$(<"$et_log")"
+  jump_count=$(LC_ALL=C grep -c '^ARG=--jumphost$' "$et_log" || true)
+  _assert_eq "ettun ProxyJump: stock ET receives the jump exactly once" 1 \
+    "$jump_count"
+
+  before=$(<"$et_log")
+  _fwdports_write_private_lines "$runtime/ettun-argv" edge-alias \
+    18080 desktop.example.net 3389 || return 1
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_TARGET_SSH_CONFIG=$target_config \
+    FWDPORTS_TEST_JUMP_SSH_CONFIG=$jump_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-gate" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun ProxyJump: missing public option fails closed" 78 \
+    "$status"
+  _assert_eq "ettun ProxyJump: rejected argv launches no ET" "$before" \
+    "$(<"$et_log")"
+
+  _fwdports_write_private_lines "$runtime/ettun-argv" edge-alias \
+    --reverse 22022 127.0.0.1 22 || return 1
+  _fwdports_ettun_apply_proxyjump "$runtime" || return 1
+  _assert_eq "ettun ProxyJump: reverse-only route stays explicit" \
+    $'edge-alias\n--jump-host\njump\n--reverse\n22022\n127.0.0.1\n22' \
+    "$(<"$runtime/ettun-argv")"
+
+  _fwdports_write_private_lines "$runtime/ettun-argv" edge-alias \
+    --local 18080 desktop.example.net 3389 \
+    --reverse 22022 127.0.0.1 22 || return 1
+  _fwdports_ettun_apply_proxyjump "$runtime" || return 1
+  _assert_eq "ettun ProxyJump: mixed route stays canonical" \
+    $'edge-alias\n--jump-host\njump\n--local\n18080\ndesktop.example.net\n3389\n--reverse\n22022\n127.0.0.1\n22' \
+    "$(<"$runtime/ettun-argv")"
+}
+
 shared_et_ssh_bundle_case() {
   local tmp direct_manifest relay_manifest direct_runtime relay_runtime
   local fake_bin fake_ettun fake_et fake_ssh ssh_config error status=0 path
@@ -1179,6 +1326,21 @@ default_et_hardening_case() {
   _assert_contains "ettun nested ET gate: reverse mapping reaches ET" \
     $'ARG=-r\nARG=127.0.0.1:49154:127.0.0.1:22' "$(<"$et_log")"
 
+  before_et=$(<"$et_log")
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: unexpected public jump fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: unexpected jump launches no ET" \
+    "$before_et" "$(<"$et_log")"
+
   printf '%s\n' \
     $'target\tgateway.example.net' \
     $'destination\texample@gateway.example.net' \
@@ -1192,12 +1354,29 @@ default_et_hardening_case() {
     'exit "${FWDPORTS_TEST_JUMP_GATE_STATUS:-0}"' \
     >"$runtime/et-ssh-jump-ambient/ssh-gate"
   chmod 0700 "$runtime/et-ssh-jump-ambient/ssh-gate"
+
+  before_et=$(<"$et_log")
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: missing public jump fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: missing public jump launches no ET" \
+    "$before_et" "$(<"$et_log")"
+
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=24 \
-    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
     -t '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
@@ -1216,7 +1395,7 @@ default_et_hardening_case() {
     FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
     FWDPORTS_TEST_JUMP_GATE_STATUS=78 \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
     -t '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
@@ -1233,7 +1412,7 @@ default_et_hardening_case() {
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
     -t '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
@@ -1891,6 +2070,7 @@ run_case builtin-selection builtin_selection_case
 run_case nested-dependency nested_dependency_case
 run_case remote-port-slot remote_port_slot_case
 run_case generation-prepare generation_prepare_case
+run_case proxyjump-public-cli proxyjump_public_cli_case
 run_case shared-et-ssh-bundle shared_et_ssh_bundle_case
 run_case generation-gate generation_gate_case
 run_case default-et-hardening default_et_hardening_case

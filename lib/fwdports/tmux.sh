@@ -1027,12 +1027,18 @@ _fwdports_wait_session_empty() {
       status=$?
     fi
     case "$status" in
-      0)
-        [[ $index -lt $attempts ]] || return 1
+      1) return 0 ;;
+      0 | 2)
+        # A process can exit while its session snapshot is being collected.
+        # Retry that indeterminate observation within the caller's existing
+        # bound, but never accept it as proof that the session is empty.
+        if [[ $index -ge $attempts ]]; then
+          [[ $status -eq 0 ]] && return 1
+          return 2
+        fi
         sleep "$delay"
         index=$((index + 1))
         ;;
-      1) return 0 ;;
       *) return 2 ;;
     esac
   done

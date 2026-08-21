@@ -104,8 +104,11 @@ disabled.
 A single `ProxyJump` alias receives a narrower equivalent treatment. The
 destination and jump-host effective configurations are authenticated
 separately, and the shim accepts only ET's reviewed destination-bootstrap and
-jump-relay argument shapes. The jump must itself be direct and use its default
-SSH port; `ProxyCommand`, nested routes, and multi-hop lists remain rejected.
+jump-relay argument shapes. For the ettun driver, the validated selector is
+also present as the public `ettun --jump-host` argument; the nested ET gate
+requires the resulting `--jumphost` value to match the same prepared plan. The
+jump must itself be direct and use its default SSH port; `ProxyCommand`, nested
+routes, and multi-hop lists remain rejected.
 
 ## ettun consistency
 

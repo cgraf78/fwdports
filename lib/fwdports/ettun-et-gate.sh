@@ -109,6 +109,15 @@ if [[ -s $GATE_DIR/et-ssh-proxyjump ]]; then
     publish_drift ettun-et-generation-drift
 fi
 
+et_argv=("$@")
+if [[ -n $jump_selector ]]; then
+  [[ $# -ge 2 && ${1:-} == --jumphost && ${2:-} == "$jump_selector" ]] ||
+    publish_drift ettun-et-generation-drift
+  shift 2
+elif [[ ${1:-} == --jumphost ]]; then
+  publish_drift ettun-et-generation-drift
+fi
+
 # These are the reviewed stock-ET call shapes from the authenticated public
 # ettun launcher. Every route carries the private ordinary tunnel used for
 # lifecycle control; a reverse route adds one fixed-position -r pair. A future
@@ -145,7 +154,4 @@ PATH=$GATE_DIR/et-bin:${PATH:-/usr/bin:/bin}
 export TERM TMPDIR TMP TEMP PATH
 
 rm -f -- "$DRIFT_FILE"
-if [[ -n $jump_selector ]]; then
-  exec "$et_path" --telemetry=false --jumphost "$jump_selector" "$@"
-fi
-exec "$et_path" --telemetry=false "$@"
+exec "$et_path" --telemetry=false "${et_argv[@]}"

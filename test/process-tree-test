@@ -79,6 +79,46 @@ wait_for_file() {
   [[ -s "$path" ]]
 }
 
+write_interrupt_sync_tmux() {
+  local path=$1
+
+  cat >"$path" <<'TMUX'
+#!/usr/bin/env bash
+set -u
+
+real=${FWDPORTS_TEST_REAL_TMUX:?}
+marker=${FWDPORTS_TEST_INTERRUPT_MARKER:?}
+is_interrupt=0
+for arg in "$@"; do
+  [[ $arg == send-keys ]] && is_interrupt=1
+done
+
+before=0
+if [[ $is_interrupt -eq 1 && -s $marker ]]; then
+  before=$(<"$marker")
+fi
+
+"$real" "$@"
+status=$?
+[[ $status -eq 0 && $is_interrupt -eq 1 ]] || exit "$status"
+
+attempt=0
+while [[ $attempt -lt 200 ]]; do
+  observed=0
+  [[ ! -s $marker ]] || observed=$(<"$marker")
+  if [[ $observed =~ ^[0-9]+$ && $observed -gt $before ]]; then
+    exit 0
+  fi
+  sleep 0.01
+  attempt=$((attempt + 1))
+done
+
+printf 'test tmux: interrupt after %s was not acknowledged\n' "$before" >&2
+exit 1
+TMUX
+  chmod 0700 "$path"
+}
+
 wait_for_process_exit() {
   local pid=$1 attempts=$2 delay=$3 index=0
   while kill -0 "$pid" 2>/dev/null && [[ $index -lt $attempts ]]; do
@@ -325,11 +365,12 @@ termination_fixture() {
         'interrupts=0' \
         'on_interrupt() {' \
         '  interrupts=$((interrupts + 1))' \
-        '  printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
         '  if [[ $interrupts -ge 2 ]]; then' \
+        '    printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
         '    complete_stop' \
         '  fi' \
         '  (sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"; kill -TERM "$$") &' \
+        '  printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
         '}' \
         'set +m' \
         'trap on_interrupt INT' \
@@ -1290,16 +1331,22 @@ zombie_process_is_inert_case() {
 }
 
 ettun_runner_force_case() {
-  local tmp output error status worker_alive=0
+  local tmp output error status worker_alive=0 sync_tmux
   tmp=$(_tmpdir) || return 1
   termination_fixture "$tmp" ettun-runner-force || return 1
   output=$tmp/output
   error=$tmp/error
+  sync_tmux=$tmp/tmux-sync
+  write_interrupt_sync_tmux "$sync_tmux" || return 1
 
-  # Two authenticated scans reach the force stage before the 60-second
-  # fixture grace period even on platforms with expensive session queries.
+  # Keep the fixture synchronized with actual terminal signal handling. The
+  # production path still performs its real bounded session scans between the
+  # two interrupts, while the wrapper prevents CI scheduling from coalescing a
+  # second C-c before the first handler has returned.
   set +e
-  fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+  FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN \
+    FWDPORTS_TEST_INTERRUPT_MARKER=$PROC_LEADER_MARKER \
+    fwdports_tmux_terminate_pane "$sync_tmux" "$PROC_SOCKET" "$PROC_ROOT" \
     active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
     2 0.02 ettun-session >"$output" 2>"$error"
   status=$?

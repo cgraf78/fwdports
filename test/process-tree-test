@@ -1274,13 +1274,13 @@ ettun_runner_graceful_case() {
     20 0.02 ettun-session >"$output" 2>"$error"
   status=$?
   set -e
-  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+  wait_for_process_inert "$PROC_CHILD" 100 0.01 || worker_alive=1
 
   _assert_exit "ettun runner graceful stop: cleanup succeeds" 0 "$status"
   _assert_eq \
     "ettun runner graceful stop: first stage remains a graceful request" \
     1 "$(<"$PROC_LEADER_MARKER")"
-  _assert_eq "ettun runner graceful stop: worker is reaped" 0 \
+  _assert_eq "ettun runner graceful stop: worker has no live execution" 0 \
     "$worker_alive"
   _assert_eq "ettun runner graceful stop: has no diagnostic" "" \
     "$(<"$error")"

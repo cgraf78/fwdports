@@ -352,8 +352,9 @@ termination_fixture() {
       else
         graceful_delay=60
       fi
-      # Model the post-gate exec directly. The graceful timer must not block
-      # the signal handler, or Bash cannot observe the second terminal INT.
+      # Model the post-gate exec directly. Publish readiness and the first
+      # interrupt acknowledgment from the main loop so the force request
+      # cannot race startup or nest inside the first signal handler.
       printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -u' \
@@ -363,21 +364,38 @@ termination_fixture() {
         '  kill -KILL 0 2>/dev/null || exit 130' \
         '}' \
         'interrupts=0' \
+        'acknowledged=0' \
+        'ready=0' \
+        'stop_requested=0' \
         'on_interrupt() {' \
         '  interrupts=$((interrupts + 1))' \
         '  if [[ $interrupts -ge 2 ]]; then' \
         '    printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
         '    complete_stop' \
         '  fi' \
-        '  (sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"; kill -TERM "$$") &' \
-        '  printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
+        '  stop_requested=1' \
         '}' \
         'set +m' \
         'trap on_interrupt INT' \
         'trap complete_stop TERM' \
         'trap '\'''\'' HUP' \
         'printf "%s %s\\n" "$$" "$$" >"$FWDPORTS_TEST_PROC_IDS"' \
-        'while :; do read -r -t 1 _ || true; done' \
+        'while :; do' \
+        '  if [[ $ready -eq 0 ]]; then' \
+        '    printf "0\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
+        '    ready=1' \
+        '  fi' \
+        '  read -r -t 0.01 _ || true' \
+        '  # Publish only after the first INT handler has returned.' \
+        '  if [[ $interrupts -gt $acknowledged ]]; then' \
+        '    printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
+        '    acknowledged=$interrupts' \
+        '    if [[ $stop_requested -eq 1 ]]; then' \
+        '      (sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"; kill -TERM "$$") &' \
+        '      stop_requested=0' \
+        '    fi' \
+        '  fi' \
+        'done' \
         >"$PROC_GATE"
       chmod 0700 "$PROC_GATE"
       printf '%s\n' ettun >"$PROC_GENERATION/legs/web/driver-kind"
@@ -419,6 +437,7 @@ termination_fixture() {
       ;;
     ettun-runner-*)
       wait_for_foreground_group "$PROC_ENGINE" "$PROC_CHILD" || return 1
+      wait_for_file "$PROC_LEADER_MARKER" || return 1
       ;;
   esac
   fwdports_tmux_record_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_SESSION" \
@@ -1274,13 +1293,13 @@ ettun_runner_graceful_case() {
     20 0.02 ettun-session >"$output" 2>"$error"
   status=$?
   set -e
-  kill -0 "$PROC_CHILD" 2>/dev/null && worker_alive=1
+  wait_for_process_inert "$PROC_CHILD" 100 0.01 || worker_alive=1
 
   _assert_exit "ettun runner graceful stop: cleanup succeeds" 0 "$status"
   _assert_eq \
     "ettun runner graceful stop: first stage remains a graceful request" \
     1 "$(<"$PROC_LEADER_MARKER")"
-  _assert_eq "ettun runner graceful stop: worker is reaped" 0 \
+  _assert_eq "ettun runner graceful stop: worker has no live execution" 0 \
     "$worker_alive"
   _assert_eq "ettun runner graceful stop: has no diagnostic" "" \
     "$(<"$error")"

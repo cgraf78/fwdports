@@ -3,7 +3,7 @@ name: Retry CI infrastructure failures
 # This controller inspects run metadata and logs; it never executes the failed ref.
 on: # zizmor: ignore[dangerous-triggers]
   workflow_run:
-    workflows: [CI]
+    workflows: [Tests]
     types: [completed]
 
 permissions: {}

@@ -94,7 +94,12 @@ termux_prefix_anchor_case() {
 
 stock_macos_bash_ci_case() {
   local workflow
-  workflow=$ROOT/.github/workflows/ci.yml
+  workflow=$ROOT/.github/workflows/test.yml
+  _assert_contains "portability CI: uses the standard Tests display name" \
+    "name: Tests" "$(<"$workflow")"
+  _assert_contains "portability CI: retry controller watches Tests" \
+    "workflows: [Tests]" \
+    "$(<"$ROOT/.github/workflows/retry-infrastructure.yml")"
 
   # The shared matrix installs a current Homebrew Bash before running tests.
   # Keep a repository-owned gate for Apple's stock Bash so the documented

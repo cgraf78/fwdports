@@ -18,6 +18,26 @@ _fwdports_tmux_call() {
   TMUX='' TMUX_PANE='' "$tmux_path" -S "$socket" "$@"
 }
 
+_fwdports_tmux_layout_spread() {
+  local tmux_path=$1 socket=$2 window_id=$3 heights height minimum maximum
+
+  heights=$(_fwdports_tmux_call "$tmux_path" "$socket" list-panes \
+    -t "$window_id" -F '#{pane_height}') || return 1
+  minimum=
+  maximum=
+  while IFS= read -r height; do
+    [[ $height =~ ^[0-9]+$ ]] || return 1
+    if [[ -z $minimum || $height -lt $minimum ]]; then
+      minimum=$height
+    fi
+    if [[ -z $maximum || $height -gt $maximum ]]; then
+      maximum=$height
+    fi
+  done <<<"$heights"
+  [[ -n $minimum && -n $maximum ]] || return 1
+  printf '%d\n' "$((maximum - minimum))"
+}
+
 fwdports_tmux_create_session() {
   local tmux_path=$1 socket=$2 session_name=$3 nonce=$4 start_directory=$5
   local output session_id pane_id recorded_nonce recorded_session
@@ -160,7 +180,7 @@ fwdports_tmux_split_pane() {
 
 fwdports_tmux_configure_transport_pane() {
   local tmux_path=$1 socket=$2 session_id=$3 nonce=$4 pane_id=$5
-  local leg=$6 driver=$7 recorded_nonce recorded_session window_id
+  local leg=$6 driver=$7 recorded_nonce recorded_session window_id spread
 
   [[ $session_id =~ ^\$[0-9]+$ &&
     $nonce =~ ^generation\.[A-Za-z0-9]+$ &&
@@ -193,11 +213,24 @@ fwdports_tmux_configure_transport_pane() {
   _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
     -t "$window_id" allow-rename off || return 1
   _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
-    -t "$window_id" pane-border-status top || return 1
-  _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
     -t "$window_id" pane-border-format ' #{@fwdports_label} ' || return 1
+  _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+    -t "$window_id" pane-border-status top || return 1
   _fwdports_tmux_call "$tmux_path" "$socket" select-layout \
     -t "$window_id" even-vertical >/dev/null || return 1
+  spread=$(_fwdports_tmux_layout_spread "$tmux_path" "$socket" \
+    "$window_id") || return 1
+  if [[ $spread -gt 1 ]]; then
+    # tmux 3.2a assigns title rows to the final pane during even-vertical.
+    # Newer releases balance with titles present, so use this fallback only
+    # when the observed geometry proves that the normal layout is uneven.
+    _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+      -t "$window_id" pane-border-status off || return 1
+    _fwdports_tmux_call "$tmux_path" "$socket" select-layout \
+      -t "$window_id" even-vertical >/dev/null || return 1
+    _fwdports_tmux_call "$tmux_path" "$socket" set-option -w \
+      -t "$window_id" pane-border-status top || return 1
+  fi
 }
 
 fwdports_tmux_abort_created_window() {

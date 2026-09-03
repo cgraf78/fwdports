@@ -6,11 +6,13 @@
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Termux-lightgrey.svg)](#)
 
 `fwdports` keeps a declared set of port forwards alive in one inspectable tmux
-session. It uses ordinary foreground OpenSSH by default, supports autossh when
-explicitly selected, supports Eternal Terminal 7.0.0 or newer for resilient
-direct-host tunnels, supports the public `ettun` relay engine for destinations
-reached through an ET host, and lets trusted local executables provide other
-transport drivers without putting consumer policy in the core.
+session. It uses the platform OpenSSH executable directly by default instead
+of an `ssh` wrapper found through PATH; `FWDPORTS_SSH_COMMAND` remains the
+explicit override. It supports autossh when explicitly selected, supports
+Eternal Terminal 7.0.0 or newer for resilient direct-host tunnels, supports
+the public `ettun` relay engine for destinations reached through an ET host,
+and lets trusted local executables provide other transport drivers without
+putting consumer policy in the core.
 
 ## Install
 

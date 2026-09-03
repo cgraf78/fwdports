@@ -50,6 +50,31 @@ canonicalization_case() {
     "$real" "$result"
 }
 
+stock_ssh_default_case() {
+  local tmp fake_bin fake_ssh result override_result
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  fake_ssh=$fake_bin/ssh
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "OpenSSH_9.9p1 fake" >&2' \
+    'exit 0' >"$fake_ssh"
+  chmod 0700 "$fake_ssh"
+
+  result=$(PATH="$fake_bin:/usr/bin:/bin" fwdports_ssh_command) ||
+    return 1
+  _assert_ne "portability: default SSH ignores PATH shims" \
+    "$fake_ssh" "$result"
+  _assert_contains "portability: default SSH selects stock binary" \
+    "/ssh" "$result"
+
+  override_result=$(FWDPORTS_SSH_COMMAND="$fake_ssh" \
+    PATH="/usr/bin:/bin" fwdports_ssh_command) || return 1
+  _assert_eq "portability: explicit SSH override remains honored" \
+    "$fake_ssh" "$override_result"
+}
+
 termux_prefix_anchor_case() {
   local tmp outer prefix fake output error status
   tmp=$(_tmpdir) || return 1
@@ -160,6 +185,7 @@ bsd_ps_session_keyword_case() {
 
 run_case bsd-stat bsd_stat_case
 run_case canonicalization canonicalization_case
+run_case stock-ssh-default stock_ssh_default_case
 run_case termux-prefix-anchor termux_prefix_anchor_case
 run_case stock-macos-bash-ci stock_macos_bash_ci_case
 run_case bsd-ps-session-keyword bsd_ps_session_keyword_case

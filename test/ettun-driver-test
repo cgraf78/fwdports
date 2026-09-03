@@ -636,8 +636,10 @@ builtin_dependency_preflight_case() {
   _assert_contains "built-in dependency preflight: every leg prepares before tmux creation" \
     'Validate every leg before invoking any interactive prepare operation' \
     "$core"
-  _assert_contains "built-in dependency preflight: SSH resolves during prepare" \
-    'fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}"' "$drivers"
+  _assert_contains "built-in dependency preflight: SSH command is resolved during prepare" \
+    'ssh_command=$(fwdports_ssh_command)' "$drivers"
+  _assert_contains "built-in dependency preflight: SSH resolves from selected command" \
+    'fwdports_ssh_resolve "$ssh_command"' "$drivers"
   _assert_contains "built-in dependency preflight: autossh resolves during prepare" \
     'fwdports_autossh_resolve "${FWDPORTS_AUTOSSH_COMMAND:-autossh}"' \
     "$drivers"

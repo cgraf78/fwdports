@@ -79,6 +79,38 @@ _fwdports_canonical_executable() {
   printf '%s\n' "$candidate"
 }
 
+_fwdports_stock_ssh_command() {
+  local candidate
+
+  if _fwdports_termux_prefix_anchor &&
+    [[ -n ${PREFIX:-} && -x $PREFIX/bin/ssh && ! -L $PREFIX/bin/ssh ]]; then
+    printf '%s\n' "$PREFIX/bin/ssh"
+    return 0
+  fi
+
+  # fwdports binds OpenSSH process identity and effective config. The default
+  # must be the platform SSH binary, not a user PATH shim that may itself
+  # reinvoke `ssh` while fwdports has installed a private ET bootstrap shim.
+  for candidate in /usr/bin/ssh /bin/ssh; do
+    if [[ -x $candidate && ! -L $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+fwdports_ssh_command() {
+  if [[ -n ${FWDPORTS_SSH_COMMAND:-} ]]; then
+    printf '%s\n' "$FWDPORTS_SSH_COMMAND"
+    return 0
+  fi
+  _fwdports_stock_ssh_command || {
+    printf 'fwdports: stock OpenSSH executable is not available\n' >&2
+    return 1
+  }
+}
+
 _fwdports_executable_parent_chain_trusted() {
   local path=$1 directory record owner mode _rest mode_bits uid parent
   local trust_anchor='' canonical_candidate
@@ -2148,10 +2180,10 @@ _fwdports_builtin_prepare_ssh() {
   local manifest=$1 leg=$2 driver=$3 runtime=$4 target_override=$5
   local identity=$runtime/ssh-source argv_file=$runtime/ssh-argv
   local target=$runtime/ssh-target digest=$runtime/ssh-effective-digest
-  local ssh_path
+  local ssh_command ssh_path
 
-  fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" "$identity" ||
-    return 1
+  ssh_command=$(fwdports_ssh_command) || return 1
+  fwdports_ssh_resolve "$ssh_command" "$identity" || return 1
   fwdports_ssh_build_argv "$manifest" "$leg" "$target_override" \
     "$argv_file" "$target" || return 1
   fwdports_ssh_preflight_local_ports "$argv_file" || return 1
@@ -2167,7 +2199,7 @@ _fwdports_builtin_prepare_ssh() {
 }
 
 _fwdports_prepare_et_ssh_gates() {
-  local runtime=$1 target=$2 ssh_path
+  local runtime=$1 target=$2 ssh_command ssh_path
   local ssh_source=$runtime/et-ssh-source
   local ambient_argv=$runtime/et-ssh-ambient-argv
   local ambient_digest=$runtime/et-ssh-ambient-digest
@@ -2186,8 +2218,8 @@ _fwdports_prepare_et_ssh_gates() {
   # `ssh`. Publish the same trusted executable plus ambient and hardened
   # bootstrap gates for either outer driver. Their ET engine gates remain
   # separate because those have different argv and lifecycle contracts.
-  fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" "$ssh_source" ||
-    return 1
+  ssh_command=$(fwdports_ssh_command) || return 1
+  fwdports_ssh_resolve "$ssh_command" "$ssh_source" || return 1
   ssh_path=$(LC_ALL=C sed -n 's/^path\t//p' "$ssh_source") || return 1
   [[ -n $ssh_path ]] || return 1
 
@@ -2438,6 +2470,7 @@ fwdports_autossh_resolve() {
 fwdports_builtin_preflight_dependencies() {
   local manifest=$1 preflight_root=$2 target_override=${3:-}
   local kind leg driver _ runtime transport via index required_capability
+  local ssh_command
   local -a legs=() drivers=()
 
   [[ -f $manifest && ! -L $manifest ]] || {
@@ -2474,20 +2507,23 @@ fwdports_builtin_preflight_dependencies() {
     # executable identities used at launch.
     case "$driver" in
       ssh)
-        fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
-          "$runtime/ssh-source" || return 1
+        ssh_command=$(fwdports_ssh_command) || return 1
+        fwdports_ssh_resolve "$ssh_command" "$runtime/ssh-source" ||
+          return 1
         ;;
       autossh)
-        fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
-          "$runtime/ssh-source" || return 1
+        ssh_command=$(fwdports_ssh_command) || return 1
+        fwdports_ssh_resolve "$ssh_command" "$runtime/ssh-source" ||
+          return 1
         fwdports_autossh_resolve "${FWDPORTS_AUTOSSH_COMMAND:-autossh}" \
           "$runtime/autossh-source" || return 1
         ;;
       et)
         fwdports_et_resolve "${FWDPORTS_ET_COMMAND:-et}" \
           "$runtime/et-source" || return 1
-        fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
-          "$runtime/ssh-source" || return 1
+        ssh_command=$(fwdports_ssh_command) || return 1
+        fwdports_ssh_resolve "$ssh_command" "$runtime/ssh-source" ||
+          return 1
         ;;
       ettun)
         fwdports_ettun_resolve "${FWDPORTS_ETTUN_COMMAND:-ettun}" \
@@ -2509,8 +2545,9 @@ fwdports_builtin_preflight_dependencies() {
             return 1
           fwdports_et_resolve "${FWDPORTS_ETTUN_ET_COMMAND:-et}" \
             "$runtime/ettun-et-source" || return 1
-          fwdports_ssh_resolve "${FWDPORTS_SSH_COMMAND:-ssh}" \
-            "$runtime/ssh-source" || return 1
+          ssh_command=$(fwdports_ssh_command) || return 1
+          fwdports_ssh_resolve "$ssh_command" "$runtime/ssh-source" ||
+            return 1
         fi
         ;;
       *)

@@ -622,7 +622,7 @@ fwdports_tmux_session_named_exists() {
     -t "$session_name" 2>/dev/null
 }
 
-_fwdports_process_group_records() {
+_fwdports_process_group_snapshot() {
   local wanted_pgid=$1 output line pid pgid sid tty state extra found=0
   local records=''
 
@@ -640,6 +640,30 @@ _fwdports_process_group_records() {
   done <<<"$output"
   [[ $found -eq 1 ]] || return 1
   printf '%s' "$records"
+}
+
+_fwdports_process_group_records() {
+  local wanted_pgid=$1 records status
+
+  [[ $wanted_pgid =~ ^[0-9]+$ ]] || return 1
+  if records=$(_fwdports_process_group_snapshot "$wanted_pgid"); then
+    printf '%s' "$records"
+    return 0
+  else
+    status=$?
+  fi
+  [[ $status -eq 1 ]] || return "$status"
+
+  # A process can fork while ps is walking /proc. As with session inspection,
+  # require two complete empty scans before treating the recorded group as
+  # absent; a transient gap must not revoke ownership before KILL escalation.
+  if records=$(_fwdports_process_group_snapshot "$wanted_pgid"); then
+    printf '%s' "$records"
+    return 0
+  else
+    status=$?
+  fi
+  return "$status"
 }
 
 _fwdports_process_group_live_records() {

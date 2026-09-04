@@ -188,7 +188,7 @@ darwin_session_ps_fixture() {
 
 termination_fixture() {
   local tmp=$1 mode=$2 home state source start record
-  local driver=ssh graceful_delay='' python_path
+  local driver=ssh graceful_delay='' python_path signal_helper=''
   home=$tmp/home
   state=$tmp/state
   source=$tmp/resolved-profile
@@ -347,55 +347,64 @@ termination_fixture() {
     ettun-runner-graceful | ettun-runner-force)
       PROC_SCRIPT=$ROOT/lib/fwdports/builtin-runner.sh
       PROC_GATE=$PROC_GENERATION/legs/web/ettun-gate
+      signal_helper=$PROC_GENERATION/legs/web/ettun-signal-fixture.py
       if [[ $mode == ettun-runner-graceful ]]; then
         graceful_delay=0.02
       else
         graceful_delay=60
       fi
-      # Model the post-gate exec directly. Publish readiness and the first
-      # interrupt acknowledgment from the main loop so the force request
-      # cannot race startup or nest inside the first signal handler.
+      # Model the post-gate exec directly. Keep INT blocked between synchronous
+      # sigwait calls so each acknowledged terminal interrupt is consumed
+      # exactly once instead of depending on Bash's deferred-trap timing.
+      cat >"$signal_helper" <<'PYTHON'
+#!/usr/bin/env python3
+import os
+import signal
+import threading
+
+
+pid = os.getpid()
+group = os.getpgrp()
+marker = os.environ["FWDPORTS_TEST_ENGINE_MARKER"]
+graceful_delay = float(os.environ["FWDPORTS_TEST_GRACEFUL_DELAY"])
+blocked = {signal.SIGINT, signal.SIGTERM}
+
+
+def publish(value):
+    with open(marker, "w", encoding="utf-8") as stream:
+        stream.write(f"{value}\n")
+
+
+def stop():
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    os.killpg(0, signal.SIGKILL)
+
+
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+with open(os.environ["FWDPORTS_TEST_PROC_IDS"], "w", encoding="utf-8") as stream:
+    stream.write(f"{group} {group}\n")
+publish(0)
+
+interrupts = 0
+while True:
+    received = signal.sigwait(blocked)
+    if received == signal.SIGTERM:
+        stop()
+    interrupts += 1
+    publish(interrupts)
+    if interrupts >= 2:
+        stop()
+    timer = threading.Timer(graceful_delay, os.kill, args=(pid, signal.SIGTERM))
+    timer.daemon = True
+    timer.start()
+PYTHON
+      chmod 0700 "$signal_helper"
       printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -u' \
         'set -m' \
-        'complete_stop() {' \
-        '  trap '\'''\'' HUP INT TERM' \
-        '  kill -KILL 0 2>/dev/null || exit 130' \
-        '}' \
-        'interrupts=0' \
-        'acknowledged=0' \
-        'ready=0' \
-        'stop_requested=0' \
-        'on_interrupt() {' \
-        '  interrupts=$((interrupts + 1))' \
-        '  if [[ $interrupts -ge 2 ]]; then' \
-        '    printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '    complete_stop' \
-        '  fi' \
-        '  stop_requested=1' \
-        '}' \
-        'set +m' \
-        'trap on_interrupt INT' \
-        'trap complete_stop TERM' \
-        'trap '\'''\'' HUP' \
-        'printf "%s %s\\n" "$$" "$$" >"$FWDPORTS_TEST_PROC_IDS"' \
-        'while :; do' \
-        '  if [[ $ready -eq 0 ]]; then' \
-        '    printf "0\\n" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '    ready=1' \
-        '  fi' \
-        '  read -r -t 0.01 _ || true' \
-        '  # Publish only after the first INT handler has returned.' \
-        '  if [[ $interrupts -gt $acknowledged ]]; then' \
-        '    printf "%s\\n" "$interrupts" >"$FWDPORTS_TEST_ENGINE_MARKER"' \
-        '    acknowledged=$interrupts' \
-        '    if [[ $stop_requested -eq 1 ]]; then' \
-        '      (sleep "$FWDPORTS_TEST_GRACEFUL_DELAY"; kill -TERM "$$") &' \
-        '      stop_requested=0' \
-        '    fi' \
-        '  fi' \
-        'done' \
+        'python3 "$FWDPORTS_TEST_SIGNAL_HELPER"' \
         >"$PROC_GATE"
       chmod 0700 "$PROC_GATE"
       printf '%s\n' ettun >"$PROC_GENERATION/legs/web/driver-kind"
@@ -417,6 +426,7 @@ termination_fixture() {
       "FWDPORTS_TEST_PROC_IDS=$PROC_IDS" \
       "FWDPORTS_TEST_ENGINE_MARKER=$PROC_LEADER_MARKER" \
       "FWDPORTS_TEST_GRACEFUL_DELAY=$graceful_delay" \
+      "FWDPORTS_TEST_SIGNAL_HELPER=$signal_helper" \
       "$PROC_SCRIPT" "$PROC_GENERATION/legs/web") || return 1
   else
     chmod 0700 "$PROC_SCRIPT"
@@ -1504,6 +1514,70 @@ malformed_process_enumeration_case() {
     "" "$(<"$output")"
 }
 
+transient_empty_process_group_case() {
+  local tmp fake_bin count output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  count=$tmp/count
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '0\n' >"$count"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'current=$(<"$FWDPORTS_TEST_PS_COUNT")' \
+    'current=$((current + 1))' \
+    'printf "%s\n" "$current" >"$FWDPORTS_TEST_PS_COUNT"' \
+    'if [[ $current -eq 1 ]]; then' \
+    '  printf "1 1 1 ? S\n"' \
+    'else' \
+    '  printf "4242 4242 4242 ? S\n"' \
+    'fi' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  FWDPORTS_TEST_PS_COUNT=$count PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_records 4242 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "transient empty process group: retries the snapshot" 0 \
+    "$status"
+  _assert_eq "transient empty process group: finds the live member" \
+    $'4242\t4242\t?\tS' "$(<"$output")"
+  _assert_eq "transient empty process group: takes two snapshots" 2 \
+    "$(<"$count")"
+}
+
+stable_empty_process_group_case() {
+  local tmp fake_bin count output status
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  count=$tmp/count
+  output=$tmp/output
+  mkdir -p "$fake_bin"
+  printf '0\n' >"$count"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'current=$(<"$FWDPORTS_TEST_PS_COUNT")' \
+    'printf "%s\n" "$((current + 1))" >"$FWDPORTS_TEST_PS_COUNT"' \
+    'printf "1 1 1 ? S\n"' \
+    >"$fake_bin/ps"
+  chmod 0700 "$fake_bin/ps"
+
+  set +e
+  FWDPORTS_TEST_PS_COUNT=$count PATH="$fake_bin:/usr/bin:/bin" \
+    _fwdports_process_group_records 4242 >"$output" 2>/dev/null
+  status=$?
+  set -e
+
+  _assert_exit "stable empty process group: reports absence" 1 "$status"
+  _assert_eq "stable empty process group: publishes no member" \
+    "" "$(<"$output")"
+  _assert_eq "stable empty process group: requires two snapshots" 2 \
+    "$(<"$count")"
+}
+
 zombie_only_process_group_case() {
   local tmp fake_bin output status
   tmp=$(_tmpdir) || return 1
@@ -1605,6 +1679,8 @@ run_case ettun-session-survivor ettun_session_survivor_case
 run_case darwin-ettun-session-survivor darwin_ettun_session_survivor_case
 run_case failed-process-enumeration failed_process_enumeration_case
 run_case malformed-process-enumeration malformed_process_enumeration_case
+run_case transient-empty-process-group transient_empty_process_group_case
+run_case stable-empty-process-group stable_empty_process_group_case
 run_case darwin-session-enumerator darwin_session_enumerator_case
 run_case session-enumerator-probe session_enumerator_probe_case
 run_case session-enumerator-integrity session_enumerator_integrity_case

@@ -1046,6 +1046,78 @@ session_enumerator_integrity_case() {
     2 "$status"
 }
 
+session_enumerator_device_drift_case() {
+  local tmp runtime evidence output status python_path rewritten
+  local key value rest owner mode device tail
+  tmp=$(_tmpdir) || return 1
+  runtime=$tmp/runtime
+  evidence=$runtime/pane
+  output=$tmp/output
+  rewritten=$tmp/session-python
+  python_path=$(python3 -c \
+    'import os, sys; print(os.path.realpath(sys.executable))') || return 1
+  mkdir -p "$runtime"
+  chmod 0700 "$runtime"
+  write_session_enumerator_runtime "$runtime" "$python_path" || return 1
+
+  # Volume device numbers are not stable across reboots or remounts, so a
+  # recorded identity whose only drift is the device field must still
+  # authenticate. Rewrite both recorded identities with a different device.
+  while IFS=$'\t' read -r key value rest || [[ -n ${key:-} ]]; do
+    case "$key" in
+      identity | helper-identity)
+        owner=${value%%:*}
+        rest=${value#*:}
+        mode=${rest%%:*}
+        rest=${rest#*:}
+        device=${rest%%:*}
+        tail=${rest#*:}
+        [[ $device =~ ^[0-9]+$ ]] || return 1
+        value=$owner:$mode:$((device + 1)):$tail
+        ;;
+    esac
+    printf '%s\t%s\n' "$key" "$value"
+  done <"$runtime/session-python" >"$rewritten" || return 1
+  chmod 0600 "$rewritten" || return 1
+  mv -f -- "$rewritten" "$runtime/session-python" || return 1
+
+  set +e
+  _fwdports_process_session_runtime "$evidence" >"$output"
+  status=$?
+  set -e
+  _assert_exit \
+    "session enumerator device drift: device-only drift still resolves" \
+    0 "$status"
+
+  # Any other identity drift must still fail closed. Rewrite the helper
+  # identity with a different inode while keeping the device drifted.
+  while IFS=$'\t' read -r key value rest || [[ -n ${key:-} ]]; do
+    case "$key" in
+      helper-identity)
+        owner=${value%%:*}
+        rest=${value#*:}
+        mode=${rest%%:*}
+        rest=${rest#*:}
+        device=${rest%%:*}
+        tail=${rest#*:}
+        tail=$(( ${tail%%:*} + 1 )):${tail#*:}
+        value=$owner:$mode:$device:$tail
+        ;;
+    esac
+    printf '%s\t%s\n' "$key" "$value"
+  done <"$runtime/session-python" >"$rewritten" || return 1
+  chmod 0600 "$rewritten" || return 1
+  mv -f -- "$rewritten" "$runtime/session-python" || return 1
+
+  set +e
+  _fwdports_process_session_runtime "$evidence" >"$output"
+  status=$?
+  set -e
+  _assert_exit \
+    "session enumerator device drift: inode drift still fails closed" \
+    2 "$status"
+}
+
 darwin_recorded_sid_case() {
   local tmp rewritten output error status session_arg
   tmp=$(_tmpdir) || return 1
@@ -1684,6 +1756,7 @@ run_case stable-empty-process-group stable_empty_process_group_case
 run_case darwin-session-enumerator darwin_session_enumerator_case
 run_case session-enumerator-probe session_enumerator_probe_case
 run_case session-enumerator-integrity session_enumerator_integrity_case
+run_case session-enumerator-device-drift session_enumerator_device_drift_case
 run_case darwin-recorded-sid darwin_recorded_sid_case
 run_case session-zombie session_zombie_case
 run_case session-mixed-live session_mixed_live_case

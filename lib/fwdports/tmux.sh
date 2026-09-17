@@ -727,6 +727,36 @@ _fwdports_tmux_trusted_file_identity() {
     "$owner" "$mode" "$device" "$inode" "$size" "$mtime"
 }
 
+# Volume device numbers are not stable across reboots or remounts: the same
+# file can report a different st_dev after the system restarts, while owner,
+# mode, inode, size, and mtime still describe the same directory entry. The
+# sha256 digest compared alongside the identity remains the content authority,
+# so a device-only drift must still authenticate. Any other field drift keeps
+# failing closed.
+_fwdports_tmux_identity_matches_recorded() {
+  local actual=$1 recorded=$2
+  local actual_owner actual_mode actual_device actual_inode actual_size
+  local actual_mtime actual_rest recorded_owner recorded_mode recorded_device
+  local recorded_inode recorded_size recorded_mtime recorded_rest
+
+  IFS=: read -r actual_owner actual_mode actual_device actual_inode \
+    actual_size actual_mtime actual_rest <<<"$actual"
+  IFS=: read -r recorded_owner recorded_mode recorded_device \
+    recorded_inode recorded_size recorded_mtime recorded_rest <<<"$recorded"
+  [[ -z ${actual_rest:-} && -z ${recorded_rest:-} &&
+    $actual_owner =~ ^[0-9]+$ && $actual_mode =~ ^[0-7]{3,4}$ &&
+    $actual_device =~ ^[0-9]+$ && $actual_inode =~ ^[0-9]+$ &&
+    $actual_size =~ ^[0-9]+$ && $actual_mtime =~ ^[0-9]+$ &&
+    $recorded_owner =~ ^[0-9]+$ && $recorded_mode =~ ^[0-7]{3,4}$ &&
+    $recorded_device =~ ^[0-9]+$ && $recorded_inode =~ ^[0-9]+$ &&
+    $recorded_size =~ ^[0-9]+$ && $recorded_mtime =~ ^[0-9]+$ ]] || return 1
+  [[ $actual_owner == "$recorded_owner" &&
+    $actual_mode == "$recorded_mode" &&
+    $actual_inode == "$recorded_inode" &&
+    $actual_size == "$recorded_size" &&
+    $actual_mtime == "$recorded_mtime" ]]
+}
+
 _fwdports_process_session_runtime() {
   local evidence=$1 runtime helper python_file key python_path identity digest
   local helper_identity helper_digest extra actual_identity actual_digest
@@ -759,12 +789,14 @@ _fwdports_process_session_runtime() {
     $helper_digest =~ ^[0-9a-f]{64}$ ]] || return 2
   actual_identity=$(_fwdports_tmux_trusted_file_identity "$python_path") ||
     return 2
-  [[ $actual_identity == "$identity" ]] || return 2
+  _fwdports_tmux_identity_matches_recorded "$actual_identity" "$identity" ||
+    return 2
   actual_digest=$(_fwdports_runtime_sha256_file "$python_path") || return 2
   [[ $actual_digest == "$digest" ]] || return 2
   actual_identity=$(_fwdports_tmux_trusted_file_identity "$helper") ||
     return 2
-  [[ $actual_identity == "$helper_identity" ]] || return 2
+  _fwdports_tmux_identity_matches_recorded "$actual_identity" \
+    "$helper_identity" || return 2
   actual_digest=$(_fwdports_runtime_sha256_file "$helper") || return 2
   [[ $actual_digest == "$helper_digest" ]] || return 2
   printf '%s\t%s\n' "$python_path" "$helper"

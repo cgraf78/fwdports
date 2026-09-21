@@ -1221,4 +1221,72 @@ run_case force-stale-pointer-rebuilds force_stale_pointer_rebuilds_case
 run_case force-unowned-session-rebuilds force_unowned_session_rebuilds_case
 run_case force-residual-listener-rebuilds force_residual_listener_rebuilds_case
 run_case force-rebuilds-healthy-generation force_rebuilds_healthy_generation_case
+
+force_proc_discovery_resolves_owner_case() {
+  local tmp listener_pid found free_found probe_attempt probe_ready
+  local pid alive
+  tmp=$(_tmpdir) || return 1
+  if [[ ! -r /proc/net/tcp ]] || ! command -v find >/dev/null 2>&1; then
+    _pass "force proc discovery: /proc owner resolution unavailable"
+    return 0
+  fi
+
+  python3 -c "import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 19235))
+s.listen(1)
+time.sleep(120)" &
+  listener_pid=$!
+  probe_ready=0
+  probe_attempt=0
+  while [[ $probe_attempt -lt 25 ]]; do
+    if python3 -c "import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect(('127.0.0.1', 19235))
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+      probe_ready=1
+      break
+    fi
+    probe_attempt=$((probe_attempt + 1))
+    sleep 0.2
+  done
+  if [[ $probe_ready -ne 1 ]]; then
+    _fail "force proc discovery: setup listener is live"
+    kill -9 "$listener_pid" 2>/dev/null || true
+    return 1
+  fi
+
+  found=$(bash -c 'source "$1";
+    _fwdports_local_forward_listener_pids_proc "$2"' _ \
+    "$ROOT/lib/fwdports/drivers.sh" 19235)
+  if [[ -z $found ]]; then
+    _fail "force proc discovery: resolves the listening owner"
+  else
+    alive=1
+    while IFS= read -r pid || [[ -n $pid ]]; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      kill -0 "$pid" 2>/dev/null || alive=0
+    done <<<"$found"
+    if [[ $alive -eq 1 ]]; then
+      _pass "force proc discovery: resolves the listening owner"
+    else
+      _fail "force proc discovery: resolves the listening owner"
+    fi
+  fi
+  kill -9 "$listener_pid" 2>/dev/null || true
+
+  free_found=$(bash -c 'source "$1";
+    _fwdports_local_forward_listener_pids_proc "$2"' _ \
+    "$ROOT/lib/fwdports/drivers.sh" 19236)
+  _assert_eq "force proc discovery: free port resolves nothing" "" \
+    "$free_found"
+}
+
+run_case force-proc-discovery-resolves-owner \
+  force_proc_discovery_resolves_owner_case
 _test_summary

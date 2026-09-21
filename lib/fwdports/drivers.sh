@@ -1080,7 +1080,8 @@ _fwdports_preflight_local_forward() {
 # Prints the PIDs currently listening on a TCP port, one per line. Empty
 # output means no visible listener. Fails when no PID-capable inspector
 # (lsof or ss) is available. Note ss -p hides foreign PIDs from unprivileged
-# callers; the eviction wrapper below closes that gap with a final nc probe.
+# callers, and lsof can be blind on Android; the eviction wrapper below
+# closes those gaps with an nc probe and a /proc fallback phase.
 _fwdports_local_forward_listener_pids() {
   local port=$1 status=0 pids line pid
   if command -v lsof >/dev/null 2>&1; then
@@ -1122,17 +1123,72 @@ _fwdports_local_forward_listener_pids() {
   return 1
 }
 
-# Evicts any listener on a local-forward spec's port (SIGTERM, then SIGKILL),
-# so a forced rebuild can reclaim ports held by residual or foreign owners.
-# Succeeds when nothing listens on the port. Fails when a listener survives
-# the grace period or hides from PID inspection while still accepting.
-_fwdports_evict_local_forward_listener() {
-  local spec=$1 attempts=$2 delay=$3
-  local port pids attempt=0 status=0 pid
+# Succeeds when a TCP connect to the host:port is accepted. Without nc the
+# probe cannot observe acceptance, so it reports closed and the caller
+# trusts PID discovery, matching preflight's no-nc behavior.
+_fwdports_tcp_port_accepts() {
+  local host=$1 port=$2
 
-  port=$(_fwdports_local_forward_port "$spec") || return 1
+  command -v nc >/dev/null 2>&1 || return 1
+  LC_ALL=C nc -z -w 2 "$host" "$port" >/dev/null 2>&1
+}
+
+# Prints the PIDs listening on a TCP port via /proc, one per line. Resolves
+# listening-socket inodes from /proc/net/tcp{,6}, then attributes them by
+# scanning /proc/PID/fd symlinks. Empty output means no visible listener.
+# Exists for platforms where lsof/ss cannot see owners (Android); callers
+# run it only after an nc probe proves a listener is accepting, because a
+# full fd sweep is slower than the native inspectors. Each inode resolves
+# in one find process matching link targets in-process (no per-entry
+# forks); inodes are numeric-validated before interpolation, and the
+# brackets are backslash-escaped so fnmatch reads them literally.
+_fwdports_local_forward_listener_pids_proc() {
+  local port=$1 hex file sl laddr _raddr state inode rest path pid
+  local inodes='' seen=' '
+
+  hex=$(printf '%04X' "$port") || return 1
+  for file in /proc/net/tcp /proc/net/tcp6; do
+    [[ -r $file ]] || continue
+    while read -r sl laddr _raddr state _r1 _r2 _r3 _r4 _r5 inode rest ||
+      [[ -n ${sl:-} ]]; do
+      if [[ $sl == sl ]]; then
+        continue
+      fi
+      [[ $laddr == *:$hex && $state == 0[Aa] ]] || continue
+      [[ $inode =~ ^[0-9]+$ ]] || continue
+      inodes+="$inode"$'\n'
+    done <"$file"
+  done
+  if [[ -z $inodes ]]; then
+    return 0
+  fi
+  while IFS= read -r inode || [[ -n $inode ]]; do
+    [[ $inode =~ ^[0-9]+$ ]] || continue
+    while IFS= read -r path || [[ -n $path ]]; do
+      pid=${path#/proc/}
+      pid=${pid%%/*}
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      if [[ $seen == *" $pid "* ]]; then
+        continue
+      fi
+      seen="${seen}${pid} "
+      printf '%s\n' "$pid"
+    done < <(find /proc/[0-9]*/fd -maxdepth 1 \
+      -lname "socket:\\[$inode\\]" 2>/dev/null)
+  done <<<"$inodes"
+  return 0
+}
+
+# Reaps the listeners a discovery function reports for a port (SIGTERM with
+# a bounded grace period, then one SIGKILL sweep). Succeeds when no
+# listeners remain visible. Fails when discovery errors or a listener
+# survives SIGKILL.
+_fwdports_reap_port_listeners() {
+  local port=$1 discover=$2 attempts=$3 delay=$4
+  local pids attempt=0 status=0 pid
+
   while [[ $attempt -lt $attempts ]]; do
-    if pids=$(_fwdports_local_forward_listener_pids "$port"); then
+    if pids=$("$discover" "$port"); then
       status=0
     else
       status=$?
@@ -1151,7 +1207,23 @@ _fwdports_evict_local_forward_listener() {
     attempt=$((attempt + 1))
   done
   # Final sweep: SIGKILL anything that ignored SIGTERM.
-  if pids=$(_fwdports_local_forward_listener_pids "$port"); then
+  if pids=$("$discover" "$port"); then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ $status -ne 0 ]]; then
+    return 1
+  fi
+  if [[ -z $pids ]]; then
+    return 0
+  fi
+  while IFS= read -r pid || [[ -n $pid ]]; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    kill -KILL "$pid" >/dev/null 2>&1 || true
+  done <<<"$pids"
+  sleep "$delay"
+  if pids=$("$discover" "$port"); then
     status=0
   else
     status=$?
@@ -1160,35 +1232,45 @@ _fwdports_evict_local_forward_listener() {
     return 1
   fi
   if [[ -n $pids ]]; then
-    while IFS= read -r pid || [[ -n $pid ]]; do
-      [[ $pid =~ ^[0-9]+$ ]] || continue
-      kill -KILL "$pid" >/dev/null 2>&1 || true
-    done <<<"$pids"
-    sleep "$delay"
-    if pids=$(_fwdports_local_forward_listener_pids "$port"); then
-      status=0
-    else
-      status=$?
-    fi
-    if [[ $status -ne 0 ]]; then
-      return 1
-    fi
-    if [[ -n $pids ]]; then
-      printf 'fwdports: cannot reclaim port %s (PIDs still listening):\n%s\n' \
-        "$port" "$pids" >&2
-      return 1
-    fi
-  fi
-  # A listener invisible to PID inspection (e.g. unprivileged ss, a container
-  # without /proc access) still blocks the rebuild; fail loudly instead of
-  # rebuilding into a bind conflict.
-  if command -v nc >/dev/null 2>&1 &&
-    LC_ALL=C nc -z -w 2 127.0.0.1 "$port" >/dev/null 2>&1; then
-    printf 'fwdports: cannot reclaim port %s (listener has no visible PID)\n' \
-      "$port" >&2
+    printf 'fwdports: cannot reclaim port %s (PIDs still listening):\n%s\n' \
+      "$port" "$pids" >&2
     return 1
   fi
   return 0
+}
+
+# Evicts any listener on a local-forward spec's port, so a forced rebuild
+# can reclaim ports held by residual or foreign owners. Succeeds when
+# nothing listens on the port. Fails when a listener survives the grace
+# period or hides from every owner-resolution method while still accepting.
+_fwdports_evict_local_forward_listener() {
+  local spec=$1 attempts=$2 delay=$3
+  local port
+
+  port=$(_fwdports_local_forward_port "$spec") || return 1
+  # Phase 1: native inspectors (fast path). An inspector error degrades to
+  # the nc gate below: with no accepting listener there is nothing to
+  # evict, and an accepting listener still gets the /proc phase.
+  _fwdports_reap_port_listeners "$port" \
+    _fwdports_local_forward_listener_pids "$attempts" "$delay" || true
+  if ! _fwdports_tcp_port_accepts 127.0.0.1 "$port"; then
+    return 0
+  fi
+  # Phase 2: a listener is accepting but has no inspector-visible PID
+  # (Android restrictions, unprivileged ss). Resolve owners via /proc.
+  if [[ -r /proc/net/tcp ]] && command -v find >/dev/null 2>&1; then
+    _fwdports_reap_port_listeners "$port" \
+      _fwdports_local_forward_listener_pids_proc "$attempts" "$delay" ||
+      true
+    if ! _fwdports_tcp_port_accepts 127.0.0.1 "$port"; then
+      return 0
+    fi
+  fi
+  # A listener invisible to every owner-resolution method still blocks the
+  # rebuild; fail loudly instead of rebuilding into a bind conflict.
+  printf 'fwdports: cannot reclaim port %s (listener has no visible PID)\n' \
+    "$port" >&2
+  return 1
 }
 
 fwdports_ssh_preflight_local_ports() {

@@ -1077,6 +1077,120 @@ _fwdports_preflight_local_forward() {
   fi
 }
 
+# Prints the PIDs currently listening on a TCP port, one per line. Empty
+# output means no visible listener. Fails when no PID-capable inspector
+# (lsof or ss) is available. Note ss -p hides foreign PIDs from unprivileged
+# callers; the eviction wrapper below closes that gap with a final nc probe.
+_fwdports_local_forward_listener_pids() {
+  local port=$1 status=0 pids line pid
+  if command -v lsof >/dev/null 2>&1; then
+    if pids=$(LC_ALL=C lsof -nP -t -iTCP:"$port" \
+      -sTCP:LISTEN 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
+    # This function may be sourced by a caller with errexit enabled. It never
+    # enables or disables that caller state; lsof's no-match status is benign.
+    if [[ $status -eq 0 || $status -eq 1 ]]; then
+      printf '%s\n' "$pids"
+      return 0
+    fi
+    printf 'fwdports: lsof failed while inspecting port %s (exit %s)\n' \
+      "$port" "$status" >&2
+    return 1
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if pids=$(LC_ALL=C ss -H -ltnp "sport = :$port" 2>/dev/null); then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ $status -ne 0 ]]; then
+      printf 'fwdports: ss failed while inspecting port %s (exit %s)\n' \
+        "$port" "$status" >&2
+      return 1
+    fi
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line =~ pid=([0-9]+) ]] || continue
+      pid=${BASH_REMATCH[1]}
+      printf '%s\n' "$pid"
+    done <<<"$pids"
+    return 0
+  fi
+  printf 'fwdports: cannot inspect port %s without lsof or ss\n' "$port" >&2
+  return 1
+}
+
+# Evicts any listener on a local-forward spec's port (SIGTERM, then SIGKILL),
+# so a forced rebuild can reclaim ports held by residual or foreign owners.
+# Succeeds when nothing listens on the port. Fails when a listener survives
+# the grace period or hides from PID inspection while still accepting.
+_fwdports_evict_local_forward_listener() {
+  local spec=$1 attempts=$2 delay=$3
+  local port pids attempt=0 status=0 pid
+
+  port=$(_fwdports_local_forward_port "$spec") || return 1
+  while [[ $attempt -lt $attempts ]]; do
+    if pids=$(_fwdports_local_forward_listener_pids "$port"); then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ $status -ne 0 ]]; then
+      return 1
+    fi
+    if [[ -z $pids ]]; then
+      break
+    fi
+    while IFS= read -r pid || [[ -n $pid ]]; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      kill -TERM "$pid" >/dev/null 2>&1 || true
+    done <<<"$pids"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+  # Final sweep: SIGKILL anything that ignored SIGTERM.
+  if pids=$(_fwdports_local_forward_listener_pids "$port"); then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ $status -ne 0 ]]; then
+    return 1
+  fi
+  if [[ -n $pids ]]; then
+    while IFS= read -r pid || [[ -n $pid ]]; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      kill -KILL "$pid" >/dev/null 2>&1 || true
+    done <<<"$pids"
+    sleep "$delay"
+    if pids=$(_fwdports_local_forward_listener_pids "$port"); then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ $status -ne 0 ]]; then
+      return 1
+    fi
+    if [[ -n $pids ]]; then
+      printf 'fwdports: cannot reclaim port %s (PIDs still listening):\n%s\n' \
+        "$port" "$pids" >&2
+      return 1
+    fi
+  fi
+  # A listener invisible to PID inspection (e.g. unprivileged ss, a container
+  # without /proc access) still blocks the rebuild; fail loudly instead of
+  # rebuilding into a bind conflict.
+  if command -v nc >/dev/null 2>&1 &&
+    LC_ALL=C nc -z -w 2 127.0.0.1 "$port" >/dev/null 2>&1; then
+    printf 'fwdports: cannot reclaim port %s (listener has no visible PID)\n' \
+      "$port" >&2
+    return 1
+  fi
+  return 0
+}
+
 fwdports_ssh_preflight_local_ports() {
   local argv_file=$1 line expect_local=0
 

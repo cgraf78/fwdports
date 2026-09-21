@@ -422,6 +422,20 @@ fwdports_start() {
   }
 
   status=0
+  if [[ $force -eq 1 ]]; then
+    # Replacement dependencies are checked before any teardown: a failed
+    # preflight must preserve the running generation.
+    fwdports_builtin_preflight_dependencies "$resolved" \
+      "$workspace/builtin-preflight" "$target_override" || status=$?
+    [[ $status -ne 0 ]] || builtin_preflighted=1
+    if [[ $status -eq 0 ]]; then
+      # Unconditional teardown: clear every residue (stale pointers,
+      # generations, residual session, bound ports) so the rebuild below
+      # starts from a clean slate no matter the prior state.
+      _fwdports_force_reset_locked "$tmux_path" "$socket" "$root" \
+        "$resolved" "$FWDPORTS_SESSION_NAME" 40 0.05 || status=$?
+    fi
+  fi
   # Recovery is also meaningful when only active exists: an authenticated
   # stopping/stopped control record commits cleanup authority before any
   # replacement dependency is considered. A running active generation is

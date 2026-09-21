@@ -90,8 +90,12 @@ One owned tmux session is supported. Repeating `start` with the same desired
 state is a no-churn success while the generation is live and its checks pass.
 A dead generation, dead controller, or restart-policy health failure is
 replaced sequentially; `preserve` keeps a still-live degraded generation.
-A differing configuration requires `--force`, which completes an authenticated
-stop before starting the replacement. Two generations never overlap.
+A differing configuration requires `--force`, which checks the replacement
+dependencies first, then unconditionally tears down and rebuilds: stale
+pointers and generations are cleared without validation, any residual session
+under the owned name is killed, and listeners on the desired local-forward
+ports are evicted before the replacement starts. A matching configuration
+under `--force` rebuilds as well. Two generations never overlap.
 
 `fwdports attach` connects to that session through its private socket while
 retaining the user's normal tmux configuration, including mouse, copy-mode,

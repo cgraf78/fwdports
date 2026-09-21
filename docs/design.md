@@ -31,8 +31,12 @@ fwdports --help
 `start` is implied when the first token is a target or an option. `TARGET`
 overrides the selected leg target where its driver supports that concept.
 Repeated start with an identical fingerprint reconciles the current generation.
-A different fingerprint is refused unless `--force`; force stops the old
-generation completely before creating the new one.
+A different fingerprint is refused unless `--force`; force checks the
+replacement dependencies first, then resets unconditionally (best-effort
+authenticated stop, raw removal of stale pointers and generations,
+residual session kill, eviction of listeners on desired local-forward
+ports) before creating the new one. A matching fingerprint under `--force`
+rebuilds as well; only a plain repeated start is a no-churn success.
 
 ## Data grammar
 

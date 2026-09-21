@@ -95,7 +95,9 @@ dependencies first, then unconditionally tears down and rebuilds: stale
 pointers and generations are cleared without validation, any residual session
 under the owned name is killed, and listeners on the desired local-forward
 ports are evicted before the replacement starts. A matching configuration
-under `--force` rebuilds as well. Two generations never overlap.
+under `--force` rebuilds as well. Two generations never overlap. Where the
+platform exposes no way to identify a listener owner (Android), force
+refuses loudly instead of rebuilding into the conflict.
 
 `fwdports attach` connects to that session through its private socket while
 retaining the user's normal tmux configuration, including mouse, copy-mode,

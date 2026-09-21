@@ -72,7 +72,9 @@ netcat probe can still identify the occupied endpoint. None of those results
 grants authority to stop the owner, except through an explicit forced start:
 `--force` evicts listeners on the desired local-forward ports (SIGTERM, then
 SIGKILL) after its dependency checks pass, so the rebuild cannot observe a
-residual bind.
+residual bind. Where the platform exposes no owner-resolution method
+(Android hides sockets from lsof and /proc alike), eviction refuses loudly
+instead of rebuilding into the conflict.
 
 ## SSH consistency
 

@@ -602,6 +602,72 @@ _fwdports_recover_state_locked() {
   printf 'stopped\n'
 }
 
+# Unconditional teardown for `start --force`. Runs best-effort normal
+# recovery and verified stop first so a healthy generation shuts down
+# cleanly, then force-clears anything left (residual session, pointers,
+# generations, bound ports) without validation, so the rebuild cannot
+# observe stale state. Must be called with the state lock held. Fails only
+# for genuinely unfixable residue (an unkillable session or listener);
+# corrupt state never aborts the reset itself.
+_fwdports_force_reset_locked() {
+  local tmux_path=$1 socket=$2 root=$3 resolved=$4 session_name=$5
+  local attempts=$6 delay=$7
+  local pointer record generation digest kind leg key value _extra path
+
+  _fwdports_recover_state_locked "$tmux_path" "$socket" "$root" \
+    "$session_name" "$attempts" "$delay" >/dev/null 2>&1 || true
+  for pointer in active pending; do
+    record=$(fwdports_pointer_read "$root" "$pointer" 2>/dev/null) ||
+      continue
+    IFS=$'\t' read -r generation digest <<<"$record"
+    [[ -n ${generation:-} && -n ${digest:-} ]] || continue
+    _fwdports_stop_generation_locked "$tmux_path" "$socket" "$root" \
+      "$pointer" "$generation" "$digest" "$session_name" \
+      "$attempts" "$delay" >/dev/null 2>&1 || true
+  done
+
+  # Reap writers before removing state: the session holds every controller,
+  # owned or not, and the name must be free for the rebuild.
+  if fwdports_tmux_session_named_exists "$tmux_path" "$socket" \
+    "$session_name"; then
+    _fwdports_tmux_call "$tmux_path" "$socket" kill-session \
+      -t "$session_name" >/dev/null 2>&1 || true
+    if fwdports_tmux_session_named_exists "$tmux_path" "$socket" \
+      "$session_name"; then
+      printf 'fwdports: force reset cannot kill residual session %s\n' \
+        "$session_name" >&2
+      return 1
+    fi
+  fi
+
+  # Raw removal: validation already failed or does not apply here.
+  rm -rf -- "$root/active" "$root/pending" 2>/dev/null || true
+  if [[ -e $root/active || -L $root/active ||
+    -e $root/pending || -L $root/pending ]]; then
+    printf 'fwdports: force reset cannot clear state pointers\n' >&2
+    return 1
+  fi
+  for path in "$root/generations"/*; do
+    [[ -e $path || -L $path ]] || continue
+    rm -rf -- "$path" 2>/dev/null || {
+      printf 'fwdports: force reset cannot remove %s\n' "$path" >&2
+    }
+  done
+
+  # Evict listeners on desired local-forward ports, residual or foreign.
+  [[ -f $resolved && ! -L $resolved ]] || {
+    printf 'fwdports: force reset cannot read desired state\n' >&2
+    return 1
+  }
+  while IFS=$'\t' read -r kind leg key value _extra ||
+    [[ -n ${kind:-} ]]; do
+    [[ $kind == set && $key == local-forward ]] || continue
+    _fwdports_evict_local_forward_listener "$value" "$attempts" \
+      "$delay" || return 1
+  done <"$resolved"
+  return 0
+}
+
 fwdports_recover_state() {
   local tmux_path=$1 socket=$2 root=$3 session_name=$4 attempts=$5 delay=$6
   local candidate status release_status

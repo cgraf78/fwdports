@@ -987,6 +987,7 @@ later_pane_failure_reaps_autossh_case() {
 
 default_ssh_lifecycle_case() {
   local tmp config output status_output generation_before generation_after
+  local generation_rebuilt
   tmp=$(_tmpdir) || return 1
   setup_case_root "$tmp"
   config=$CASE_CONFIG/fwdports/tunnels.conf
@@ -1005,15 +1006,28 @@ default_ssh_lifecycle_case() {
     "$COMMAND_OUTPUT"
 
   generation_before=$(basename "$CASE_STATE/fwdports/generations"/*)
-  run_fwdports "$output" start --force
+  run_fwdports "$output" start
   _assert_exit "CLI lifecycle: repeated matching start succeeds" 0 \
     "$COMMAND_STATUS"
   _assert_eq "CLI lifecycle: no-churn start reports exact active forwards" \
     $'fwdports: profile default is already running (live/unverified)\nfwdports: forwards\n  shell [ssh] remote 127.0.0.1:19090:127.0.0.1:9090' \
     "$COMMAND_OUTPUT"
   generation_after=$(basename "$CASE_STATE/fwdports/generations"/*)
-  _assert_eq "CLI lifecycle: matching --force does not churn generation" \
+  _assert_eq "CLI lifecycle: matching start does not churn generation" \
     "$generation_before" "$generation_after"
+
+  run_fwdports "$output" start --force
+  _assert_exit "CLI lifecycle: matching --force succeeds" 0 \
+    "$COMMAND_STATUS"
+  _assert_eq "CLI lifecycle: matching --force rebuilds and reports forwards" \
+    $'fwdports: started profile default\nfwdports: forwards\n  shell [ssh] remote 127.0.0.1:19090:127.0.0.1:9090' \
+    "$COMMAND_OUTPUT"
+  generation_rebuilt=$(basename "$CASE_STATE/fwdports/generations"/*)
+  if [[ $generation_after == "$generation_rebuilt" ]]; then
+    _fail "CLI lifecycle: matching --force replaces the generation"
+  else
+    _pass "CLI lifecycle: matching --force replaces the generation"
+  fi
 
   run_fwdports "$output" status
   status_output=$COMMAND_OUTPUT
@@ -1041,6 +1055,185 @@ default_ssh_lifecycle_case() {
     "$COMMAND_OUTPUT"
 }
 
+force_stale_pointer_rebuilds_case() {
+  local tmp config output
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19231:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  run_fwdports "$output" start
+  _assert_exit "force stale pointer: setup generation starts" 0 \
+    "$COMMAND_STATUS"
+  "$TMUX_BIN" -S "$CASE_SOCKET" kill-server 2>/dev/null || true
+  rm -rf -- "$CASE_STATE"/fwdports/generations/generation.*
+
+  run_fwdports "$output" start --force
+  _assert_exit "force stale pointer: rebuilds despite missing generation" 0 \
+    "$COMMAND_STATUS"
+  _assert_contains "force stale pointer: forwards summary present" \
+    'shell [ssh] remote' "$COMMAND_OUTPUT"
+}
+
+force_unowned_session_rebuilds_case() {
+  local tmp config output sentinel_pid
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19232:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  "$TMUX_BIN" -S "$CASE_SOCKET" new-session -d -s fwdports \
+    'exec sleep 300'
+  sentinel_pid=$("$TMUX_BIN" -S "$CASE_SOCKET" display-message -p \
+    -t fwdports '#{pane_pid}')
+
+  run_fwdports "$output" start --force
+  _assert_exit "force unowned session: rebuilds despite residual session" 0 \
+    "$COMMAND_STATUS"
+  if kill -0 "$sentinel_pid" 2>/dev/null; then
+    _fail "force unowned session: residual session processes are gone"
+  else
+    _pass "force unowned session: residual session processes are gone"
+  fi
+  kill -9 "$sentinel_pid" 2>/dev/null || true
+  _assert_contains "force unowned session: forwards summary present" \
+    'shell [ssh] remote' "$COMMAND_OUTPUT"
+}
+
+force_residual_listener_rebuilds_case() {
+  local tmp config output listener_pid listener_ready probe_attempt
+  local resolvable=0 probe_pids
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell local-forward 127.0.0.1:19233:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  python3 -c "import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 19233))
+s.listen(1)
+time.sleep(120)" &
+  listener_pid=$!
+  listener_ready=0
+  probe_attempt=0
+  while [[ $probe_attempt -lt 25 ]]; do
+    if python3 -c "import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect(('127.0.0.1', 19233))
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+      listener_ready=1
+      break
+    fi
+    probe_attempt=$((probe_attempt + 1))
+    sleep 0.2
+  done
+  if [[ $listener_ready -eq 1 ]] && kill -0 "$listener_pid" 2>/dev/null; then
+    _pass "force residual listener: setup listener is live"
+  else
+    _fail "force residual listener: setup listener is live"
+    return 1
+  fi
+
+  # Self-calibrating: probe real owner resolution on this platform. Where
+  # no method can see the listener owner (e.g. Android /proc
+  # restrictions), force must fail loudly without collateral damage
+  # instead of reclaiming.
+  probe_pids=$(bash -c 'source "$1";
+    _fwdports_local_forward_listener_pids "$2"' _ \
+    "$ROOT/lib/fwdports/drivers.sh" 19233 2>/dev/null)
+  if [[ -n $probe_pids ]]; then
+    resolvable=1
+  elif [[ -r /proc/net/tcp ]]; then
+    probe_pids=$(bash -c 'source "$1";
+      _fwdports_local_forward_listener_pids_proc "$2"' _ \
+      "$ROOT/lib/fwdports/drivers.sh" 19233 2>/dev/null)
+    if [[ -n $probe_pids ]]; then
+      resolvable=1
+    fi
+  fi
+
+  run_fwdports "$output" start --force
+  if [[ $resolvable -eq 1 ]]; then
+    _assert_exit "force residual listener: rebuilds despite bound port" 0 \
+      "$COMMAND_STATUS"
+    if kill -0 "$listener_pid" 2>/dev/null; then
+      _fail "force residual listener: residual listener is gone"
+    else
+      _pass "force residual listener: residual listener is gone"
+    fi
+    kill -9 "$listener_pid" 2>/dev/null || true
+    _assert_contains "force residual listener: forwards summary present" \
+      'shell [ssh] local' "$COMMAND_OUTPUT"
+  else
+    if [[ $COMMAND_STATUS -ne 0 ]]; then
+      _pass "force residual listener: fails without owner resolution"
+    else
+      _fail "force residual listener: fails without owner resolution"
+    fi
+    _assert_contains "force residual listener: diagnostic names the port" \
+      '19233' "$COMMAND_OUTPUT"
+    if kill -0 "$listener_pid" 2>/dev/null; then
+      _pass "force residual listener: unresolvable listener is untouched"
+    else
+      _fail "force residual listener: unresolvable listener is untouched"
+    fi
+    kill -9 "$listener_pid" 2>/dev/null || true
+  fi
+}
+
+force_rebuilds_healthy_generation_case() {
+  local tmp config output active_before active_after
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  printf '%s\n' \
+    'profile default' \
+    'leg shell' \
+    'set shell host shell.example.com' \
+    'set shell remote-forward 127.0.0.1:19234:127.0.0.1:9090' >"$config"
+  chmod 0600 "$config"
+
+  run_fwdports "$output" start
+  _assert_exit "force healthy rebuild: setup generation starts" 0 \
+    "$COMMAND_STATUS"
+  active_before=$(<"$CASE_STATE/fwdports/active")
+
+  run_fwdports "$output" start --force
+  _assert_exit "force healthy rebuild: succeeds" 0 "$COMMAND_STATUS"
+  active_after=$(<"$CASE_STATE/fwdports/active")
+  if [[ $active_before == "$active_after" ]]; then
+    _fail "force healthy rebuild: generation is replaced, not reused"
+  else
+    _pass "force healthy rebuild: generation is replaced, not reused"
+  fi
+  _assert_contains "force healthy rebuild: forwards summary present" \
+    'shell [ssh] remote' "$COMMAND_OUTPUT"
+}
+
 run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case stock-et-lifecycle stock_et_lifecycle_case
 run_case ettun-lifecycle ettun_lifecycle_case
@@ -1059,4 +1252,80 @@ run_case shared-external-driver shared_external_driver_case
 run_case symlink-config-target-override symlink_config_target_override_case
 run_case later-pane-failure-reaps-autossh \
   later_pane_failure_reaps_autossh_case
+run_case force-stale-pointer-rebuilds force_stale_pointer_rebuilds_case
+run_case force-unowned-session-rebuilds force_unowned_session_rebuilds_case
+run_case force-residual-listener-rebuilds force_residual_listener_rebuilds_case
+run_case force-rebuilds-healthy-generation force_rebuilds_healthy_generation_case
+
+force_proc_discovery_resolves_owner_case() {
+  local tmp listener_pid found free_found probe_attempt probe_ready
+  local pid alive
+  tmp=$(_tmpdir) || return 1
+  if [[ ! -r /proc/net/tcp ]]; then
+    _pass "force proc discovery: /proc/net/tcp is unreadable here"
+    return 0
+  fi
+  if ! command -v ls >/dev/null 2>&1; then
+    _pass "force proc discovery: ls is unavailable here"
+    return 0
+  fi
+
+  python3 -c "import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 19235))
+s.listen(1)
+time.sleep(120)" &
+  listener_pid=$!
+  probe_ready=0
+  probe_attempt=0
+  while [[ $probe_attempt -lt 25 ]]; do
+    if python3 -c "import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect(('127.0.0.1', 19235))
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+      probe_ready=1
+      break
+    fi
+    probe_attempt=$((probe_attempt + 1))
+    sleep 0.2
+  done
+  if [[ $probe_ready -ne 1 ]]; then
+    _fail "force proc discovery: setup listener is live"
+    kill -9 "$listener_pid" 2>/dev/null || true
+    return 1
+  fi
+
+  found=$(bash -c 'source "$1";
+    _fwdports_local_forward_listener_pids_proc "$2"' _ \
+    "$ROOT/lib/fwdports/drivers.sh" 19235)
+  if [[ -z $found ]]; then
+    _fail "force proc discovery: resolves the listening owner"
+  else
+    alive=1
+    while IFS= read -r pid || [[ -n $pid ]]; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      kill -0 "$pid" 2>/dev/null || alive=0
+    done <<<"$found"
+    if [[ $alive -eq 1 ]]; then
+      _pass "force proc discovery: resolves the listening owner"
+    else
+      _fail "force proc discovery: resolves the listening owner"
+    fi
+  fi
+  kill -9 "$listener_pid" 2>/dev/null || true
+
+  free_found=$(bash -c 'source "$1";
+    _fwdports_local_forward_listener_pids_proc "$2"' _ \
+    "$ROOT/lib/fwdports/drivers.sh" 19236)
+  _assert_eq "force proc discovery: free port resolves nothing" "" \
+    "$free_found"
+}
+
+run_case force-proc-discovery-resolves-owner \
+  force_proc_discovery_resolves_owner_case
 _test_summary

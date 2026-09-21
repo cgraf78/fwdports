@@ -69,15 +69,20 @@ user identity, or otherwise escape that process session.
 Local-listener discovery is diagnostic only. `lsof` or `ss` can explain a
 conflict; when Android hides another process from `lsof`, a bounded loopback
 netcat probe can still identify the occupied endpoint. None of those results
-grants authority to stop the owner.
+grants authority to stop the owner, except through an explicit forced start:
+`--force` evicts listeners on the desired local-forward ports (SIGTERM, then
+SIGKILL) after its dependency checks pass, so the rebuild cannot observe a
+residual bind. Where the platform exposes no owner-resolution method
+(Android hides sockets from lsof and /proc alike), eviction refuses loudly
+instead of rebuilding into the conflict.
 
 ## SSH consistency
 
 Each generation records one canonical SSH executable identity and a digest of
 the complete normalized `ssh -G` result. Direct retries and autossh children
 pass through a generation-owned gate that rechecks both immediately before
-exec. Drift refuses the retry until an explicit forced start; it does not churn
-a live connection.
+exec. Drift refuses the retry until an explicit forced start, which rebuilds
+the generation; the refusal itself does not churn a live connection.
 
 SSH multiplex reuse, tunnel devices, local commands, remote commands, and
 ambient forwards are disabled or rejected so the manifest describes every

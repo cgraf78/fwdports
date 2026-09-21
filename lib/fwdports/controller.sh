@@ -457,6 +457,7 @@ _fwdports_stop_generation_locked() {
   local digest=$6 session_name=$7 attempts=$8 delay=$9
   local control_record phase desired controller_pid controller_start
   local probe evidence pane_state runtime leg driver strategy index
+  local gate_attempt
   local -a pane_evidence=() pane_strategies=()
 
   control_record=$(fwdports_control_read "$generation" "$digest") || return 74
@@ -489,8 +490,23 @@ _fwdports_stop_generation_locked() {
     fi
     pane_evidence+=("$evidence")
     pane_strategies+=("$strategy")
-    _fwdports_stop_pane_state "$tmux_path" "$socket" "$generation" \
-      "$digest" "$evidence" "$strategy" >/dev/null || return 74
+    # Snapshot validation races a live system: a pane or process entry can
+    # settle between observations (notably on slow runners), so retry the
+    # fail-fast gate within the caller's approved bound instead of aborting
+    # a healthy stop on one stale read. A persistent mismatch still fails
+    # closed with its diagnostic.
+    gate_attempt=0
+    while true; do
+      if _fwdports_stop_pane_state "$tmux_path" "$socket" "$generation" \
+        "$digest" "$evidence" "$strategy" >/dev/null; then
+        break
+      fi
+      gate_attempt=$((gate_attempt + 1))
+      if [[ $gate_attempt -ge $attempts ]]; then
+        return 74
+      fi
+      sleep "$delay"
+    done
   done
 
   # Cleanup is deliberately idempotent in the driver contract. The live pass

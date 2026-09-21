@@ -841,6 +841,59 @@ precleanup_revalidation_ambiguity_case() {
   _assert_file "precleanup revalidation: preserves pointer" "$root/pending"
 }
 
+precleanup_transient_gate_retry_case() {
+  local tmp fixture root generation digest events status count_file
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  count_file=$tmp/verify-count
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+  : >"$events"
+  printf '0\n' >"$count_file"
+
+  # A single stale observation (slow runner, tmux IPC hiccup) must not abort
+  # a healthy stop: the fail-fast gate retries within the caller's bound.
+  # The counter is file-backed because the gate runs in a subshell.
+  fwdports_tmux_verify_pane() {
+    local count
+    count=$(<"$FWDPORTS_TEST_VERIFY_COUNT")
+    printf '%s\n' "$((count + 1))" >"$FWDPORTS_TEST_VERIFY_COUNT"
+    if [[ $count -eq 0 ]]; then
+      printf 'fwdports: test transient pane observation\n' >&2
+      return 2
+    fi
+    return 0
+  }
+  _fwdports_verify_owned_group() { printf '1\n'; }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    FWDPORTS_TEST_VERIFY_COUNT=$count_file \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 5 0 >/dev/null 2>&1
+  status=$?
+  set -e
+
+  _assert_exit "precleanup gate retry: transient observation still stops" \
+    0 "$status"
+  _assert_eq "precleanup gate retry: preserves live then final cleanup" \
+    $'cleanup\nterminate\ncleanup\nremove-session' "$(<"$events")"
+  _assert_not_exists "precleanup gate retry: removes completed generation" \
+    "$generation"
+}
+
 darwin_dead_ettun_scope_case() {
   local tmp fixture root generation digest evidence rewritten output scope_arg
   local status
@@ -912,4 +965,5 @@ run_case precleanup-all-panes-validated precleanup_all_panes_validated_case
 run_case precleanup-stops-pane precleanup_stops_pane_case
 run_case precleanup-revalidation-ambiguity \
   precleanup_revalidation_ambiguity_case
+run_case precleanup-transient-gate-retry precleanup_transient_gate_retry_case
 _test_summary

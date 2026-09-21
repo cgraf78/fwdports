@@ -1138,13 +1138,13 @@ _fwdports_tcp_port_accepts() {
 # scanning /proc/PID/fd symlinks. Empty output means no visible listener.
 # Exists for platforms where lsof/ss cannot see owners (Android); callers
 # run it only after an nc probe proves a listener is accepting, because a
-# full fd sweep is slower than the native inspectors. Each inode resolves
-# in one find process matching link targets in-process (no per-entry
-# forks); inodes are numeric-validated before interpolation, and the
-# brackets are backslash-escaped so fnmatch reads them literally.
+# full fd sweep is slower than the native inspectors. The sweep is one
+# ls over the fd directories (no per-entry forks, no argv explosion,
+# no find-predicate portability hazards); ownership compares exact
+# socket:[inode] strings, never patterns.
 _fwdports_local_forward_listener_pids_proc() {
-  local port=$1 hex file sl laddr _raddr state inode rest path pid
-  local inodes='' seen=' '
+  local port=$1 hex file sl laddr _raddr state inode rest line link n pid
+  local inodes=' ' seen=' '
 
   hex=$(printf '%04X' "$port") || return 1
   for file in /proc/net/tcp /proc/net/tcp6; do
@@ -1156,26 +1156,39 @@ _fwdports_local_forward_listener_pids_proc() {
       fi
       [[ $laddr == *:$hex && $state == 0[Aa] ]] || continue
       [[ $inode =~ ^[0-9]+$ ]] || continue
-      inodes+="$inode"$'\n'
+      inodes="${inodes}${inode} "
     done <"$file"
   done
-  if [[ -z $inodes ]]; then
+  if [[ $inodes == ' ' ]]; then
     return 0
   fi
-  while IFS= read -r inode || [[ -n $inode ]]; do
-    [[ $inode =~ ^[0-9]+$ ]] || continue
-    while IFS= read -r path || [[ -n $path ]]; do
-      pid=${path#/proc/}
-      pid=${pid%%/*}
-      [[ $pid =~ ^[0-9]+$ ]] || continue
-      if [[ $seen == *" $pid "* ]]; then
-        continue
-      fi
-      seen="${seen}${pid} "
-      printf '%s\n' "$pid"
-    done < <(find /proc/[0-9]*/fd -maxdepth 1 \
-      -lname "socket:\\[$inode\\]" 2>/dev/null)
-  done <<<"$inodes"
+  # Appending /proc/self/fd keeps at least two directory operands, so ls
+  # always prints the per-directory headers the parser below tracks PIDs
+  # with (one operand would list entries with no header).
+  while IFS= read -r line || [[ -n $line ]]; do
+    case "$line" in
+      '/proc/'*'/fd/:' | '/proc/'*'/fd:')
+        pid=${line#/proc/}
+        pid=${pid%%/*}
+        if [[ ! $pid =~ ^[0-9]+$ ]]; then
+          pid=""
+        fi
+        ;;
+      *' -> socket:['*']')
+        [[ -n ${pid:-} ]] || continue
+        link=${line##*' -> '}
+        [[ $link == socket:\[*\] ]] || continue
+        n=${link#socket:[}
+        n=${n%\]}
+        [[ $inodes == *" $n "* ]] || continue
+        if [[ $seen == *" $pid "* ]]; then
+          continue
+        fi
+        seen="${seen}${pid} "
+        printf '%s\n' "$pid"
+        ;;
+    esac
+  done < <(LC_ALL=C ls -l /proc/[0-9]*/fd/ /proc/self/fd/ 2>/dev/null)
   return 0
 }
 
@@ -1258,7 +1271,7 @@ _fwdports_evict_local_forward_listener() {
   fi
   # Phase 2: a listener is accepting but has no inspector-visible PID
   # (Android restrictions, unprivileged ss). Resolve owners via /proc.
-  if [[ -r /proc/net/tcp ]] && command -v find >/dev/null 2>&1; then
+  if [[ -r /proc/net/tcp ]] && command -v ls >/dev/null 2>&1; then
     _fwdports_reap_port_listeners "$port" \
       _fwdports_local_forward_listener_pids_proc "$attempts" "$delay" ||
       true

@@ -1226,8 +1226,12 @@ force_proc_discovery_resolves_owner_case() {
   local tmp listener_pid found free_found probe_attempt probe_ready
   local pid alive
   tmp=$(_tmpdir) || return 1
-  if [[ ! -r /proc/net/tcp ]] || ! command -v find >/dev/null 2>&1; then
-    _pass "force proc discovery: /proc owner resolution unavailable"
+  if [[ ! -r /proc/net/tcp ]]; then
+    _pass "force proc discovery: /proc/net/tcp is unreadable here"
+    return 0
+  fi
+  if ! command -v ls >/dev/null 2>&1; then
+    _pass "force proc discovery: ls is unavailable here"
     return 0
   fi
 

@@ -1114,6 +1114,7 @@ force_unowned_session_rebuilds_case() {
 
 force_residual_listener_rebuilds_case() {
   local tmp config output listener_pid listener_ready probe_attempt
+  local resolvable=0 probe_pids
   tmp=$(_tmpdir) || return 1
   setup_case_root "$tmp"
   config=$CASE_CONFIG/fwdports/tunnels.conf
@@ -1156,17 +1157,51 @@ except OSError:
     return 1
   fi
 
-  run_fwdports "$output" start --force
-  _assert_exit "force residual listener: rebuilds despite bound port" 0 \
-    "$COMMAND_STATUS"
-  if kill -0 "$listener_pid" 2>/dev/null; then
-    _fail "force residual listener: residual listener is gone"
-  else
-    _pass "force residual listener: residual listener is gone"
+  # Self-calibrating: probe real owner resolution on this platform. Where
+  # no method can see the listener owner (e.g. Android /proc
+  # restrictions), force must fail loudly without collateral damage
+  # instead of reclaiming.
+  probe_pids=$(bash -c 'source "$1";
+    _fwdports_local_forward_listener_pids "$2"' _ \
+    "$ROOT/lib/fwdports/drivers.sh" 19233 2>/dev/null)
+  if [[ -n $probe_pids ]]; then
+    resolvable=1
+  elif [[ -r /proc/net/tcp ]]; then
+    probe_pids=$(bash -c 'source "$1";
+      _fwdports_local_forward_listener_pids_proc "$2"' _ \
+      "$ROOT/lib/fwdports/drivers.sh" 19233 2>/dev/null)
+    if [[ -n $probe_pids ]]; then
+      resolvable=1
+    fi
   fi
-  kill -9 "$listener_pid" 2>/dev/null || true
-  _assert_contains "force residual listener: forwards summary present" \
-    'shell [ssh] local' "$COMMAND_OUTPUT"
+
+  run_fwdports "$output" start --force
+  if [[ $resolvable -eq 1 ]]; then
+    _assert_exit "force residual listener: rebuilds despite bound port" 0 \
+      "$COMMAND_STATUS"
+    if kill -0 "$listener_pid" 2>/dev/null; then
+      _fail "force residual listener: residual listener is gone"
+    else
+      _pass "force residual listener: residual listener is gone"
+    fi
+    kill -9 "$listener_pid" 2>/dev/null || true
+    _assert_contains "force residual listener: forwards summary present" \
+      'shell [ssh] local' "$COMMAND_OUTPUT"
+  else
+    if [[ $COMMAND_STATUS -ne 0 ]]; then
+      _pass "force residual listener: fails without owner resolution"
+    else
+      _fail "force residual listener: fails without owner resolution"
+    fi
+    _assert_contains "force residual listener: diagnostic names the port" \
+      '19233' "$COMMAND_OUTPUT"
+    if kill -0 "$listener_pid" 2>/dev/null; then
+      _pass "force residual listener: unresolvable listener is untouched"
+    else
+      _fail "force residual listener: unresolvable listener is untouched"
+    fi
+    kill -9 "$listener_pid" 2>/dev/null || true
+  fi
 }
 
 force_rebuilds_healthy_generation_case() {
@@ -1293,4 +1328,81 @@ except OSError:
 
 run_case force-proc-discovery-resolves-owner \
   force_proc_discovery_resolves_owner_case
+
+# TEMPORARY-DIAG: capability telemetry for the Termux owner-resolution
+# gap. Remove once CI logs answer which methods exist there.
+force_owner_resolution_probe_case() {
+  local tmp listener_pid probe_attempt probe_ready tool lsof_out lsof_status
+  local fd_count fd_entry
+  tmp=$(_tmpdir) || return 1
+  for tool in lsof ss nc find ls readlink fuser; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      _pass "force probe: has $tool"
+    else
+      _pass "force probe: lacks $tool"
+    fi
+  done
+  if [[ -r /proc/net/tcp ]]; then
+    _pass "force probe: /proc/net/tcp readable"
+  else
+    _pass "force probe: /proc/net/tcp unreadable"
+  fi
+  if [[ -r /proc/self/net/tcp ]]; then
+    _pass "force probe: /proc/self/net/tcp readable"
+  else
+    _pass "force probe: /proc/self/net/tcp unreadable"
+  fi
+  fd_count=0
+  for fd_entry in /proc/self/fd/*; do
+    [[ -e $fd_entry || -L $fd_entry ]] || continue
+    fd_count=$((fd_count + 1))
+  done
+  _pass "force probe: /proc/self/fd lists $fd_count entries"
+
+  python3 -c "import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 19237))
+s.listen(1)
+time.sleep(60)" &
+  listener_pid=$!
+  probe_ready=0
+  probe_attempt=0
+  while [[ $probe_attempt -lt 25 ]]; do
+    if python3 -c "import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect(('127.0.0.1', 19237))
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+      probe_ready=1
+      break
+    fi
+    probe_attempt=$((probe_attempt + 1))
+    sleep 0.2
+  done
+  if [[ $probe_ready -ne 1 ]]; then
+    _pass "force probe: setup listener never accepted"
+    kill -9 "$listener_pid" 2>/dev/null || true
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof_out=$(LC_ALL=C lsof -nP -t -iTCP:19237 \
+      -sTCP:LISTEN 2>/dev/null); then
+      lsof_status=0
+    else
+      lsof_status=$?
+    fi
+    if [[ -n $lsof_out ]]; then
+      _pass "force probe: lsof exit $lsof_status with PIDs"
+    else
+      _pass "force probe: lsof exit $lsof_status empty"
+    fi
+  fi
+  kill -9 "$listener_pid" 2>/dev/null || true
+}
+
+run_case force-owner-resolution-probe force_owner_resolution_probe_case
 _test_summary

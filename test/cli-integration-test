@@ -43,6 +43,29 @@ run_fwdports() {
   COMMAND_OUTPUT=$(<"$output")
 }
 
+# A process fwdports just stopped can still answer kill -0 for a moment:
+# the signal may be in flight, or the exit may be sitting as an unreaped
+# zombie, which kill -0 reports as alive even though the product
+# correctly treats it as stopped. Poll for the stopped condition
+# instead of sampling it once; absent, zombie, and dead rows all count
+# as stopped. Pid 0 is this file's unset-pid fallback, never a waited-on
+# process, so it reports stopped.
+wait_for_process_stopped() {
+  local pid=$1 attempts=0 record state
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  [[ $pid -eq 0 ]] && return 0
+  while [[ $attempts -lt 200 ]]; do
+    if ! record=$(_fwdports_process_snapshot "$pid" 2>/dev/null); then
+      return 0
+    fi
+    state=${record##*$'\t'}
+    [[ $state == Z* || $state == X* ]] && return 0
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
 configured_health_case() {
   local tmp config output index=0 observed=''
   tmp=$(_tmpdir) || return 1
@@ -452,8 +475,8 @@ shared_external_driver_case() {
     "$lifecycle_state/first.listener"
   _assert_not_exists "external driver cleanup: second listener is retired" \
     "$lifecycle_state/second.listener"
-  if ! kill -0 "$first_pid" 2>/dev/null &&
-    ! kill -0 "$second_pid" 2>/dev/null; then
+  if wait_for_process_stopped "$first_pid" &&
+    wait_for_process_stopped "$second_pid"; then
     _pass "external driver cleanup: all run processes exit"
   else
     _fail "external driver cleanup: all run processes exit"
@@ -975,7 +998,7 @@ later_pane_failure_reaps_autossh_case() {
   fi
   _assert_file "later pane rollback: converts session HUP to autossh TERM" \
     "$term_marker"
-  if [[ -n $child_pid ]] && ! kill -0 "$child_pid" 2>/dev/null; then
+  if [[ -n $child_pid ]] && wait_for_process_stopped "$child_pid"; then
     _pass "later pane rollback: leaves no autossh child"
   else
     _fail "later pane rollback: leaves no autossh child"
@@ -1102,10 +1125,10 @@ force_unowned_session_rebuilds_case() {
   run_fwdports "$output" start --force
   _assert_exit "force unowned session: rebuilds despite residual session" 0 \
     "$COMMAND_STATUS"
-  if kill -0 "$sentinel_pid" 2>/dev/null; then
-    _fail "force unowned session: residual session processes are gone"
-  else
+  if wait_for_process_stopped "$sentinel_pid"; then
     _pass "force unowned session: residual session processes are gone"
+  else
+    _fail "force unowned session: residual session processes are gone"
   fi
   kill -9 "$sentinel_pid" 2>/dev/null || true
   _assert_contains "force unowned session: forwards summary present" \
@@ -1179,10 +1202,10 @@ except OSError:
   if [[ $resolvable -eq 1 ]]; then
     _assert_exit "force residual listener: rebuilds despite bound port" 0 \
       "$COMMAND_STATUS"
-    if kill -0 "$listener_pid" 2>/dev/null; then
-      _fail "force residual listener: residual listener is gone"
-    else
+    if wait_for_process_stopped "$listener_pid"; then
       _pass "force residual listener: residual listener is gone"
+    else
+      _fail "force residual listener: residual listener is gone"
     fi
     kill -9 "$listener_pid" 2>/dev/null || true
     _assert_contains "force residual listener: forwards summary present" \
@@ -1234,6 +1257,49 @@ force_rebuilds_healthy_generation_case() {
     'shell [ssh] remote' "$COMMAND_OUTPUT"
 }
 
+process_stopped_helper_case() {
+  local tmp holder zombie_pid index=0
+  tmp=$(_tmpdir) || return 1
+  # Hold a real zombie: the child exits at once while the parent sleeps
+  # without reaping, so kill -0 still succeeds for a process the product
+  # treats as stopped.
+  python3 -c 'import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+sys.stdout.write(f"{pid}\n")
+sys.stdout.flush()
+time.sleep(30)' >"$tmp/zombie.pid" 2>/dev/null &
+  holder=$!
+  while [[ ! -s "$tmp/zombie.pid" && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  if [[ -s "$tmp/zombie.pid" ]]; then
+    zombie_pid=$(<"$tmp/zombie.pid")
+  else
+    zombie_pid=""
+  fi
+  if [[ -n $zombie_pid ]] && kill -0 "$zombie_pid" 2>/dev/null; then
+    _pass "process stopped helper: fixture holds a kill -0-visible zombie"
+  else
+    _fail "process stopped helper: fixture holds a kill -0-visible zombie"
+  fi
+  if [[ -n $zombie_pid ]] && wait_for_process_stopped "$zombie_pid"; then
+    _pass "process stopped helper: zombie counts as stopped"
+  else
+    _fail "process stopped helper: zombie counts as stopped"
+  fi
+  if wait_for_process_stopped "999999999"; then
+    _pass "process stopped helper: absent pid counts as stopped"
+  else
+    _fail "process stopped helper: absent pid counts as stopped"
+  fi
+  kill -9 "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+}
+
+run_case process-stopped-helper process_stopped_helper_case
 run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case stock-et-lifecycle stock_et_lifecycle_case
 run_case ettun-lifecycle ettun_lifecycle_case

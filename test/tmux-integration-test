@@ -34,6 +34,18 @@ wait_for_file() {
   [[ -s "$path" ]]
 }
 
+wait_for_lines() {
+  local path=$1 expected=$2 attempts=0 actual
+  while [[ $attempts -lt 200 ]]; do
+    actual=$(wc -l <"$path" 2>/dev/null || echo 0)
+    actual=${actual//[[:space:]]/}
+    [[ $actual -ge $expected ]] && return 0
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
 kill_test_server() {
   local socket=$1
   TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
@@ -63,7 +75,11 @@ direct_argv_case() {
     fwdports generation.direct01 "$tmp" "$fixture" "$output" "$release" \
     'one value' 'semi;colon' '$literal')
   IFS=$'\t' read -r session_id pane_id <<<"$record"
-  wait_for_file "$output" || true
+  # The fixture appends one line per argv (three below) before blocking on
+  # the release gate, so a non-empty file is not yet a complete record:
+  # wait for all three lines, then let the equality assertion below judge
+  # correctness (a genuinely lost argument still fails, with the diff).
+  wait_for_lines "$output" 3 || true
   actual=$(<"$output")
   implementation=$(declare -f fwdports_tmux_create_session) || return 1
 

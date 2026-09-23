@@ -46,6 +46,19 @@ wait_for_lines() {
   return 1
 }
 
+# Startup-marker wait: the session fixtures below signal readiness by
+# creating an empty file, so existence (not size) is the completion
+# condition. Use wait_for_file for content-bearing records and
+# wait_for_lines for multi-append records.
+wait_for_marker() {
+  local path=$1 attempts=0
+  while [[ ! -e "$path" && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -e "$path" ]]
+}
+
 kill_test_server() {
   local socket=$1
   TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
@@ -164,7 +177,7 @@ user_config_case() {
     fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.config01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
-  wait_for_file "$output" || true
+  wait_for_marker "$output" || true
   mouse=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
     show-options -gqv mouse)
   mode_keys=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
@@ -216,7 +229,7 @@ focus_transport_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.focus01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
-  wait_for_file "$output" || true
+  wait_for_marker "$output" || true
   window_id=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
     display-message -p -t "$pane_id" '#{window_id}')
   TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
@@ -271,7 +284,7 @@ layout_scaling_case() {
     fwdports generation.layout01 "$tmp" "$fixture" "$tmp/started-1" \
     "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
-  wait_for_file "$tmp/started-1" || true
+  wait_for_marker "$tmp/started-1" || true
   fwdports_tmux_configure_transport_pane "$TMUX_BIN" "$socket" \
     "$session_id" generation.layout01 "$pane_id" \
     "${legs[0]}" "${drivers[0]}"
@@ -328,7 +341,7 @@ control_window_rollback_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.control01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
-  wait_for_file "$output" || true
+  wait_for_marker "$output" || true
 
   set +e
   FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN fwdports_tmux_create_control_window \
@@ -383,7 +396,7 @@ control_window_identity_failure_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.control02 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
-  wait_for_file "$output" || true
+  wait_for_marker "$output" || true
 
   set +e
   FWDPORTS_TEST_REAL_TMUX=$TMUX_BIN fwdports_tmux_create_control_window \

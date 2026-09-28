@@ -414,9 +414,10 @@ lsof_visibility_fallback_case() {
 
 # Writes fake ss/lsof/nc inspectors into $1. ss logs its argv when
 # FWDPORTS_TEST_SS_LOG is set and follows FWDPORTS_TEST_SS (listener, empty,
-# owners-fail, or fail); its owner line lists two processes sharing one
-# socket, repeated on an IPv6 line, like a prefork server. lsof and nc record
-# that they ran so cases can prove which inspector decided.
+# owners-fail, or fail). Its owner line lists processes sharing one socket,
+# repeated on an IPv6 line like a prefork server, plus one whose comm tries to
+# smuggle pid=1 into the line. lsof and nc record that they ran so cases can
+# prove which inspector decided.
 write_port_inspectors() {
   local fake_bin=$1
   mkdir -p "$fake_bin"
@@ -430,7 +431,7 @@ write_port_inspectors() {
     'esac' \
     'case " $* " in' \
     '  *" -p "*)' \
-    '    printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:* users:((\"fixture\",pid=4243,fd=3),(\"fixture\",pid=4242,fd=3))\n"' \
+    '    printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:* users:((\"fixture\",pid=4243,fd=3),(\"fixture\",pid=4242,fd=3),(\"a\",pid=1,fd=3\",pid=4244,fd=5))\n"' \
     '    printf "LISTEN 0 1 [::1]:8080 [::]:* users:((\"fixture\",pid=4242,fd=4))\n" ;;' \
     '  *) printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:*\n" ;;' \
     'esac' >"$fake_bin/ss"
@@ -486,7 +487,7 @@ ss_listener_preferred_case() {
   pids=$(PATH="$fake_bin:$PATH" FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
     _fwdports_local_forward_listener_pids 8080)
   _assert_eq "ss inspector: every PID sharing the socket is reported once" \
-    $'4243\n4242' "$pids"
+    $'4243\n4242\n4244' "$pids"
   _assert_not_exists "ss inspector: PID lookup does not run lsof" \
     "$tmp/lsof-ran"
 }
@@ -510,10 +511,51 @@ ss_leading_zero_port_case() {
     "-H -ltn sport = :2020" "$(<"$ss_log")"
 
   : >"$ss_log"
-  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty FWDPORTS_TEST_SS_LOG=$ss_log \
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS_LOG=$ss_log \
     _fwdports_local_forward_listener_pids 02020 >/dev/null
   _assert_eq "ss inspector: PID lookup queries the decimal port" \
-    "-H -ltn -p sport = :2020" "$(<"$ss_log")"
+    $'-H -ltn sport = :2020\n-H -ltn -p sport = :2020' "$(<"$ss_log")"
+}
+
+proc_leading_zero_port_case() {
+  local tmp port_file port listener listener_pid index=0 pids
+  if [[ ! -r /proc/net/tcp ]]; then
+    _pass "proc inspector: zero-padded port skipped (no /proc/net/tcp)"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  port_file=$tmp/port
+  python3 - "$port_file" <<'PY' &
+import os
+import socket
+import signal
+import sys
+import time
+
+signal.alarm(15)
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+with open(sys.argv[1] + ".tmp", "w", encoding="ascii") as output:
+    output.write(f"{listener.getsockname()[1]} {os.getpid()}")
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+while True:
+    time.sleep(1)
+PY
+  listener=$!
+  while [[ ! -s "$port_file" && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  # An interpreter launcher may fork, so the listener reports its own PID.
+  read -r port listener_pid <"$port_file"
+  # The /proc phase matches the hex port in /proc/net/tcp. A zero-padded spec
+  # must still name this decimal port rather than its octal reading.
+  pids=$(_fwdports_local_forward_listener_pids_proc "0$port")
+  kill "$listener" 2>/dev/null || true
+  wait "$listener" 2>/dev/null || true
+  _assert_eq "proc inspector: zero-padded port resolves as decimal" \
+    "$listener_pid" "$pids"
 }
 
 ss_empty_case() {
@@ -553,9 +595,12 @@ ss_empty_case() {
     "listener details (nc)" "$(<"$error")"
 
   pids=$(PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty \
+    FWDPORTS_TEST_SS_LOG=$tmp/ss.log \
     FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
     _fwdports_local_forward_listener_pids 8080)
   _assert_eq "ss inspector: no listener yields no PIDs" "" "$pids"
+  _assert_eq "ss inspector: a free port skips the owner scan" \
+    "-H -ltn sport = :8080" "$(<"$tmp/ss.log")"
   _assert_not_exists "ss inspector: empty PID lookup does not run lsof" \
     "$tmp/lsof-ran"
 }
@@ -684,6 +729,7 @@ run_case remote-port-no-preflight remote_port_no_preflight_case
 run_case lsof-visibility-fallback lsof_visibility_fallback_case
 run_case ss-listener-preferred ss_listener_preferred_case
 run_case ss-leading-zero-port ss_leading_zero_port_case
+run_case proc-leading-zero-port proc_leading_zero_port_case
 run_case ss-empty ss_empty_case
 run_case ss-failure-fallback ss_failure_fallback_case
 run_case duplicate-profile-local-ports duplicate_profile_local_ports_case

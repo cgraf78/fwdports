@@ -1118,13 +1118,21 @@ _fwdports_preflight_local_forward() {
 # below closes those gaps with an nc probe and a /proc fallback phase.
 _fwdports_local_forward_listener_pids() {
   local port=$1 status=0 ss_status='' pids line pid seen=' '
+  # ss prints each owner as ("comm",pid=N,fd=M) without escaping comm, so a
+  # listener could name itself `x",pid=1,fd=3` to smuggle a PID into the line.
+  # Anchor on the full entry: comm cannot supply the closing parenthesis. A
+  # variable keeps the regex unquoted, as Bash 3.2 and later both require.
+  local owner_re=',pid=([0-9]+),fd=[0-9]+\)(.*)'
   if command -v ss >/dev/null 2>&1; then
-    if pids=$(_fwdports_ss_listeners "$port" -p); then
+    # The owner query scans /proc (~1s on a busy host), so a free port is
+    # answered by the cheap listener query alone.
+    if pids=$(_fwdports_ss_listeners "$port") &&
+      { [[ -z $pids ]] || pids=$(_fwdports_ss_listeners "$port" -p); }; then
       # Processes sharing one listening socket (forked or prefork servers)
       # all appear on its line. Report every PID once so eviction reaps the
       # whole group in one round, as lsof -t does.
       while IFS= read -r line || [[ -n $line ]]; do
-        while [[ $line =~ pid=([0-9]+)(.*) ]]; do
+        while [[ $line =~ $owner_re ]]; do
           pid=${BASH_REMATCH[1]}
           line=${BASH_REMATCH[2]}
           [[ $seen == *" $pid "* ]] && continue
@@ -1186,7 +1194,8 @@ _fwdports_local_forward_listener_pids_proc() {
   local port=$1 hex file sl laddr _raddr state inode rest line link n pid
   local inodes=' ' seen=' '
 
-  hex=$(printf '%04X' "$port") || return 1
+  # printf reads a leading zero as octal; ports are decimal ("02020" is 2020).
+  hex=$(printf '%04X' "$((10#$port))") || return 1
   for file in /proc/net/tcp /proc/net/tcp6; do
     [[ -r $file ]] || continue
     while read -r sl laddr _raddr state _r1 _r2 _r3 _r4 _r5 inode rest ||

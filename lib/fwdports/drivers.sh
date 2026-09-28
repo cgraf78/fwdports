@@ -1021,13 +1021,53 @@ fwdports_builtin_validate_profile_ports() {
   done <"$manifest"
 }
 
+# Prints ss's listening-socket lines for a TCP port; extra ss flags (-p)
+# follow the port. ss evaluates the filter port with C number rules, so a
+# spec's legal leading zero ("02020") would select an octal port and name an
+# unrelated listener; the port is forced to base 10 first. Exits non-zero when
+# ss is missing or rejects the query (old iproute2 without -H).
+_fwdports_ss_listeners() {
+  local port=$1
+  shift
+  command -v ss >/dev/null 2>&1 || return 127
+  LC_ALL=C ss -H -ltn "$@" "sport = :$((10#$port))" 2>/dev/null
+}
+
 _fwdports_preflight_local_forward() {
-  local spec=$1 port details status
+  local spec=$1 port details owners status
 
   port=$(_fwdports_local_forward_port "$spec") || {
     printf 'fwdports: cannot parse local-forward port\n' >&2
     return 1
   }
+  # ss answers from the kernel socket table in milliseconds, while lsof walks
+  # every readable process fd and takes seconds on a busy host. A failing ss
+  # means "unavailable" rather than "free", so the lsof path below still runs.
+  if details=$(_fwdports_ss_listeners "$port"); then
+    if [[ -n $details ]]; then
+      # Owner columns cost a /proc scan, so collect them only for the
+      # diagnostic, keeping the plain listener line if they are unavailable.
+      # Unprivileged callers may still see no foreign owner.
+      owners=$(_fwdports_ss_listeners "$port" -p) && [[ -n $owners ]] &&
+        details=$owners
+      printf 'fwdports: local forward port %s already has a listener\n' \
+        "$port" >&2
+      printf 'fwdports: listener details (ss):\n%s\n' "$details" >&2
+      return 1
+    fi
+    # When netlink is denied (Android), ss falls back to /proc/net and exits 0
+    # even if that view is restricted, so an empty answer is not proof. Keep
+    # the same bounded loopback probe the lsof path uses.
+    if command -v nc >/dev/null 2>&1 &&
+      nc -z -w 1 127.0.0.1 "$port" >/dev/null 2>&1; then
+      printf 'fwdports: local forward port %s already has a listener\n' \
+        "$port" >&2
+      printf '%s\n' \
+        'fwdports: listener details (nc): loopback connection succeeded' >&2
+      return 1
+    fi
+    return 0
+  fi
   if command -v lsof >/dev/null 2>&1; then
     if details=$(LC_ALL=C lsof -nP -iTCP:"$port" \
       -sTCP:LISTEN 2>&1); then
@@ -1061,16 +1101,9 @@ _fwdports_preflight_local_forward() {
       return 1
     fi
   elif command -v ss >/dev/null 2>&1; then
-    details=$(LC_ALL=C ss -H -ltn "sport = :$port" 2>&1) || {
-      printf 'fwdports: ss failed while checking local port %s\n' "$port" >&2
-      return 1
-    }
-    if [[ -n $details ]]; then
-      printf 'fwdports: local forward port %s already has a listener\n' \
-        "$port" >&2
-      printf 'fwdports: listener details (ss):\n%s\n' "$details" >&2
-      return 1
-    fi
+    # Reached only when the ss probe above failed and lsof is absent.
+    printf 'fwdports: ss failed while checking local port %s\n' "$port" >&2
+    return 1
   else
     printf 'fwdports: lsof or ss is required to check local ports\n' >&2
     return 1
@@ -1079,11 +1112,42 @@ _fwdports_preflight_local_forward() {
 
 # Prints the PIDs currently listening on a TCP port, one per line. Empty
 # output means no visible listener. Fails when no PID-capable inspector
-# (lsof or ss) is available. Note ss -p hides foreign PIDs from unprivileged
-# callers, and lsof can be blind on Android; the eviction wrapper below
-# closes those gaps with an nc probe and a /proc fallback phase.
+# (ss or lsof) works. ss is preferred for the same reason as preflight, and a
+# failing ss falls through to lsof. Note ss -p hides foreign PIDs from
+# unprivileged callers, and lsof can be blind on Android; the eviction wrapper
+# below closes those gaps with an nc probe and a /proc fallback phase.
 _fwdports_local_forward_listener_pids() {
-  local port=$1 status=0 pids line pid
+  local port=$1 status=0 ss_status='' pids line pid seen=' '
+  # ss prints each owner as ("comm",pid=N,fd=M) without escaping comm, so a
+  # listener could name itself `x",pid=1,fd=3` to smuggle a PID into the line.
+  # Anchor on the full entry: iproute2 reads comm from /proc/PID/stat up to
+  # the first `)`, so a name cannot supply the closing parenthesis. A variable
+  # keeps the regex unquoted, as Bash 3.2 and later both require. The C
+  # locale lets `.` cross non-UTF-8 name bytes that would end a UTF-8 match
+  # early and hide the PIDs after them.
+  local owner_re=',pid=([0-9]+),fd=[0-9]+\)(.*)' LC_ALL=C
+  if command -v ss >/dev/null 2>&1; then
+    # The owner query scans /proc (~1s on a busy host), so a free port is
+    # answered by the cheap listener query alone.
+    if pids=$(_fwdports_ss_listeners "$port") &&
+      { [[ -z $pids ]] || pids=$(_fwdports_ss_listeners "$port" -p); }; then
+      # Processes sharing one listening socket (forked or prefork servers)
+      # all appear on its line. Report every PID once so eviction reaps the
+      # whole group in one round, as lsof -t does.
+      while IFS= read -r line || [[ -n $line ]]; do
+        while [[ $line =~ $owner_re ]]; do
+          pid=${BASH_REMATCH[1]}
+          line=${BASH_REMATCH[2]}
+          [[ $seen == *" $pid "* ]] && continue
+          seen="$seen$pid "
+          printf '%s\n' "$pid"
+        done
+      done <<<"$pids"
+      return 0
+    else
+      ss_status=$?
+    fi
+  fi
   if command -v lsof >/dev/null 2>&1; then
     if pids=$(LC_ALL=C lsof -nP -t -iTCP:"$port" \
       -sTCP:LISTEN 2>/dev/null); then
@@ -1101,23 +1165,10 @@ _fwdports_local_forward_listener_pids() {
       "$port" "$status" >&2
     return 1
   fi
-  if command -v ss >/dev/null 2>&1; then
-    if pids=$(LC_ALL=C ss -H -ltnp "sport = :$port" 2>/dev/null); then
-      status=0
-    else
-      status=$?
-    fi
-    if [[ $status -ne 0 ]]; then
-      printf 'fwdports: ss failed while inspecting port %s (exit %s)\n' \
-        "$port" "$status" >&2
-      return 1
-    fi
-    while IFS= read -r line || [[ -n $line ]]; do
-      [[ $line =~ pid=([0-9]+) ]] || continue
-      pid=${BASH_REMATCH[1]}
-      printf '%s\n' "$pid"
-    done <<<"$pids"
-    return 0
+  if [[ -n $ss_status ]]; then
+    printf 'fwdports: ss failed while inspecting port %s (exit %s)\n' \
+      "$port" "$ss_status" >&2
+    return 1
   fi
   printf 'fwdports: cannot inspect port %s without lsof or ss\n' "$port" >&2
   return 1
@@ -1146,7 +1197,8 @@ _fwdports_local_forward_listener_pids_proc() {
   local port=$1 hex file sl laddr _raddr state inode rest line link n pid
   local inodes=' ' seen=' '
 
-  hex=$(printf '%04X' "$port") || return 1
+  # printf reads a leading zero as octal; ports are decimal ("02020" is 2020).
+  hex=$(printf '%04X' "$((10#$port))") || return 1
   for file in /proc/net/tcp /proc/net/tcp6; do
     [[ -r $file ]] || continue
     while read -r sl laddr _raddr state _r1 _r2 _r3 _r4 _r5 inode rest ||

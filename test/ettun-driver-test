@@ -233,6 +233,16 @@ write_ettun_manifest() {
   chmod 0600 "$path"
 }
 
+# Keeps the host's real listeners out of local-port preflight: ss fails like an
+# unusable iproute2 and lsof finds nothing, so the result is deterministic
+# wherever ss is installed.
+write_blind_port_inspectors() {
+  local fake_bin=$1
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
+  cp "$fake_bin/lsof" "$fake_bin/ss"
+  chmod 0700 "$fake_bin/lsof" "$fake_bin/ss"
+}
+
 missing_dependency_case() {
   local tmp output error status
   tmp=$(_tmpdir) || return 1
@@ -882,8 +892,7 @@ generation_prepare_case() {
   write_fake_et "$fake_et"
   write_fake_ssh "$fake_ssh"
   write_clean_ssh_config "$ssh_config"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
@@ -957,8 +966,7 @@ proxyjump_public_cli_case() {
   chmod 0600 "$manifest"
   write_fake_ettun_passthrough "$fake_ettun"
   write_fake_et "$fake_et"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ ${1:-} == -V ]]; then printf "OpenSSH_9.9p1 test\n" >&2; exit 0; fi' \
@@ -1088,8 +1096,7 @@ shared_et_ssh_bundle_case() {
   write_fake_et "$fake_et"
   write_fake_ssh "$fake_ssh"
   write_clean_ssh_config "$ssh_config"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_ET_COMMAND=$fake_et \
@@ -1142,8 +1149,7 @@ generation_gate_case() {
   write_fake_et "$fake_et"
   write_fake_ssh "$fake_ssh"
   write_clean_ssh_config "$ssh_config"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_ETTUN_COMMAND=$fake_ettun \
     FWDPORTS_ETTUN_ET_COMMAND=$fake_et \
@@ -1274,8 +1280,7 @@ default_et_hardening_case() {
   write_fake_et "$fake_et"
   write_fake_ssh "$fake_ssh"
   write_clean_ssh_config "$ssh_config"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_ETTUN_COMMAND=$fake_ettun \
@@ -1463,8 +1468,7 @@ custom_transport_generation_case() {
   printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
   write_fake_ettun "$fake_ettun"
   write_fake_transport "$fake_transport"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
@@ -1543,8 +1547,7 @@ mixed_custom_transport_generation_case() {
     >>"$manifest"
   write_fake_ettun "$fake_ettun"
   write_fake_transport "$fake_transport"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
@@ -1605,8 +1608,7 @@ engine_snapshot_reexec_case() {
   printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
   write_reexec_ettun "$fake_ettun" original
   write_fake_transport "$fake_transport"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_ETTUN_COMMAND=$fake_ettun \
@@ -1660,8 +1662,7 @@ adapter_snapshot_invocation_case() {
   printf 'set\trelay\ttransport\trelay-adapter\n' >>"$manifest"
   write_delayed_adapter_ettun "$fake_ettun"
   write_versioned_transport "$fake_transport" original
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  write_blind_port_inspectors "$fake_bin"
 
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_ETTUN_COMMAND=$fake_ettun \

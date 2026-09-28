@@ -1120,9 +1120,12 @@ _fwdports_local_forward_listener_pids() {
   local port=$1 status=0 ss_status='' pids line pid seen=' '
   # ss prints each owner as ("comm",pid=N,fd=M) without escaping comm, so a
   # listener could name itself `x",pid=1,fd=3` to smuggle a PID into the line.
-  # Anchor on the full entry: comm cannot supply the closing parenthesis. A
-  # variable keeps the regex unquoted, as Bash 3.2 and later both require.
-  local owner_re=',pid=([0-9]+),fd=[0-9]+\)(.*)'
+  # Anchor on the full entry: iproute2 reads comm from /proc/PID/stat up to
+  # the first `)`, so a name cannot supply the closing parenthesis. A variable
+  # keeps the regex unquoted, as Bash 3.2 and later both require. The C
+  # locale lets `.` cross non-UTF-8 name bytes that would end a UTF-8 match
+  # early and hide the PIDs after them.
+  local owner_re=',pid=([0-9]+),fd=[0-9]+\)(.*)' LC_ALL=C
   if command -v ss >/dev/null 2>&1; then
     # The owner query scans /proc (~1s on a busy host), so a free port is
     # answered by the cheap listener query alone.

@@ -550,12 +550,43 @@ PY
   # An interpreter launcher may fork, so the listener reports its own PID.
   read -r port listener_pid <"$port_file"
   # The /proc phase matches the hex port in /proc/net/tcp. A zero-padded spec
-  # must still name this decimal port rather than its octal reading.
+  # must still name this decimal port rather than its octal reading. Calibrate
+  # first: Android can report /proc/net/tcp readable yet deny the read.
+  if [[ $(_fwdports_local_forward_listener_pids_proc "$port") != "$listener_pid" ]]; then
+    kill "$listener" 2>/dev/null || true
+    wait "$listener" 2>/dev/null || true
+    _pass "proc inspector: zero-padded port skipped (/proc cannot see owners)"
+    return 0
+  fi
   pids=$(_fwdports_local_forward_listener_pids_proc "0$port")
   kill "$listener" 2>/dev/null || true
   wait "$listener" 2>/dev/null || true
   _assert_eq "proc inspector: zero-padded port resolves as decimal" \
     "$listener_pid" "$pids"
+}
+
+ss_owner_non_utf8_comm_case() {
+  local tmp fake_bin utf8_locale pids
+  utf8_locale=$(locale -a 2>/dev/null | grep -iE '^(C|en_US)\.utf-?8$' | head -n 1)
+  if [[ -z $utf8_locale ]]; then
+    _pass "ss inspector: non-UTF-8 comm skipped (no UTF-8 locale)"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  mkdir -p "$fake_bin"
+  # A UTF-8 regex `.` stops at an invalid byte, which would hide every owner
+  # after a process whose name contains one.
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case " $* " in *" -p "*) ;; *) printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:*\n"; exit 0 ;; esac' \
+    'printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:* users:((\"a\",pid=11,fd=3),(\"\xff\",pid=22,fd=3),(\"c\",pid=33,fd=3))\n"' \
+    >"$fake_bin/ss"
+  chmod 0755 "$fake_bin/ss"
+  pids=$(LC_ALL=$utf8_locale PATH="$fake_bin:$PATH" \
+    _fwdports_local_forward_listener_pids 8080)
+  _assert_eq "ss inspector: a non-UTF-8 comm hides no later owners" \
+    $'11\n22\n33' "$pids"
 }
 
 ss_empty_case() {
@@ -730,6 +761,7 @@ run_case lsof-visibility-fallback lsof_visibility_fallback_case
 run_case ss-listener-preferred ss_listener_preferred_case
 run_case ss-leading-zero-port ss_leading_zero_port_case
 run_case proc-leading-zero-port proc_leading_zero_port_case
+run_case ss-owner-non-utf8-comm ss_owner_non_utf8_comm_case
 run_case ss-empty ss_empty_case
 run_case ss-failure-fallback ss_failure_fallback_case
 run_case duplicate-profile-local-ports duplicate_profile_local_ports_case

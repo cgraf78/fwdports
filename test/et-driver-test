@@ -766,7 +766,9 @@ local_port_conflict_case() {
     '#!/usr/bin/env bash' \
     'printf "fixture 1 user 3u IPv4 TCP 127.0.0.1:18080 (LISTEN)\n"' \
     'exit 0' >"$fake_bin/lsof"
-  chmod 0700 "$fake_bin/lsof"
+  # Fail ss so this case keeps exercising lsof's owner evidence.
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/ss"
+  chmod 0700 "$fake_bin/lsof" "$fake_bin/ss"
 
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \

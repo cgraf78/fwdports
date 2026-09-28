@@ -349,7 +349,8 @@ remote_port_no_preflight_case() {
     '#!/usr/bin/env bash' \
     ': >"$FWDPORTS_TEST_INSPECTION_MARKER"' \
     'exit 99' >"$fake_bin/lsof"
-  chmod 0755 "$fake_bin/lsof"
+  cp "$fake_bin/lsof" "$fake_bin/ss"
+  chmod 0755 "$fake_bin/lsof" "$fake_bin/ss"
   printf '%s\n' '-R' '127.0.0.1:9090:127.0.0.1:80' >"$argv_file"
 
   set +e
@@ -377,7 +378,10 @@ lsof_visibility_fallback_case() {
     'exit "${FWDPORTS_TEST_LSOF_STATUS:-1}"' \
     >"$fake_bin/lsof"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$fake_bin/nc"
-  chmod 0755 "$fake_bin/lsof" "$fake_bin/nc"
+  # Hosts whose ss cannot answer (old iproute2 without -H) leave lsof to
+  # decide; this case covers lsof's own visibility fallback.
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$fake_bin/ss"
+  chmod 0755 "$fake_bin/lsof" "$fake_bin/nc" "$fake_bin/ss"
   printf '%s\n' '-L' '127.0.0.1:8080:127.0.0.1:80' >"$argv_file"
 
   set +e
@@ -406,6 +410,205 @@ lsof_visibility_fallback_case() {
   set -e
   _assert_exit "local port fallback: lsof warning is still inconclusive" \
     1 "$status"
+}
+
+# Writes fake ss/lsof/nc inspectors into $1. ss logs its argv when
+# FWDPORTS_TEST_SS_LOG is set and follows FWDPORTS_TEST_SS (listener, empty,
+# owners-fail, or fail); its owner line lists two processes sharing one
+# socket, repeated on an IPv6 line, like a prefork server. lsof and nc record
+# that they ran so cases can prove which inspector decided.
+write_port_inspectors() {
+  local fake_bin=$1
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ -z ${FWDPORTS_TEST_SS_LOG:-} ]] || printf "%s\n" "$*" >>"$FWDPORTS_TEST_SS_LOG"' \
+    'case ${FWDPORTS_TEST_SS:-listener} in' \
+    '  fail) exit 1 ;;' \
+    '  empty) exit 0 ;;' \
+    '  owners-fail) [[ " $* " != *" -p "* ]] || exit 1 ;;' \
+    'esac' \
+    'case " $* " in' \
+    '  *" -p "*)' \
+    '    printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:* users:((\"fixture\",pid=4243,fd=3),(\"fixture\",pid=4242,fd=3))\n"' \
+    '    printf "LISTEN 0 1 [::1]:8080 [::]:* users:((\"fixture\",pid=4242,fd=4))\n" ;;' \
+    '  *) printf "LISTEN 0 1 127.0.0.1:8080 0.0.0.0:*\n" ;;' \
+    'esac' >"$fake_bin/ss"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$FWDPORTS_TEST_LSOF_MARKER"' \
+    'case " $* " in' \
+    '  *" -t "*) printf "777\n" ;;' \
+    '  *) printf "fixture 777 user 3u IPv4 TCP 127.0.0.1:8080 (LISTEN)\n" ;;' \
+    'esac' >"$fake_bin/lsof"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"$FWDPORTS_TEST_NC_MARKER"' \
+    'exit "${FWDPORTS_TEST_NC_STATUS:-1}"' >"$fake_bin/nc"
+  chmod 0755 "$fake_bin/ss" "$fake_bin/lsof" "$fake_bin/nc"
+}
+
+ss_listener_preferred_case() {
+  local tmp fake_bin argv_file error status pids
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  argv_file=$tmp/argv
+  error=$tmp/error
+  write_port_inspectors "$fake_bin"
+  printf '%s\n' '-L' '127.0.0.1:8080:127.0.0.1:80' >"$argv_file"
+
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    FWDPORTS_TEST_NC_MARKER=$tmp/nc-ran \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ss inspector: occupied port is rejected" 1 "$status"
+  _assert_contains "ss inspector: diagnostic identifies ss" \
+    "listener details (ss)" "$(<"$error")"
+  _assert_contains "ss inspector: diagnostic carries the owner" \
+    "pid=4242" "$(<"$error")"
+  _assert_not_exists "ss inspector: preflight does not run lsof" \
+    "$tmp/lsof-ran"
+
+  # Owner columns are best-effort; the listener line itself must survive.
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=owners-fail \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    FWDPORTS_TEST_NC_MARKER=$tmp/nc-ran \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ss inspector: owner lookup failure still rejects" 1 "$status"
+  _assert_contains "ss inspector: owner lookup failure keeps the listener" \
+    "LISTEN 0 1 127.0.0.1:8080" "$(<"$error")"
+
+  pids=$(PATH="$fake_bin:$PATH" FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    _fwdports_local_forward_listener_pids 8080)
+  _assert_eq "ss inspector: every PID sharing the socket is reported once" \
+    $'4243\n4242' "$pids"
+  _assert_not_exists "ss inspector: PID lookup does not run lsof" \
+    "$tmp/lsof-ran"
+}
+
+ss_leading_zero_port_case() {
+  local tmp fake_bin argv_file error ss_log
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  argv_file=$tmp/argv
+  error=$tmp/error
+  ss_log=$tmp/ss.log
+  write_port_inspectors "$fake_bin"
+  # SSH accepts a zero-padded port; ss would read "02020" as octal 1040.
+  printf '%s\n' '-L' '02020:127.0.0.1:80' >"$argv_file"
+
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty FWDPORTS_TEST_SS_LOG=$ss_log \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    FWDPORTS_TEST_NC_MARKER=$tmp/nc-ran \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error" || true
+  _assert_eq "ss inspector: preflight queries the decimal port" \
+    "-H -ltn sport = :2020" "$(<"$ss_log")"
+
+  : >"$ss_log"
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty FWDPORTS_TEST_SS_LOG=$ss_log \
+    _fwdports_local_forward_listener_pids 02020 >/dev/null
+  _assert_eq "ss inspector: PID lookup queries the decimal port" \
+    "-H -ltn -p sport = :2020" "$(<"$ss_log")"
+}
+
+ss_empty_case() {
+  local tmp fake_bin argv_file error status pids
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  argv_file=$tmp/argv
+  error=$tmp/error
+  write_port_inspectors "$fake_bin"
+  printf '%s\n' '-L' '127.0.0.1:8080:127.0.0.1:80' >"$argv_file"
+
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    FWDPORTS_TEST_NC_MARKER=$tmp/nc-ran FWDPORTS_TEST_NC_STATUS=1 \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ss inspector: a free port passes preflight" 0 "$status"
+  _assert_eq "ss inspector: a free port has no diagnostic" "" "$(<"$error")"
+  _assert_file "ss inspector: an empty answer is confirmed by netcat" \
+    "$tmp/nc-ran"
+  _assert_not_exists "ss inspector: a free port does not run lsof" \
+    "$tmp/lsof-ran"
+
+  # A restricted /proc/net view can make ss report nothing for a live port.
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    FWDPORTS_TEST_NC_MARKER=$tmp/nc-ran FWDPORTS_TEST_NC_STATUS=0 \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ss inspector: netcat catches a listener ss missed" 1 \
+    "$status"
+  _assert_contains "ss inspector: hidden-listener diagnostic names netcat" \
+    "listener details (nc)" "$(<"$error")"
+
+  pids=$(PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=empty \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    _fwdports_local_forward_listener_pids 8080)
+  _assert_eq "ss inspector: no listener yields no PIDs" "" "$pids"
+  _assert_not_exists "ss inspector: empty PID lookup does not run lsof" \
+    "$tmp/lsof-ran"
+}
+
+ss_failure_fallback_case() {
+  local tmp fake_bin only_ss_bin argv_file error status pids
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  only_ss_bin=$tmp/only-ss
+  argv_file=$tmp/argv
+  error=$tmp/error
+  write_port_inspectors "$fake_bin"
+  printf '%s\n' '-L' '127.0.0.1:8080:127.0.0.1:80' >"$argv_file"
+
+  set +e
+  PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=fail \
+    FWDPORTS_TEST_SS_LOG=$tmp/ss.log \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    FWDPORTS_TEST_NC_MARKER=$tmp/nc-ran \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_file "ss failure: ss is consulted before lsof" "$tmp/ss.log"
+  _assert_exit "ss failure: lsof still rejects an occupied port" 1 "$status"
+  _assert_contains "ss failure: diagnostic identifies lsof" \
+    "listener details (lsof)" "$(<"$error")"
+
+  pids=$(PATH="$fake_bin:$PATH" FWDPORTS_TEST_SS=fail \
+    FWDPORTS_TEST_LSOF_MARKER=$tmp/lsof-ran \
+    _fwdports_local_forward_listener_pids 8080)
+  _assert_eq "ss failure: listener PIDs fall back to lsof" "777" "$pids"
+
+  # Only bash and the failing ss are visible, so no inspector can answer.
+  mkdir -p "$only_ss_bin"
+  ln -s "$BASH" "$only_ss_bin/bash"
+  cp "$fake_bin/ss" "$only_ss_bin/ss"
+  set +e
+  PATH=$only_ss_bin FWDPORTS_TEST_SS=fail \
+    fwdports_ssh_preflight_local_ports "$argv_file" 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ss failure without lsof: preflight fails closed" 1 "$status"
+  _assert_contains "ss failure without lsof: diagnostic names ss" \
+    "ss failed while checking local port 8080" "$(<"$error")"
+
+  set +e
+  PATH=$only_ss_bin FWDPORTS_TEST_SS=fail \
+    _fwdports_local_forward_listener_pids 8080 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ss failure without lsof: PID lookup fails" 1 "$status"
+  _assert_contains "ss failure without lsof: PID diagnostic keeps ss status" \
+    "ss failed while inspecting port 8080 (exit 1)" "$(<"$error")"
 }
 
 duplicate_profile_local_ports_case() {
@@ -479,5 +682,9 @@ run_case retry-gate retry_gate_case
 run_case local-port-conflict local_port_conflict_case
 run_case remote-port-no-preflight remote_port_no_preflight_case
 run_case lsof-visibility-fallback lsof_visibility_fallback_case
+run_case ss-listener-preferred ss_listener_preferred_case
+run_case ss-leading-zero-port ss_leading_zero_port_case
+run_case ss-empty ss_empty_case
+run_case ss-failure-fallback ss_failure_fallback_case
 run_case duplicate-profile-local-ports duplicate_profile_local_ports_case
 _test_summary

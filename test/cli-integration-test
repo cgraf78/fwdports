@@ -861,10 +861,13 @@ ettun_lifecycle_case() {
     'exit 0' >"$CASE_ET"
   chmod 0700 "$CASE_ET"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$tmp/bin/lsof"
+  # Keep the host's real listeners out of preflight: ss fails, lsof sees
+  # nothing, and only the health check's netcat probe connects.
+  cp "$tmp/bin/lsof" "$tmp/bin/ss"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     '[[ " $* " != *" -w 1 "* ]]' >"$tmp/bin/nc"
-  chmod 0700 "$tmp/bin/lsof" "$tmp/bin/nc"
+  chmod 0700 "$tmp/bin/lsof" "$tmp/bin/ss" "$tmp/bin/nc"
   printf '%s\n' \
     'profile default' \
     'leg relay ettun' \

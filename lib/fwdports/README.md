@@ -1,6 +1,7 @@
 # Runtime library ownership
 
-These Bash 3.2-compatible modules implement reusable `fwdports` behavior:
+These Bash 3.2-compatible modules and one Python helper implement reusable
+`fwdports` behavior:
 
 - `config.sh` parses and resolves data-only profiles.
 - `core.sh` composes command-level start/status/inspect/stop/attach operations.
@@ -23,6 +24,9 @@ These Bash 3.2-compatible modules implement reusable `fwdports` behavior:
 - `health.sh` owns pure health and backoff state transitions.
 - `runtime.sh` owns XDG state, generations, locks, manifests, and pointers.
 - `tmux.sh` owns direct-argv session and pane operations.
+- `session-enumerator.py` is the Python helper that selects one POSIX process
+  session from a validated Darwin `ps` snapshot. ettun legs on macOS snapshot
+  it into the leg runtime so pane process ownership stays observable.
 
 Modules are implementation details, not a general sourced-shell API. The
 supported extension boundary is the executable driver protocol documented in

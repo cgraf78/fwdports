@@ -210,7 +210,8 @@ retry loop.
 
 ## Status vocabulary
 
-- `starting`: a verified pending generation has not become active.
+- `starting`: a verified pending generation has not become active, or the
+  active generation is still preparing.
 - `healthy`: the driver is live and every configured service check passes.
 - `live/unverified`: the driver is live and has no configured service check.
 - `degraded`: the driver is live but a configured service check fails.
@@ -218,18 +219,27 @@ retry loop.
 - `controller-down`: active legs may remain, but observation needs an explicit
   `start` to rebuild the generation.
 - `stopping`: replacement is disabled while authenticated cleanup is incomplete.
+- `stopped`: no generation is active or pending, and no tmux session uses the
+  fwdports session name.
+- `unowned-session`: a tmux session uses the fwdports session name without an
+  authenticated generation pointer; `status` exits 1 because ownership cannot
+  be proven.
 
 Process or monitor liveness is never reported as endpoint health.
 
-`status` emits exactly one vocabulary token for scripts. `inspect` is the
-human-readable companion: it authenticates the active pointer and manifest
-before emitting a report, then shows controller and leg tmux identities,
-supervisor or driver-reported liveness, standard forwards, and a bounded
-point-in-time result for every normalized check. A configured check is always
-labeled as a local TCP connect probe. It is not described as end-to-end tunnel
-or application health because the probe sends no payload and cannot establish
-either claim. Built-in panes are labeled as live supervisors rather than live
-transports because direct SSH may be between retry attempts.
+`status` prints exactly one vocabulary token for scripts when it can determine
+state: it exits 0, or 1 for `unowned-session`. When state cannot be
+authenticated or a dependency is missing, it prints no token and exits nonzero,
+for example 74 for unauthenticated state or 69 when tmux is unavailable.
+
+`inspect` is the human-readable companion: it authenticates the active pointer
+and manifest before emitting a report, then shows controller and leg tmux
+identities, supervisor or driver-reported liveness, standard forwards, and a
+bounded point-in-time result for every normalized check. A configured check is
+always labeled as a local TCP connect probe. It is not described as end-to-end
+tunnel or application health because the probe sends no payload and cannot
+establish either claim. Built-in panes are labeled as live supervisors rather
+than live transports because direct SSH may be between retry attempts.
 
 ## Reconciliation
 

@@ -77,9 +77,11 @@ Usage:
   fwdports --help
 
 Start or inspect one profile-driven set of port forwards in tmux.
-OpenSSH is the default driver; autossh and Eternal Terminal are available only
-when selected. Configuration defaults to
-${XDG_CONFIG_HOME:-$HOME/.config}/fwdports.
+OpenSSH is the default driver. The built-in autossh, Eternal Terminal (et),
+and ettun drivers, and external drivers in
+${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/drivers.d/, are used only when
+selected. Configuration defaults to
+${XDG_CONFIG_HOME:-$HOME/.config}/fwdports/tunnels.conf.
 EOF
 }
 

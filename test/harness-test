@@ -174,10 +174,10 @@ time.sleep(30)' >"$tmp/zombie.pid" 2>/dev/null &
   return 0
 }
 
-# Write a child suite whose case starts an isolated tmux server under its own
-# harness root, records the server and pane PIDs, and then runs the given
-# case-tail lines. The pane ignores HUP and TERM so only group escalation stops it,
-# which is the shape that survives a bare kill-server.
+# Write a child suite that records its harness root, then starts an isolated
+# tmux server under that root, records the server and pane PIDs, and runs the
+# given case-tail lines. The pane ignores HUP and TERM so only group
+# escalation stops it, which is the shape that survives a bare kill-server.
 write_tmux_child() {
   local child=$1
   shift
@@ -186,6 +186,7 @@ write_tmux_child() {
 #!/usr/bin/env bash
 set -u
 source "$FWDPORTS_TEST_HARNESS"
+printf '%s\n' "$_FWDPORTS_TEST_TMP_ROOT" >"$FWDPORTS_TEST_ROOT_RECORD"
 starts_server() {
   local socket
   socket=$(_tmpdir)/tmux.sock || return 1
@@ -212,14 +213,18 @@ tmux_child_alive() {
   [[ -n "$CHILD_PANE_PID" ]] && _test_process_live "-$CHILD_PANE_PID"
 }
 
-# Run a child written by write_tmux_child with a private TMPDIR so its harness
-# root is observable, then wait for its recorded processes to disappear.
+# Run a child written by write_tmux_child, then wait for its recorded
+# processes to disappear. The child's root sits directly in this suite's root
+# rather than in a case directory: macOS limits socket paths to about 104
+# bytes, and a second level of case nesting overflows that under its long
+# /private/var temporary base.
 run_tmux_child() {
   local tmp=$1 child=$2 attempts=0
-  mkdir -p "$tmp/child-tmp"
   set +e
-  TMPDIR=$tmp/child-tmp FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+  TMPDIR=$_FWDPORTS_TEST_TMP_ROOT \
+    FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
     FWDPORTS_TEST_TMUX="$_FWDPORTS_TEST_TMUX" FWDPORTS_TEST_PIDS=$tmp/pids \
+    FWDPORTS_TEST_ROOT_RECORD=$tmp/root \
     bash "$child" >"$tmp/output" 2>&1
   CHILD_STATUS=$?
   CHILD_OUTPUT=$(<"$tmp/output")
@@ -238,7 +243,10 @@ run_tmux_child() {
     sleep 0.01
     attempts=$((attempts + 1))
   done
-  CHILD_ROOTS=$(ls -A "$tmp/child-tmp")
+  # Without a recorded root, point at a directory that exists so the
+  # root-removal assertion fails instead of passing vacuously.
+  CHILD_ROOT=$tmp
+  [[ -s "$tmp/root" ]] && CHILD_ROOT=$(<"$tmp/root")
   reap_tmux_child
 }
 
@@ -279,7 +287,8 @@ leaked_tmux_case() {
   _assert_ne "tmux leak: fixture recorded its processes" "" "$CHILD_PANE_PID"
   _assert_eq "tmux leak: server and HUP-ignoring pane are stopped" \
     0 "$CHILD_ALIVE"
-  _assert_eq "tmux leak: temporary root is still removed" "" "$CHILD_ROOTS"
+  _assert_not_exists "tmux leak: temporary root is still removed" \
+    "$CHILD_ROOT"
 }
 
 aborted_tmux_case() {
@@ -302,7 +311,8 @@ aborted_tmux_case() {
   _assert_ne "tmux abort: fixture recorded its processes" "" "$CHILD_PANE_PID"
   _assert_eq "tmux abort: server and HUP-ignoring pane are stopped" \
     0 "$CHILD_ALIVE"
-  _assert_eq "tmux abort: temporary root is still removed" "" "$CHILD_ROOTS"
+  _assert_not_exists "tmux abort: temporary root is still removed" \
+    "$CHILD_ROOT"
 }
 
 interrupted_tmux_case() {
@@ -323,8 +333,8 @@ interrupted_tmux_case() {
     "$CHILD_PANE_PID"
   _assert_eq "tmux interrupt: server and HUP-ignoring pane are stopped" \
     0 "$CHILD_ALIVE"
-  _assert_eq "tmux interrupt: temporary root is still removed" "" \
-    "$CHILD_ROOTS"
+  _assert_not_exists "tmux interrupt: temporary root is still removed" \
+    "$CHILD_ROOT"
 }
 
 clean_tmux_case() {

@@ -138,9 +138,148 @@ _tmpdir() {
   printf '%s\n' "$path"
 }
 
+# Resolve tmux before suites can shadow PATH with fakes, so teardown talks to
+# the same binary the fixtures used. Absence only matters once a socket exists.
+_FWDPORTS_TEST_TMUX=${FWDPORTS_TEST_TMUX_BIN:-$(command -v tmux 2>/dev/null)}
+
+_test_tmux() {
+  local socket=$1
+  shift
+  TMUX='' TMUX_PANE='' "$_FWDPORTS_TEST_TMUX" -S "$socket" -f /dev/null "$@"
+}
+
+# Succeed while a process, or with a leading `-` a process group, still has a
+# member that can run. Zombies keep their IDs until a parent reaps them, and a
+# container whose PID 1 never reaps keeps orphaned zombies forever, so
+# `kill -0` alone would report them live and wait out every deadline there.
+# If ps is unavailable, trust `kill -0` rather than declare a process gone.
+_test_process_live() {
+  local target=$1 column=pid table
+  kill -0 -- "$target" 2>/dev/null || return 1
+  [[ $target == -* ]] && column=pgid
+  table=$(LC_ALL=C ps -e -o "$column=" -o stat= 2>/dev/null) || return 0
+  [[ -n "$table" ]] || return 0
+  awk -v id="${target#-}" \
+    '$1 == id && $2 !~ /^[ZX]/ { live = 1 } END { exit !live }' <<<"$table"
+}
+
+_test_process_exists() {
+  kill -0 -- "$1" 2>/dev/null
+}
+
+# Poll up to LIMIT times until PROBE reports every given pane process group
+# empty. A group ID stays reserved while any member lives; the window in which
+# an emptied group's ID could be reused by an unrelated process is tiny next
+# to PID wraparound.
+_test_tmux_groups_gone() {
+  local limit=$1 probe=$2 attempts=0 pid live
+  shift 2
+  while [[ $attempts -lt $limit ]]; do
+    live=0
+    for pid in "$@"; do
+      "$probe" "-$pid" && live=1
+    done
+    [[ $live -eq 0 ]] && return 0
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+# Stop a test tmux server that still owns panes; fail when there is none.
+# A server whose last session is already gone is exiting on its own, so it is
+# not reported as a leak. kill-server alone only hangs up pane terminals, so
+# fixtures and drivers that ignore HUP would outlive their server and keep
+# running from a deleted root. Signal each pane's process group first (tmux
+# makes every pane a session and group leader), escalate after a bounded wait,
+# and only then stop the server. Descendants that leave the pane's group are
+# the owning case's responsibility.
+_stop_test_tmux_server() {
+  local socket=$1 panes dead pid attempts=0
+  local -a pids=()
+  panes=$(_test_tmux "$socket" list-panes -a \
+    -F '#{pane_dead} #{pane_pid}' 2>/dev/null) || return 1
+  if [[ -z "$panes" ]]; then
+    _test_tmux "$socket" kill-server >/dev/null 2>&1
+    return 1
+  fi
+  while read -r dead pid; do
+    [[ $dead == 0 && $pid =~ ^[0-9]+$ ]] || continue
+    pids+=("$pid")
+    kill -TERM -- "-$pid" 2>/dev/null
+  done <<<"$panes"
+  # Teardown needs no long grace period, and several fixtures ignore TERM on
+  # purpose. The cheap probe suffices here; only zombies can outlast KILL, so
+  # the costlier zombie-aware scan runs only after escalation.
+  if ! _test_tmux_groups_gone 50 _test_process_exists \
+    ${pids[@]+"${pids[@]}"}; then
+    for pid in ${pids[@]+"${pids[@]}"}; do
+      kill -KILL -- "-$pid" 2>/dev/null
+    done
+    _test_tmux_groups_gone 200 _test_process_live ${pids[@]+"${pids[@]}"}
+  fi
+  _test_tmux "$socket" kill-server >/dev/null 2>&1
+  while _test_tmux "$socket" list-sessions >/dev/null 2>&1 &&
+    [[ $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  return 0
+}
+
+# The one teardown path for a suite's own tmux servers. Suites call this where
+# their case is done with a server; it is quiet because stopping an owned
+# server there is expected, not a leak. Cases may run under errexit, and the
+# stop sequence expects some signals and probes to fail, so invoke it from an
+# `||` list, where Bash suspends errexit for the whole function body.
+kill_test_server() {
+  [[ -n "$_FWDPORTS_TEST_TMUX" ]] || return 0
+  _stop_test_tmux_server "$1" || :
+}
+
+# Stop every tmux server still listening under this suite's root and record
+# each socket that had one, one per line, in _FWDPORTS_TEST_LEAKED. Suites own
+# their servers, but a failed assertion, early return, or interrupt can skip a
+# suite's own teardown; deleting the root afterwards would orphan the server
+# with an unreachable socket. This runs in the calling shell rather than a
+# command substitution because subshells reset caught signals to defaults,
+# which would let a second interrupt abandon the teardown sweep.
+_stop_test_tmux_servers() {
+  local socket
+  _FWDPORTS_TEST_LEAKED=
+  [[ -n "$_FWDPORTS_TEST_TMUX" && -d "$_FWDPORTS_TEST_TMP_ROOT" ]] || return 0
+  while IFS= read -r socket; do
+    [[ -n "$socket" ]] || continue
+    if _stop_test_tmux_server "$socket"; then
+      _FWDPORTS_TEST_LEAKED=$_FWDPORTS_TEST_LEAKED$socket$'\n'
+    fi
+  done < <(find "$_FWDPORTS_TEST_TMP_ROOT" -type s -print 2>/dev/null)
+  return 0
+}
+
+# Signal traps pass the conventional 128+N status. Inside a trap, `$?` is the
+# status of the interrupted command, which would let a killed suite exit 0.
 _cleanup_test_root() {
-  local status=$?
-  trap - EXIT HUP INT TERM
+  local status=$? socket
+  [[ -z "${1:-}" ]] || status=$1
+  # Finish teardown even if another signal arrives: an abandoned teardown
+  # recreates the orphaned-server leak it prevents. A no-op handler rather
+  # than an ignored signal keeps child tmux clients interruptible, so a second
+  # Ctrl-C can still break a client stuck on an unresponsive socket.
+  trap - EXIT
+  trap : HUP INT TERM
+  set +e
+  _stop_test_tmux_servers
+  if [[ -n "$_FWDPORTS_TEST_LEAKED" ]]; then
+    # A server outside any case, or one left by an interrupted case, is
+    # still a leak: report it and never let the suite pass because of it.
+    while IFS= read -r socket; do
+      [[ -n "$socket" ]] || continue
+      printf 'fwdports test: stopped leaked tmux server: %s\n' \
+        "$socket" >&2
+    done <<<"$_FWDPORTS_TEST_LEAKED"
+    [[ $status -ne 0 ]] || status=1
+  fi
   case "$_FWDPORTS_TEST_TMP_ROOT" in
     "$_FWDPORTS_TEST_TMP_BASE"/f.*)
       rm -rf -- "$_FWDPORTS_TEST_TMP_ROOT"
@@ -148,10 +287,13 @@ _cleanup_test_root() {
   esac
   exit "$status"
 }
-trap _cleanup_test_root EXIT HUP INT TERM
+trap _cleanup_test_root EXIT
+trap '_cleanup_test_root 129' HUP
+trap '_cleanup_test_root 130' INT
+trap '_cleanup_test_root 143' TERM
 
 run_case() {
-  local name=$1 function_name=$2 callback_status
+  local name=$1 function_name=$2 callback_status socket
   if [[ -n "${TEST_CASE:-}" && "${TEST_CASE:-}" != "$name" ]]; then
     return 0
   fi
@@ -175,6 +317,13 @@ run_case() {
     # produce a misleading all-green summary with zero useful coverage.
     _fail "case callback failed: $name"
   fi
+  # Attribute leaks to the case that made them. Stopping them here also keeps
+  # a leaked fixture from perturbing timing or ownership in later cases.
+  _stop_test_tmux_servers
+  while IFS= read -r socket; do
+    [[ -n "$socket" ]] || continue
+    _fail "case leaked tmux server: $name ($socket)"
+  done <<<"$_FWDPORTS_TEST_LEAKED"
 }
 
 _test_summary() {

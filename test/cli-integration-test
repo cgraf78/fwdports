@@ -1105,6 +1105,9 @@ force_stale_pointer_rebuilds_case() {
     "$COMMAND_STATUS"
   _assert_contains "force stale pointer: forwards summary present" \
     'shell [ssh] remote' "$COMMAND_OUTPUT"
+  run_fwdports "$output" stop
+  _assert_exit "force stale pointer: rebuilt generation stops" 0 \
+    "$COMMAND_STATUS"
 }
 
 force_unowned_session_rebuilds_case() {
@@ -1136,6 +1139,9 @@ force_unowned_session_rebuilds_case() {
   kill -9 "$sentinel_pid" 2>/dev/null || true
   _assert_contains "force unowned session: forwards summary present" \
     'shell [ssh] remote' "$COMMAND_OUTPUT"
+  run_fwdports "$output" stop
+  _assert_exit "force unowned session: rebuilt generation stops" 0 \
+    "$COMMAND_STATUS"
 }
 
 force_residual_listener_rebuilds_case() {
@@ -1213,6 +1219,9 @@ except OSError:
     kill -9 "$listener_pid" 2>/dev/null || true
     _assert_contains "force residual listener: forwards summary present" \
       'shell [ssh] local' "$COMMAND_OUTPUT"
+    run_fwdports "$output" stop
+    _assert_exit "force residual listener: rebuilt generation stops" 0 \
+      "$COMMAND_STATUS"
   else
     if [[ $COMMAND_STATUS -ne 0 ]]; then
       _pass "force residual listener: fails without owner resolution"
@@ -1258,6 +1267,9 @@ force_rebuilds_healthy_generation_case() {
   fi
   _assert_contains "force healthy rebuild: forwards summary present" \
     'shell [ssh] remote' "$COMMAND_OUTPUT"
+  run_fwdports "$output" stop
+  _assert_exit "force healthy rebuild: rebuilt generation stops" 0 \
+    "$COMMAND_STATUS"
 }
 
 process_stopped_helper_case() {

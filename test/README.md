@@ -16,6 +16,15 @@ tmux sockets, SSH configuration, loopback listeners, and cleanup traps. They do
 not inspect or alter the user's normal tmux server, SSH sessions, or runtime
 state.
 
+Cases stop the tmux servers they start, either through `fwdports stop` or the
+harness's `kill_test_server`, which stops pane process groups before the
+server so HUP-ignoring fixtures cannot outlive it. After every case the
+harness looks for tmux servers that still own panes on a socket under its
+root, fails the case as a leak, and stops them the same way. Its exit trap
+repeats the sweep before deleting the root, so a failed assertion, early
+return, `exit`, or catchable signal cannot orphan a server whose socket no
+longer exists.
+
 Process-group, signal, tmux, and listener suites remain sequential because
 parallel load weakens their timing and ownership evidence. Fakes are used at
 external executable boundaries, while real tmux/process/autossh integration

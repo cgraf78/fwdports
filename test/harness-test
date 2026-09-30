@@ -191,7 +191,7 @@ starts_server() {
   local socket
   socket=$(_tmpdir)/tmux.sock || return 1
   TMUX='' "$FWDPORTS_TEST_TMUX" -S "$socket" -f /dev/null new-session -d \
-    -- /bin/sh -c 'trap "" HUP TERM; while :; do sleep 1; done' || return 1
+    -- sh -c 'trap "" HUP TERM; while :; do sleep 1; done' || return 1
   TMUX='' "$FWDPORTS_TEST_TMUX" -S "$socket" display-message -p \
     '#{pid} #{pane_pid}' >"$FWDPORTS_TEST_PIDS" || return 1
 EOF

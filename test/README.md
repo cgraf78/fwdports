@@ -22,8 +22,8 @@ server so HUP-ignoring fixtures cannot outlive it. After every case the
 harness looks for tmux servers that still own panes on a socket under its
 root, fails the case as a leak, and stops them the same way. Its exit trap
 repeats the sweep before deleting the root, so a failed assertion, early
-return, `exit`, or catchable signal cannot orphan a server whose socket no
-longer exists.
+return, `exit`, HUP, INT, or TERM cannot orphan a server whose socket no
+longer exists. Further signals are ignored until that teardown finishes.
 
 Process-group, signal, tmux, and listener suites remain sequential because
 parallel load weakens their timing and ownership evidence. Fakes are used at

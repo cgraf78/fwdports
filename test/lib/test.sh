@@ -263,11 +263,13 @@ _cleanup_test_root() {
   local status=$? socket
   [[ -z "${1:-}" ]] || status=$1
   # Finish teardown even if another signal arrives: an abandoned teardown
-  # recreates the orphaned-server leak it prevents. A no-op handler rather
-  # than an ignored signal keeps child tmux clients interruptible, so a second
-  # Ctrl-C can still break a client stuck on an unresponsive socket.
+  # recreates the orphaned-server leak it prevents. Ignoring (rather than
+  # catching) the signals also shields `find` and `rm`, which would otherwise
+  # die at their defaults, skipping servers or leaving the root behind. A tmux
+  # client stuck on an unresponsive socket still exits on TERM or HUP, which
+  # tmux handles itself; INT does not stop it.
   trap - EXIT
-  trap : HUP INT TERM
+  trap '' HUP INT TERM
   set +e
   _stop_test_tmux_servers
   if [[ -n "$_FWDPORTS_TEST_LEAKED" ]]; then

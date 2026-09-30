@@ -125,6 +125,55 @@ signal_status_case() {
   _assert_exit "signal status: a TERMed suite exits 143" 143 "$status"
 }
 
+zombie_liveness_case() {
+  local tmp holder zombie_pid='' index=0 stopped=0
+  if ! command -v python3 >/dev/null 2>&1; then
+    _pass "process liveness: python3 is unavailable here"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  # The child exits at once while its parent sleeps without reaping it: the
+  # state an orphaned fixture reaches under a container PID 1 that never
+  # reaps. Teardown and the tmux cases must treat it as stopped.
+  python3 -c 'import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+sys.stdout.write(f"{pid}\n")
+sys.stdout.flush()
+time.sleep(30)' >"$tmp/zombie.pid" 2>/dev/null &
+  holder=$!
+  while [[ ! -s "$tmp/zombie.pid" && $index -lt 200 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  [[ -s "$tmp/zombie.pid" ]] && zombie_pid=$(<"$tmp/zombie.pid")
+  index=0
+  while [[ -n "$zombie_pid" && $index -lt 200 ]]; do
+    if ! _test_process_live "$zombie_pid"; then
+      stopped=1
+      break
+    fi
+    sleep 0.01
+    index=$((index + 1))
+  done
+
+  if [[ -n "$zombie_pid" ]] && kill -0 "$zombie_pid" 2>/dev/null; then
+    _pass "process liveness: fixture holds a kill -0-visible zombie"
+  else
+    _fail "process liveness: fixture holds a kill -0-visible zombie"
+  fi
+  _assert_eq "process liveness: a zombie is not live" 1 "$stopped"
+  if _test_process_live "$holder"; then
+    _pass "process liveness: a running process is live"
+  else
+    _fail "process liveness: a running process is live"
+  fi
+  kill -KILL "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null
+  return 0
+}
+
 # Write a child suite whose case starts an isolated tmux server under its own
 # harness root, records the server and pane PIDs, and then runs the given
 # case-tail lines. The pane ignores HUP and TERM so only group escalation stops it,
@@ -155,11 +204,12 @@ EOF
   chmod 0700 "$child"
 }
 
-# True while the recorded server or any member of its pane group remains.
+# True while the recorded server or any member of its pane group can run.
+# Stopped fixtures may linger as unreaped zombies in containers.
 tmux_child_alive() {
-  [[ -n "$CHILD_SERVER_PID" ]] && kill -0 "$CHILD_SERVER_PID" 2>/dev/null &&
+  [[ -n "$CHILD_SERVER_PID" ]] && _test_process_live "$CHILD_SERVER_PID" &&
     return 0
-  [[ -n "$CHILD_PANE_PID" ]] && kill -0 -- "-$CHILD_PANE_PID" 2>/dev/null
+  [[ -n "$CHILD_PANE_PID" ]] && _test_process_live "-$CHILD_PANE_PID"
 }
 
 # Run a child written by write_tmux_child with a private TMPDIR so its harness
@@ -305,6 +355,7 @@ run_case canonical-tmpdir canonical_tmpdir_case
 run_case private-umask private_umask_case
 run_case nonzero-callback nonzero_callback_case
 run_case signal-status signal_status_case
+run_case zombie-liveness zombie_liveness_case
 run_case leaked-tmux leaked_tmux_case
 run_case aborted-tmux aborted_tmux_case
 run_case interrupted-tmux interrupted_tmux_case

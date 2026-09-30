@@ -148,15 +148,36 @@ _test_tmux() {
   TMUX='' TMUX_PANE='' "$_FWDPORTS_TEST_TMUX" -S "$socket" -f /dev/null "$@"
 }
 
-# Poll the given pane process groups until each is empty. A group ID stays
-# reserved while any member lives; the window in which an emptied group's ID
-# could be reused by an unrelated process is tiny next to PID wraparound.
+# Succeed while a process, or with a leading `-` a process group, still has a
+# member that can run. Zombies keep their IDs until a parent reaps them, and a
+# container whose PID 1 never reaps keeps orphaned zombies forever, so
+# `kill -0` alone would report them live and wait out every deadline there.
+# If ps is unavailable, trust `kill -0` rather than declare a process gone.
+_test_process_live() {
+  local target=$1 column=pid table
+  kill -0 -- "$target" 2>/dev/null || return 1
+  [[ $target == -* ]] && column=pgid
+  table=$(LC_ALL=C ps -e -o "$column=" -o stat= 2>/dev/null) || return 0
+  [[ -n "$table" ]] || return 0
+  awk -v id="${target#-}" \
+    '$1 == id && $2 !~ /^[ZX]/ { live = 1 } END { exit !live }' <<<"$table"
+}
+
+_test_process_exists() {
+  kill -0 -- "$1" 2>/dev/null
+}
+
+# Poll up to LIMIT times until PROBE reports every given pane process group
+# empty. A group ID stays reserved while any member lives; the window in which
+# an emptied group's ID could be reused by an unrelated process is tiny next
+# to PID wraparound.
 _test_tmux_groups_gone() {
-  local attempts=0 pid live
-  while [[ $attempts -lt 200 ]]; do
+  local limit=$1 probe=$2 attempts=0 pid live
+  shift 2
+  while [[ $attempts -lt $limit ]]; do
     live=0
     for pid in "$@"; do
-      kill -0 -- "-$pid" 2>/dev/null && live=1
+      "$probe" "-$pid" && live=1
     done
     [[ $live -eq 0 ]] && return 0
     sleep 0.01
@@ -187,11 +208,15 @@ _stop_test_tmux_server() {
     pids+=("$pid")
     kill -TERM -- "-$pid" 2>/dev/null
   done <<<"$panes"
-  if ! _test_tmux_groups_gone ${pids[@]+"${pids[@]}"}; then
+  # Teardown needs no long grace period, and several fixtures ignore TERM on
+  # purpose. The cheap probe suffices here; only zombies can outlast KILL, so
+  # the costlier zombie-aware scan runs only after escalation.
+  if ! _test_tmux_groups_gone 50 _test_process_exists \
+    ${pids[@]+"${pids[@]}"}; then
     for pid in ${pids[@]+"${pids[@]}"}; do
       kill -KILL -- "-$pid" 2>/dev/null
     done
-    _test_tmux_groups_gone ${pids[@]+"${pids[@]}"}
+    _test_tmux_groups_gone 200 _test_process_live ${pids[@]+"${pids[@]}"}
   fi
   _test_tmux "$socket" kill-server >/dev/null 2>&1
   while _test_tmux "$socket" list-sessions >/dev/null 2>&1 &&

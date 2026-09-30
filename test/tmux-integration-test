@@ -59,12 +59,6 @@ wait_for_marker() {
   [[ -e "$path" ]]
 }
 
-kill_test_server() {
-  local socket=$1
-  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
-    kill-server 2>/dev/null || true
-}
-
 direct_argv_case() {
   local tmp socket fixture output release record session_id pane_id actual
   local implementation

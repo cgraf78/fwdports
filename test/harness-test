@@ -100,11 +100,215 @@ nonzero_callback_case() {
     "$marker"
 }
 
+signal_status_case() {
+  local tmp child output status
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/interrupted
+  output=$tmp/output
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'interrupted() { _pass "before signal"; kill -TERM $$; }' \
+    'run_case interrupted interrupted' \
+    '_test_summary' \
+    >"$child"
+  chmod 0700 "$child"
+
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+  # Inside a trap `$?` belongs to the interrupted command, so a signal that
+  # arrives after passing work could otherwise report success.
+  _assert_exit "signal status: a TERMed suite exits 143" 143 "$status"
+}
+
+# Write a child suite whose case starts an isolated tmux server under its own
+# harness root, records the server and pane PIDs, and then runs the given
+# case-tail lines. The pane ignores HUP and TERM so only group escalation stops it,
+# which is the shape that survives a bare kill-server.
+write_tmux_child() {
+  local child=$1
+  shift
+  {
+    cat <<'EOF'
+#!/usr/bin/env bash
+set -u
+source "$FWDPORTS_TEST_HARNESS"
+starts_server() {
+  local socket
+  socket=$(_tmpdir)/tmux.sock || return 1
+  TMUX='' "$FWDPORTS_TEST_TMUX" -S "$socket" -f /dev/null new-session -d \
+    -- /bin/sh -c 'trap "" HUP TERM; while :; do sleep 1; done' || return 1
+  TMUX='' "$FWDPORTS_TEST_TMUX" -S "$socket" display-message -p \
+    '#{pid} #{pane_pid}' >"$FWDPORTS_TEST_PIDS" || return 1
+EOF
+    printf '  %s\n' "$@"
+    printf '}\n'
+    cat <<'EOF'
+run_case starts-server starts_server
+_test_summary
+EOF
+  } >"$child"
+  chmod 0700 "$child"
+}
+
+# True while the recorded server or any member of its pane group remains.
+tmux_child_alive() {
+  [[ -n "$CHILD_SERVER_PID" ]] && kill -0 "$CHILD_SERVER_PID" 2>/dev/null &&
+    return 0
+  [[ -n "$CHILD_PANE_PID" ]] && kill -0 -- "-$CHILD_PANE_PID" 2>/dev/null
+}
+
+# Run a child written by write_tmux_child with a private TMPDIR so its harness
+# root is observable, then wait for its recorded processes to disappear.
+run_tmux_child() {
+  local tmp=$1 child=$2 attempts=0
+  mkdir -p "$tmp/child-tmp"
+  set +e
+  TMPDIR=$tmp/child-tmp FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    FWDPORTS_TEST_TMUX="$_FWDPORTS_TEST_TMUX" FWDPORTS_TEST_PIDS=$tmp/pids \
+    bash "$child" >"$tmp/output" 2>&1
+  CHILD_STATUS=$?
+  CHILD_OUTPUT=$(<"$tmp/output")
+  CHILD_SERVER_PID=
+  CHILD_PANE_PID=
+  [[ -s "$tmp/pids" ]] &&
+    read -r CHILD_SERVER_PID CHILD_PANE_PID <"$tmp/pids"
+  [[ $CHILD_SERVER_PID =~ ^[0-9]+$ ]] || CHILD_SERVER_PID=
+  [[ $CHILD_PANE_PID =~ ^[0-9]+$ ]] || CHILD_PANE_PID=
+  CHILD_ALIVE=1
+  while [[ $attempts -lt 200 ]]; do
+    if ! tmux_child_alive; then
+      CHILD_ALIVE=0
+      break
+    fi
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  CHILD_ROOTS=$(ls -A "$tmp/child-tmp")
+  reap_tmux_child
+}
+
+# A failing assertion must not become the leak it describes. Signal only the
+# recorded pane group, and only after confirming it still is the fixture; the
+# server exits by itself once its only pane is gone.
+reap_tmux_child() {
+  [[ $CHILD_ALIVE -eq 1 ]] || return 0
+  if [[ -n "$CHILD_PANE_PID" ]] &&
+    ps -o args= -p "$CHILD_PANE_PID" 2>/dev/null |
+    grep -F -q -- 'while :; do sleep 1; done'; then
+    kill -KILL -- "-$CHILD_PANE_PID" 2>/dev/null
+  fi
+  return 0
+}
+
+tmux_available() {
+  [[ -n "$_FWDPORTS_TEST_TMUX" ]]
+}
+
+leaked_tmux_case() {
+  local tmp child
+  if ! tmux_available; then
+    _pass "tmux leak: tmux is unavailable here"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/leaks-server
+  write_tmux_child "$child" '_pass "server started"'
+  run_tmux_child "$tmp" "$child"
+
+  _assert_exit "tmux leak: a passing case that leaks a server fails" \
+    1 "$CHILD_STATUS"
+  _assert_contains "tmux leak: failure names the leaking case" \
+    "case leaked tmux server: starts-server" "$CHILD_OUTPUT"
+  _assert_not_contains "tmux leak: exit teardown does not report it again" \
+    "stopped leaked tmux server" "$CHILD_OUTPUT"
+  _assert_ne "tmux leak: fixture recorded its processes" "" "$CHILD_PANE_PID"
+  _assert_eq "tmux leak: server and HUP-ignoring pane are stopped" \
+    0 "$CHILD_ALIVE"
+  _assert_eq "tmux leak: temporary root is still removed" "" "$CHILD_ROOTS"
+}
+
+aborted_tmux_case() {
+  local tmp child
+  if ! tmux_available; then
+    _pass "tmux abort: tmux is unavailable here"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/aborts-with-server
+  # Exiting from inside the case skips run_case's own check, so only the
+  # EXIT trap can stop the server before the root is deleted.
+  write_tmux_child "$child" 'exit 3'
+  run_tmux_child "$tmp" "$child"
+
+  _assert_exit "tmux abort: preserves the primary exit status" \
+    3 "$CHILD_STATUS"
+  _assert_contains "tmux abort: teardown reports the stopped server" \
+    "stopped leaked tmux server:" "$CHILD_OUTPUT"
+  _assert_ne "tmux abort: fixture recorded its processes" "" "$CHILD_PANE_PID"
+  _assert_eq "tmux abort: server and HUP-ignoring pane are stopped" \
+    0 "$CHILD_ALIVE"
+  _assert_eq "tmux abort: temporary root is still removed" "" "$CHILD_ROOTS"
+}
+
+interrupted_tmux_case() {
+  local tmp child
+  if ! tmux_available; then
+    _pass "tmux interrupt: tmux is unavailable here"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/interrupted-with-server
+  write_tmux_child "$child" 'kill -TERM $$'
+  run_tmux_child "$tmp" "$child"
+
+  _assert_exit "tmux interrupt: reports the TERM status" 143 "$CHILD_STATUS"
+  _assert_contains "tmux interrupt: teardown reports the stopped server" \
+    "stopped leaked tmux server:" "$CHILD_OUTPUT"
+  _assert_ne "tmux interrupt: fixture recorded its processes" "" \
+    "$CHILD_PANE_PID"
+  _assert_eq "tmux interrupt: server and HUP-ignoring pane are stopped" \
+    0 "$CHILD_ALIVE"
+  _assert_eq "tmux interrupt: temporary root is still removed" "" \
+    "$CHILD_ROOTS"
+}
+
+clean_tmux_case() {
+  local tmp child
+  if ! tmux_available; then
+    _pass "tmux clean: tmux is unavailable here"
+    return 0
+  fi
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/stops-server
+  write_tmux_child "$child" \
+    'TMUX= "$FWDPORTS_TEST_TMUX" -S "$socket" kill-server' \
+    'read -r _ pane <"$FWDPORTS_TEST_PIDS"' \
+    'kill -KILL -- "-$pane"' \
+    '_pass "server stopped"'
+  run_tmux_child "$tmp" "$child"
+
+  _assert_exit "tmux clean: a case that stops its server passes" \
+    0 "$CHILD_STATUS"
+  _assert_not_contains "tmux clean: reports no leak" "leaked tmux server" \
+    "$CHILD_OUTPUT"
+  _assert_eq "tmux clean: fixture processes are gone" 0 "$CHILD_ALIVE"
+}
+
 run_case case-filter case_filter_case
 run_case unselected unselected_case
 run_case canonical-tmpdir canonical_tmpdir_case
 run_case private-umask private_umask_case
 run_case nonzero-callback nonzero_callback_case
+run_case signal-status signal_status_case
+run_case leaked-tmux leaked_tmux_case
+run_case aborted-tmux aborted_tmux_case
+run_case interrupted-tmux interrupted_tmux_case
+run_case clean-tmux clean_tmux_case
 if [[ "$TEST_CASE" == case-filter ]]; then
   _assert_eq "case filter: other cases are skipped" 0 "$UNSELECTED_RAN"
 fi

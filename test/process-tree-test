@@ -161,12 +161,6 @@ wait_for_foreground_group() {
   return 1
 }
 
-kill_test_server() {
-  local socket=$1
-  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
-    kill-server 2>/dev/null || true
-}
-
 darwin_session_snapshot_fixture() {
   local uid
   uid=$(id -u) || return 1
@@ -1100,7 +1094,7 @@ session_enumerator_device_drift_case() {
         rest=${rest#*:}
         device=${rest%%:*}
         tail=${rest#*:}
-        tail=$(( ${tail%%:*} + 1 )):${tail#*:}
+        tail=$((${tail%%:*} + 1)):${tail#*:}
         value=$owner:$mode:$device:$tail
         ;;
     esac

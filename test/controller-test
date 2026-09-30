@@ -103,12 +103,6 @@ wait_for_file() {
   [[ -s "$path" ]]
 }
 
-kill_test_server() {
-  local socket=$1
-  TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
-    kill-server 2>/dev/null || true
-}
-
 start_status_pane() {
   local tmp=$1 generation=$2 digest=$3 fixture pid_file release record
   fixture=$tmp/status-leader

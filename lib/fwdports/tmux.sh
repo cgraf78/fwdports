@@ -593,10 +593,14 @@ fwdports_tmux_verify_pane() {
   # all-empty snapshot once reaped), while pane_dead still reads 0 until the
   # server reaps the child.
   rest=$tmux_record$'\t'
-  session_id=${rest%%$'\t'*}; rest=${rest#*$'\t'}
-  pane_id=${rest%%$'\t'*}; rest=${rest#*$'\t'}
-  pane_pid=${rest%%$'\t'*}; rest=${rest#*$'\t'}
-  pane_tty=${rest%%$'\t'*}; rest=${rest#*$'\t'}
+  session_id=${rest%%$'\t'*}
+  rest=${rest#*$'\t'}
+  pane_id=${rest%%$'\t'*}
+  rest=${rest#*$'\t'}
+  pane_pid=${rest%%$'\t'*}
+  rest=${rest#*$'\t'}
+  pane_tty=${rest%%$'\t'*}
+  rest=${rest#*$'\t'}
   pane_dead=${rest%$'\t'}
   if [[ -z $session_id && -z $pane_id ]]; then
     # Since tmux 3.8, display-message against a dead pane succeeds with every
@@ -1281,11 +1285,9 @@ _fwdports_tmux_terminate_ettun_session() {
   else
     session_status=$?
   fi
-  if [[ $session_status -eq 2 ]]; then
-    printf 'fwdports: cannot inspect the recorded process session after the interrupt\n' \
-      >&2
-    return 74
-  fi
+  # An indeterminate final poll is not proof of absence, but it need not
+  # veto escalation: the pane and entire session are authenticated afresh
+  # below. Persistent inspection failures still prevent the second interrupt.
 
   # Public ettun reserves a second Ctrl-C as its force-cleanup request. Keep the
   # authenticated pane as the signal boundary: if its leader has already exited
@@ -1325,6 +1327,10 @@ _fwdports_tmux_terminate_ettun_session() {
   scope=$(_fwdports_verify_owned_session "$generation" "$digest" \
     "$evidence") || return 74
   IFS=$'\t' read -r leader sid _ <<<"$scope"
+  # Session inspection can outlive the stop request; recheck authority at
+  # the signal boundary just as the first interrupt does.
+  _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
+    "$generation" "$digest" || return 74
   _fwdports_tmux_interrupt_recorded_pane "$tmux_path" "$socket" \
     "$generation" "$digest" "$evidence" || {
     if _fwdports_wait_session_empty \

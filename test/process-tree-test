@@ -549,20 +549,25 @@ tmux_pane_wire_shapes_case() {
         case "$shape" in
           dead38-empty-pid)
             printf '%s\t%s\t\t%s\t1\n' \
-              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY" ;;
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY"
+            ;;
           dead38-unreaped)
             printf '%s\t%s\t\t%s\t0\n' \
-              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY" ;;
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY"
+            ;;
           dead38-reaped) printf '\t\t\t\t\n' ;;
           dead37-remain)
             printf '%s\t%s\t%s\t%s\t1\n' \
-              "$PROC_SESSION" "$PROC_PANE" "$PROC_LEADER" "$PROC_TTY" ;;
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_LEADER" "$PROC_TTY"
+            ;;
           pid-drift)
             printf '%s\t%s\t99999999\t%s\t0\n' \
-              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY" ;;
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY"
+            ;;
           live)
             printf '%s\t%s\t%s\t%s\t0\n' \
-              "$PROC_SESSION" "$PROC_PANE" "$PROC_LEADER" "$PROC_TTY" ;;
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_LEADER" "$PROC_TTY"
+            ;;
         esac
       }
       fwdports_tmux_verify_pane "$TMUX_BIN" "$PROC_SOCKET" \
@@ -870,6 +875,83 @@ ettun_session_force_stop_case() {
 
   kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
   kill_test_server "$PROC_SOCKET"
+}
+
+ettun_indeterminate_poll_case() {
+  local tmp output error status persistent=${1:-0} signals
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-interrupt-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+  signals=$tmp/signals
+  printf '0\n' >"$signals"
+
+  set +e
+  (
+    local definition
+    definition=$(declare -f _fwdports_process_session_live_records)
+    eval "${definition/_fwdports_process_session_live_records/_test_live_records}"
+    definition=$(declare -f _fwdports_tmux_interrupt_recorded_pane)
+    eval "${definition/_fwdports_tmux_interrupt_recorded_pane/_test_interrupt}"
+    definition=$(declare -f _fwdports_process_session_records)
+    eval "${definition/_fwdports_process_session_records/_test_session_records}"
+    definition=$(declare -f _fwdports_verify_owned_session)
+    eval "${definition/_fwdports_verify_owned_session/_test_verify_session}"
+
+    # Exhaust the real bounded poll with indeterminate observations after the
+    # first real tmux interrupt. Fresh ownership inspection uses its real
+    # process adapter, independently of this injected liveness failure.
+    _fwdports_process_session_live_records() {
+      [[ $(<"$signals") -ne 1 ]] || return 2
+      _test_live_records "$@"
+    }
+    _fwdports_tmux_interrupt_recorded_pane() {
+      local count
+      count=$(<"$signals")
+      printf '%s\n' "$((count + 1))" >"$signals"
+      _test_interrupt "$@"
+    }
+    if [[ $persistent -eq 1 ]]; then
+      _fwdports_process_session_records() {
+        [[ $(<"$signals") -ne 1 ]] || return 2
+        _test_session_records "$@"
+      }
+    elif [[ $persistent -eq 2 ]]; then
+      _fwdports_lifecycle_allows_stop() { [[ ! -f $tmp/revoked ]]; }
+      _fwdports_verify_owned_session() {
+        _test_verify_session "$@" || return $?
+        # Revoke stop authority while the fresh session check is in flight.
+        [[ $(<"$signals") -eq 0 ]] || : >"$tmp/revoked"
+      }
+    fi
+    fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+      active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+      20 0.02 ettun-session >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+  if [[ $persistent -eq 2 ]]; then
+    _assert_exit "indeterminate poll: revoked stop authority fails closed" 74 "$status"
+    _assert_eq "indeterminate poll: revoked authority sends no second interrupt" 1 "$(<"$signals")"
+  elif [[ $persistent -eq 1 ]]; then
+    _assert_exit "indeterminate poll: persistent inspection fails closed" 74 "$status"
+    _assert_eq "indeterminate poll: failed authentication sends no second interrupt" 1 "$(<"$signals")"
+  else
+    _assert_exit "indeterminate poll: fresh authentication permits escalation" 0 "$status"
+    _assert_eq "indeterminate poll: delivers both interrupts" 2 "$(<"$signals")"
+    _assert_eq "indeterminate poll: reports completed cleanup" term "$(<"$output")"
+    _assert_eq "indeterminate poll: emits no diagnostic" "" "$(<"$error")"
+  fi
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_persistent_poll_case() {
+  ettun_indeterminate_poll_case 1
+}
+
+ettun_revoked_poll_case() {
+  ettun_indeterminate_poll_case 2
 }
 
 ettun_terminal_interrupt_case() {
@@ -1811,6 +1893,9 @@ run_case kill-escalation kill_escalation_case
 run_case leader-missing leader_missing_case
 run_case ettun-session-reap-handoff ettun_session_reap_handoff_case
 run_case ettun-session-force-stop ettun_session_force_stop_case
+run_case ettun-indeterminate-poll ettun_indeterminate_poll_case
+run_case ettun-persistent-poll ettun_persistent_poll_case
+run_case ettun-revoked-poll ettun_revoked_poll_case
 run_case ettun-terminal-interrupt ettun_terminal_interrupt_case
 run_case ettun-session-signal-target ettun_session_signal_target_case
 run_case ettun-session-getsid-scope ettun_session_getsid_scope_case

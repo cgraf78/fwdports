@@ -526,6 +526,81 @@ pane_identity_case() {
   kill_test_server "$socket"
 }
 
+tmux_pane_wire_shapes_case() {
+  local tmp output error status shape
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" term || return 1
+  output=$tmp/output
+  error=$tmp/error
+
+  # Pin pane-liveness classification against exact tmux wire shapes. Only
+  # the display-message observation is synthetic; the server, session,
+  # nonce gate, and evidence are real. This covers the tmux 3.8 dead-pane
+  # shapes (empty pid once the pty closes; all-empty once reaped) on every
+  # tmux version CI installs, plus the fail-closed boundary for a numeric
+  # pid that is not the recorded leader. The snapshot override must stay
+  # inside the subshell: run_case does not unwind function definitions
+  # between cases.
+  while read -r shape; do
+    [[ -n $shape ]] || continue
+    set +e
+    (
+      _fwdports_tmux_pane_snapshot() {
+        case "$shape" in
+          dead38-empty-pid)
+            printf '%s\t%s\t\t%s\t1\n' \
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY" ;;
+          dead38-unreaped)
+            printf '%s\t%s\t\t%s\t0\n' \
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY" ;;
+          dead38-reaped) printf '\t\t\t\t\n' ;;
+          dead37-remain)
+            printf '%s\t%s\t%s\t%s\t1\n' \
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_LEADER" "$PROC_TTY" ;;
+          pid-drift)
+            printf '%s\t%s\t99999999\t%s\t0\n' \
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_TTY" ;;
+          live)
+            printf '%s\t%s\t%s\t%s\t0\n' \
+              "$PROC_SESSION" "$PROC_PANE" "$PROC_LEADER" "$PROC_TTY" ;;
+        esac
+      }
+      fwdports_tmux_verify_pane "$TMUX_BIN" "$PROC_SOCKET" \
+        "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+        >"$output" 2>"$error"
+    )
+    status=$?
+    set -e
+    case "$shape" in
+      pid-drift)
+        _assert_exit "pane wire [$shape]: fails closed" 2 "$status"
+        _assert_contains "pane wire [$shape]: reports identity change" \
+          "tmux pane identity changed" "$(<"$error")"
+        ;;
+      live)
+        _assert_exit "pane wire [$shape]: verifies live" 0 "$status"
+        _assert_eq "pane wire [$shape]: has no diagnostic" "" \
+          "$(<"$error")"
+        ;;
+      *)
+        _assert_exit "pane wire [$shape]: classifies dead" 1 "$status"
+        _assert_eq "pane wire [$shape]: has no diagnostic" "" \
+          "$(<"$error")"
+        ;;
+    esac
+    _assert_eq "pane wire [$shape]: emits no stdout" "" "$(<"$output")"
+  done <<'SHAPES'
+dead38-empty-pid
+dead38-unreaped
+dead38-reaped
+dead37-remain
+pid-drift
+live
+SHAPES
+
+  kill_test_server "$PROC_SOCKET"
+}
+
 term_owned_group_case() {
   local tmp output error status group_status
   tmp=$(_tmpdir) || return 1
@@ -1728,6 +1803,7 @@ list_panes_failure_case() {
 }
 
 run_case pane-identity pane_identity_case
+run_case tmux-pane-wire-shapes tmux_pane_wire_shapes_case
 run_case term-owned-group term_owned_group_case
 run_case already-exited-owned-group already_exited_owned_group_case
 run_case exited-before-escalation exited_before_escalation_case

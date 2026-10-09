@@ -563,7 +563,7 @@ fwdports_tmux_verify_pane() {
   local expected_tty expected_sid expected_pgid expected_parent expected_state
   local nonce recorded_nonce tmux_record session_id pane_id pane_pid pane_tty
   local pane_dead process_record parent_pid pgid sid process_tty process_state
-  local current_start
+  local current_start rest
 
   record=$(_fwdports_pane_evidence_read "$generation" "$expected_digest" \
     "$evidence") || return $?
@@ -586,15 +586,38 @@ fwdports_tmux_verify_pane() {
   }
   tmux_record=$(_fwdports_tmux_pane_snapshot "$tmux_path" "$socket" \
     "$expected_pane" 2>/dev/null) || return 1
-  IFS=$'\t' read -r session_id pane_id pane_pid pane_tty pane_dead \
-    <<<"$tmux_record"
+  # Split on tabs preserving empty fields. A plain `IFS=$'\t' read` cannot
+  # be used here: tab is IFS whitespace, so read collapses consecutive tabs
+  # and an empty pid field would shift the tty path into the pid slot. Since
+  # tmux 3.8 a dead pane reports an empty pid once its pty closes (and an
+  # all-empty snapshot once reaped), while pane_dead still reads 0 until the
+  # server reaps the child.
+  rest=$tmux_record$'\t'
+  session_id=${rest%%$'\t'*}; rest=${rest#*$'\t'}
+  pane_id=${rest%%$'\t'*}; rest=${rest#*$'\t'}
+  pane_pid=${rest%%$'\t'*}; rest=${rest#*$'\t'}
+  pane_tty=${rest%%$'\t'*}; rest=${rest#*$'\t'}
+  pane_dead=${rest%$'\t'}
+  if [[ -z $session_id && -z $pane_id ]]; then
+    # Since tmux 3.8, display-message against a dead pane succeeds with every
+    # pane format expanding to empty instead of failing. A pane tmux no
+    # longer identifies is ordinary liveness failure, not an ownership
+    # violation.
+    return 1
+  fi
   [[ $session_id == "$expected_session" && $pane_id == "$expected_pane" &&
     $pane_pid == "$expected_pid" && $pane_tty == "$expected_tty" &&
     $pane_dead == 0 ]] || {
-    # A pane retained by remain-on-exit is conclusively down. Other identity
-    # mismatches are ambiguous and therefore fail closed.
-    [[ $session_id == "$expected_session" && $pane_id == "$expected_pane" &&
-      $pane_dead == 1 ]] && return 1
+    # A pane retained by remain-on-exit is conclusively down. A live pane
+    # always reports a numeric pid, so a session/pane-matched pane whose
+    # pid is empty (tmux 3.8 clears it when the pty closes) is likewise
+    # down. Other identity mismatches are ambiguous and therefore fail
+    # closed.
+    if [[ $session_id == "$expected_session" &&
+      $pane_id == "$expected_pane" ]]; then
+      [[ $pane_dead == 1 ]] && return 1
+      [[ $pane_pid =~ ^[0-9]+$ ]] || return 1
+    fi
     printf 'fwdports: tmux pane identity changed\n' >&2
     return 2
   }

@@ -788,8 +788,10 @@ stock_et_lifecycle_case() {
     '  printf "TERM=%s\nTMPDIR=%s\n" "${TERM:-}" "${TMPDIR:-}"' \
     '  printf "ARG=%s\n" "$@"' \
     '} >"$FWDPORTS_TEST_ET_LOG"' \
+    "sleep ${1:-0}" \
     'target=${!#}' \
     'ssh "$target" "echo safe-bootstrap" >/dev/null' \
+    ': >"$FWDPORTS_TEST_ET_LOG.ready"' \
     'trap "exit 0" HUP INT TERM' \
     'while :; do sleep 0.02; done' >"$CASE_ET"
   chmod 0700 "$CASE_ET"
@@ -806,10 +808,17 @@ stock_et_lifecycle_case() {
   _assert_eq "stock ET lifecycle: summary names ET and the exact forward" \
     $'fwdports: started profile default\nfwdports: forwards\n  shell [et] remote 127.0.0.1:19090:127.0.0.1:9090' \
     "$COMMAND_OUTPUT"
-  while [[ ! -s $et_log && $index -lt 200 ]]; do
+  # ET writes its argv log before invoking SSH. Wait for the fixture's
+  # completion marker so bootstrap assertions cannot race the later SSH log.
+  while [[ ! -f $et_log.ready && $index -lt 500 ]]; do
     sleep 0.01
     index=$((index + 1))
   done
+  if [[ -f $et_log.ready ]]; then
+    _pass "stock ET lifecycle: SSH bootstrap completes"
+  else
+    _fail "stock ET lifecycle: SSH bootstrap timed out waiting for $et_log.ready (SSH log: $CASE_SSH_LOG)"
+  fi
   _assert_contains "stock ET lifecycle: runs without a terminal" \
     "ARG=--no-terminal" "$(<"$et_log")"
   _assert_contains "stock ET lifecycle: disables telemetry" \
@@ -831,6 +840,11 @@ stock_et_lifecycle_case() {
   run_fwdports "$output" stop
   _assert_exit "stock ET lifecycle: authenticated stop succeeds" 0 \
     "$COMMAND_STATUS"
+}
+
+delayed_stock_et_lifecycle_case() {
+  # Deliberate fixture latency separates ET argv publication from SSH startup.
+  stock_et_lifecycle_case 2
 }
 
 ettun_lifecycle_case() {
@@ -1317,6 +1331,7 @@ time.sleep(30)' >"$tmp/zombie.pid" 2>/dev/null &
 run_case process-stopped-helper process_stopped_helper_case
 run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case stock-et-lifecycle stock_et_lifecycle_case
+run_case delayed-stock-et-lifecycle delayed_stock_et_lifecycle_case
 run_case ettun-lifecycle ettun_lifecycle_case
 run_case configured-health configured_health_case
 run_case tmux-observability tmux_observability_case

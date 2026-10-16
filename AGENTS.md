@@ -75,10 +75,12 @@ parsed as records and never evaluated as shell.
 - The `ettun` driver (`lib/fwdports/drivers.sh`) string-matches three
   `ettun --help` lines (the `Usage:` line, `ettun VIA [--jump-host JUMP_HOST]`,
   and `Provider contract: remote-port-slot-v1`). A configured `transport`
-  adapter must answer ettun's adapter protocol: fwdports calls
-  `ADAPTER --fwdports-validate` and `ADAPTER --ettun-capabilities`, and reverse
-  routes require `connect-v2`. The ettun repo's AGENTS.md documents the same
-  contract from its side; change both together.
+  adapter must pass fwdports' own `ADAPTER --fwdports-validate` check
+  (`docs/design.md`; not part of ettun's protocol). fwdports also queries it
+  with ettun's `ADAPTER --ettun-capabilities` protocol: a failed or empty
+  answer is accepted for local-only routes, but reverse routes require
+  `connect-v2`. The ettun repo's AGENTS.md documents the `--help` and
+  capability contract from its side; change both together.
 
 ## Release
 

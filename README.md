@@ -13,9 +13,10 @@ picks a driver: plain OpenSSH `-L`/`-R` forwards, autossh, Eternal Terminal
 through an ET host, or a trusted local executable you provide.
 
 Re-running `fwdports` is idempotent: a live, healthy set of forwards is left
-alone, a dead or unhealthy set is rebuilt as a whole, and a changed
-configuration needs `--force`. Compared with a handful of `ssh -fN` or autossh commands, you
-get one place to see what is forwarded, whether each leg is alive, and whether
+alone, a dead or unhealthy set is rebuilt as a whole (unless every leg opts to
+`preserve` a still-live degraded set), and a changed configuration needs
+`--force`. Compared with a handful of `ssh -fN` or autossh commands, you get
+one place to see what is forwarded, whether each leg is alive, and whether
 each checked local port accepts connections.
 
 ## Install
@@ -127,9 +128,11 @@ reached a tunnel's final destination or exercised an application protocol.
 
 Built-in `ssh`, `autossh`, `et`, and `ettun` share the standard forward record
 names where their transport semantics overlap.
+
 The built-in drivers use the platform OpenSSH executable directly by default
 instead of an `ssh` wrapper found through PATH; `FWDPORTS_SSH_COMMAND` remains
 the explicit override.
+
 ET uses an explicit four-part network form. It accepts a direct host or one
 single-hop `ProxyJump` SSH alias; the destination and jump-host configurations
 and ET's two SSH call shapes are bound separately. `ProxyCommand`, multi-hop

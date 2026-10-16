@@ -72,11 +72,13 @@ parsed as records and never evaluated as shell.
   together with the files they check.
 - `retry-infrastructure.yml` keys on the workflow name `Tests`; don't rename it.
 - Changes to ET argv must pass the stock-ET gate, whose contract ettun shares.
-- The `ettun` driver string-matches three `ettun --help` lines (the `Usage:`
-  line, `ettun VIA [--jump-host JUMP_HOST]`, and
-  `Provider contract: remote-port-slot-v1`) and probes
-  `ettun --ettun-capabilities` (`lib/fwdports/drivers.sh`). The ettun repo's
-  AGENTS.md documents the same contract from its side; change both together.
+- The `ettun` driver (`lib/fwdports/drivers.sh`) string-matches three
+  `ettun --help` lines (the `Usage:` line, `ettun VIA [--jump-host JUMP_HOST]`,
+  and `Provider contract: remote-port-slot-v1`). A configured `transport`
+  adapter must answer ettun's adapter protocol: fwdports calls
+  `ADAPTER --fwdports-validate` and `ADAPTER --ettun-capabilities`, and reverse
+  routes require `connect-v2`. The ettun repo's AGENTS.md documents the same
+  contract from its side; change both together.
 
 ## Release
 

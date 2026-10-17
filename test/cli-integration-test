@@ -43,6 +43,20 @@ run_fwdports() {
   COMMAND_OUTPUT=$(<"$output")
 }
 
+# Assert that the last run_fwdports command exited 0, printing its output on
+# failure. Stop has many distinct exit-74 refusals and most print their own
+# stderr line, so a bare status leaves an intermittent failure opaque. A few
+# refuse silently; mark that explicitly so it narrows the search instead of
+# reading as lost output.
+_assert_command_ok() {
+  local description=$1
+  if [[ $COMMAND_STATUS -eq 0 ]]; then
+    _pass "$description"
+  else
+    _fail "$description (exit $COMMAND_STATUS: ${COMMAND_OUTPUT:-<no output>})"
+  fi
+}
+
 # A process fwdports just stopped can still answer kill -0 for a moment:
 # the signal may be in flight, or the exit may be sitting as an unreaped
 # zombie, which kill -0 reports as alive even though the product
@@ -98,11 +112,7 @@ configured_health_case() {
   done
   _assert_eq "CLI health: service success becomes healthy" healthy "$observed"
   PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
-  if [[ $COMMAND_STATUS -eq 0 ]]; then
-    _pass "CLI health: checked profile stops"
-  else
-    _fail "CLI health: checked profile stops (exit $COMMAND_STATUS: $COMMAND_OUTPUT)"
-  fi
+  _assert_command_ok "CLI health: checked profile stops"
 }
 
 tmux_observability_case() {
@@ -182,8 +192,7 @@ tmux_observability_case() {
     "$expected_record" "$attach_record"
 
   run_fwdports "$output" stop
-  _assert_exit "tmux observability: split-window profile stops cleanly" \
-    0 "$COMMAND_STATUS"
+  _assert_command_ok "tmux observability: split-window profile stops cleanly"
 }
 
 inspect_observability_case() {
@@ -284,8 +293,7 @@ inspect_observability_case() {
     "$generation_before" "$generation_after"
 
   PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
-  _assert_exit "inspect active: inspected profile stops cleanly" \
-    0 "$COMMAND_STATUS"
+  _assert_command_ok "inspect active: inspected profile stops cleanly"
 }
 
 inspect_builtin_backoff_case() {
@@ -337,7 +345,7 @@ inspect_builtin_backoff_case() {
     'transport: live' "$inspect_output"
 
   FWDPORTS_TEST_SSH_RUNS=$runs run_fwdports "$output" stop
-  _assert_exit "inspect SSH backoff: profile stops cleanly" 0 "$COMMAND_STATUS"
+  _assert_command_ok "inspect SSH backoff: profile stops cleanly"
 }
 
 write_external_driver() {
@@ -465,8 +473,7 @@ shared_external_driver_case() {
   FWDPORTS_TEST_EXTERNAL_STATE=$lifecycle_state \
     FWDPORTS_TEST_EXTERNAL_ORDER=$lifecycle_order \
     run_fwdports "$output" stop
-  _assert_exit "external driver reuse: authenticated stop succeeds" \
-    0 "$COMMAND_STATUS"
+  _assert_command_ok "external driver reuse: authenticated stop succeeds"
   cleanup_order=$(awk '/^(cleanup|term)-/ { print }' "$lifecycle_order")
   _assert_eq "external driver cleanup: pre-TERM hooks precede TERM and final hooks" \
     $'cleanup-before-term-second\ncleanup-before-term-first\nterm-first\nterm-second\ncleanup-after-term-second\ncleanup-after-term-first' \
@@ -705,8 +712,7 @@ force_dependency_preflight_preserves_active_case() {
       live/unverified "$observed"
 
     run_fwdports "$output" stop
-    _assert_exit "forced $driver preflight: cleanup succeeds" 0 \
-      "$COMMAND_STATUS"
+    _assert_command_ok "forced $driver preflight: cleanup succeeds"
   done
 }
 
@@ -838,8 +844,7 @@ stock_et_lifecycle_case() {
   _assert_eq "stock ET lifecycle: live pane is observable" live/unverified \
     "$COMMAND_OUTPUT"
   run_fwdports "$output" stop
-  _assert_exit "stock ET lifecycle: authenticated stop succeeds" 0 \
-    "$COMMAND_STATUS"
+  _assert_command_ok "stock ET lifecycle: authenticated stop succeeds"
 }
 
 delayed_stock_et_lifecycle_case() {
@@ -924,8 +929,7 @@ ettun_lifecycle_case() {
   _assert_eq "ettun lifecycle: configured listener check becomes healthy" \
     healthy "$observed"
   PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
-  _assert_exit "ettun lifecycle: authenticated stop succeeds" 0 \
-    "$COMMAND_STATUS"
+  _assert_command_ok "ettun lifecycle: authenticated stop succeeds"
 }
 
 symlink_config_target_override_case() {
@@ -956,8 +960,7 @@ symlink_config_target_override_case() {
     replacement.example.com "$(tail -n 1 "$CASE_SSH_LOG")"
 
   run_fwdports "$output" stop
-  _assert_exit "symlink config: authenticated stop succeeds" \
-    0 "$COMMAND_STATUS"
+  _assert_command_ok "symlink config: authenticated stop succeeds"
 }
 
 later_pane_failure_reaps_autossh_case() {
@@ -1084,8 +1087,7 @@ default_ssh_lifecycle_case() {
     "127.0.0.1:19090:127.0.0.1:9090" "$(<"$CASE_SSH_LOG")"
 
   run_fwdports "$output" stop
-  _assert_exit "CLI lifecycle: authenticated stop succeeds" 0 \
-    "$COMMAND_STATUS"
+  _assert_command_ok "CLI lifecycle: authenticated stop succeeds"
   _assert_eq "CLI lifecycle: stop reports final state" stopped \
     "$COMMAND_OUTPUT"
 
@@ -1120,8 +1122,7 @@ force_stale_pointer_rebuilds_case() {
   _assert_contains "force stale pointer: forwards summary present" \
     'shell [ssh] remote' "$COMMAND_OUTPUT"
   run_fwdports "$output" stop
-  _assert_exit "force stale pointer: rebuilt generation stops" 0 \
-    "$COMMAND_STATUS"
+  _assert_command_ok "force stale pointer: rebuilt generation stops"
 }
 
 force_unowned_session_rebuilds_case() {
@@ -1154,8 +1155,7 @@ force_unowned_session_rebuilds_case() {
   _assert_contains "force unowned session: forwards summary present" \
     'shell [ssh] remote' "$COMMAND_OUTPUT"
   run_fwdports "$output" stop
-  _assert_exit "force unowned session: rebuilt generation stops" 0 \
-    "$COMMAND_STATUS"
+  _assert_command_ok "force unowned session: rebuilt generation stops"
 }
 
 force_residual_listener_rebuilds_case() {
@@ -1234,8 +1234,7 @@ except OSError:
     _assert_contains "force residual listener: forwards summary present" \
       'shell [ssh] local' "$COMMAND_OUTPUT"
     run_fwdports "$output" stop
-    _assert_exit "force residual listener: rebuilt generation stops" 0 \
-      "$COMMAND_STATUS"
+    _assert_command_ok "force residual listener: rebuilt generation stops"
   else
     if [[ $COMMAND_STATUS -ne 0 ]]; then
       _pass "force residual listener: fails without owner resolution"
@@ -1282,8 +1281,7 @@ force_rebuilds_healthy_generation_case() {
   _assert_contains "force healthy rebuild: forwards summary present" \
     'shell [ssh] remote' "$COMMAND_OUTPUT"
   run_fwdports "$output" stop
-  _assert_exit "force healthy rebuild: rebuilt generation stops" 0 \
-    "$COMMAND_STATUS"
+  _assert_command_ok "force healthy rebuild: rebuilt generation stops"
 }
 
 process_stopped_helper_case() {

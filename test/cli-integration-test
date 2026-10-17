@@ -44,14 +44,16 @@ run_fwdports() {
 }
 
 # Assert that the last run_fwdports command exited 0, printing its output on
-# failure. Stop has many distinct exit-74 refusals, and only the stderr line
-# says which one fired; a bare status leaves an intermittent failure opaque.
+# failure. Stop has many distinct exit-74 refusals and most print their own
+# stderr line, so a bare status leaves an intermittent failure opaque. A few
+# refuse silently; mark that explicitly so it narrows the search instead of
+# reading as lost output.
 _assert_command_ok() {
   local description=$1
   if [[ $COMMAND_STATUS -eq 0 ]]; then
     _pass "$description"
   else
-    _fail "$description (exit $COMMAND_STATUS: $COMMAND_OUTPUT)"
+    _fail "$description (exit $COMMAND_STATUS: ${COMMAND_OUTPUT:-<no output>})"
   fi
 }
 

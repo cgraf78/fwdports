@@ -5,14 +5,19 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Termux-lightgrey.svg)](#)
 
-`fwdports` keeps a declared set of port forwards alive in one inspectable tmux
-session. It uses the platform OpenSSH executable directly by default instead
-of an `ssh` wrapper found through PATH; `FWDPORTS_SSH_COMMAND` remains the
-explicit override. It supports autossh when explicitly selected, supports
-Eternal Terminal 7.0.0 or newer for resilient direct-host tunnels, supports
-the public `ettun` relay engine for destinations reached through an ET host,
-and lets trusted local executables provide other transport drivers without
-putting consumer policy in the core.
+`fwdports` keeps the port forwards you depend on declared in one config file
+and running in one tmux session you can `attach` to and `inspect`. Each leg
+picks a driver: plain OpenSSH `-L`/`-R` forwards, autossh, Eternal Terminal
+7.0.0 or newer for resilient direct-host tunnels,
+[ettun](https://github.com/cgraf78/ettun) relays for destinations reached
+through an ET host, or a trusted local executable you provide.
+
+Re-running `fwdports` is idempotent: a live, healthy set of forwards is left
+alone, a dead or unhealthy set is rebuilt as a whole (unless every leg opts to
+`preserve` a still-live degraded set), and a changed configuration needs
+`--force`. Compared with a handful of `ssh -fN` or autossh commands, you get
+one place to see what is forwarded, whether each leg is alive, and whether
+each checked local port accepts connections.
 
 ## Install
 
@@ -123,6 +128,11 @@ reached a tunnel's final destination or exercised an application protocol.
 
 Built-in `ssh`, `autossh`, `et`, and `ettun` share the standard forward record
 names where their transport semantics overlap.
+
+The built-in drivers use the platform OpenSSH executable directly by default
+instead of an `ssh` wrapper found through PATH; `FWDPORTS_SSH_COMMAND` remains
+the explicit override.
+
 ET uses an explicit four-part network form. It accepts a direct host or one
 single-hop `ProxyJump` SSH alias; the destination and jump-host configurations
 and ET's two SSH call shapes are bound separately. `ProxyCommand`, multi-hop

@@ -1100,6 +1100,32 @@ _fwdports_verify_owned_session() {
   printf '%s\t%s\t%s\n' "$leader" "$leader" "$expected_pgid"
 }
 
+# Session authentication at a signal boundary is one process snapshot: a
+# single indeterminate scan (a member exiting while `ps` walks the table)
+# fails it even when the next scan would succeed — the stale-read race the
+# stop gate already retries. The verifier collapses every failure to one
+# status, so retry any failed authentication within the caller's existing
+# termination bound; a signal still requires one complete, fresh
+# verification success, and a persistent failure fails closed with its
+# diagnostic.
+_fwdports_verify_owned_session_bounded() {
+  local generation=$1 digest=$2 evidence=$3 attempts=$4 delay=$5
+  local scope attempt=0
+
+  while true; do
+    if scope=$(_fwdports_verify_owned_session "$generation" "$digest" \
+      "$evidence"); then
+      printf '%s\n' "$scope"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [[ $attempt -ge $attempts ]]; then
+      return 1
+    fi
+    sleep "$delay"
+  done
+}
+
 _fwdports_lifecycle_allows_stop() {
   local root=$1 pointer_kind=$2 generation=$3 digest=$4 pointer control_record
   local phase desired
@@ -1260,8 +1286,8 @@ _fwdports_tmux_terminate_ettun_session() {
     return 74
   fi
 
-  scope=$(_fwdports_verify_owned_session "$generation" "$digest" \
-    "$evidence") || return 74
+  scope=$(_fwdports_verify_owned_session_bounded "$generation" "$digest" \
+    "$evidence" "$attempts" "$delay") || return 74
   IFS=$'\t' read -r leader sid _ <<<"$scope"
   _fwdports_lifecycle_allows_stop "$root" "$pointer_kind" \
     "$generation" "$digest" || return 74
@@ -1324,8 +1350,8 @@ _fwdports_tmux_terminate_ettun_session() {
     printf 'fwdports: pane ownership changed before the second interrupt\n' >&2
     return 74
   fi
-  scope=$(_fwdports_verify_owned_session "$generation" "$digest" \
-    "$evidence") || return 74
+  scope=$(_fwdports_verify_owned_session_bounded "$generation" "$digest" \
+    "$evidence" "$attempts" "$delay") || return 74
   IFS=$'\t' read -r leader sid _ <<<"$scope"
   # Session inspection can outlive the stop request; recheck authority at
   # the signal boundary just as the first interrupt does.

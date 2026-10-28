@@ -888,6 +888,125 @@ precleanup_transient_gate_retry_case() {
     "$generation"
 }
 
+decisive_revalidation_transient_retry_case() {
+  local tmp fixture root generation digest events status count_file error
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  count_file=$tmp/verify-count
+  error=$tmp/error
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+  : >"$events"
+  printf '0\n' >"$count_file"
+
+  # The gate's retry does not cover the decisive revalidation after the
+  # cleanup hooks: one indeterminate observation there (scheduled run
+  # 40656774988) aborted a healthy stop. Fail only the first decisive
+  # observation; the counter is file-backed because the revalidation runs
+  # in a subshell.
+  fwdports_tmux_verify_pane() { return 0; }
+  _fwdports_verify_owned_group() {
+    local count
+    count=$(<"$FWDPORTS_TEST_VERIFY_COUNT")
+    printf '%s\n' "$((count + 1))" >"$FWDPORTS_TEST_VERIFY_COUNT"
+    if [[ $count -eq 1 ]]; then
+      printf 'fwdports: test transient decisive observation\n' >&2
+      return 2
+    fi
+    printf '1\n'
+  }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    FWDPORTS_TEST_VERIFY_COUNT=$count_file \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 5 0 >/dev/null 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "decisive revalidation retry: transient observation stops" \
+    0 "$status"
+  _assert_eq "decisive revalidation retry: preserves cleanup order" \
+    $'cleanup\nterminate\ncleanup\nremove-session' "$(<"$events")"
+  _assert_eq "decisive revalidation retry: revalidates after the stale read" \
+    3 "$(<"$count_file")"
+  _assert_contains "decisive revalidation retry: keeps the diagnostic" \
+    "test transient decisive observation" "$(<"$error")"
+  _assert_not_exists "decisive revalidation retry: removes generation" \
+    "$generation"
+}
+
+decisive_revalidation_persistent_case() {
+  local tmp fixture root generation digest events status count_file error
+  tmp=$(_tmpdir) || return 1
+  fixture=$(controller_fixture "$tmp" example) || return 1
+  IFS=$'\t' read -r root generation digest <<<"$fixture"
+  events=$tmp/events
+  count_file=$tmp/verify-count
+  error=$tmp/error
+  mkdir -p "$generation/legs/web"
+  chmod 0700 "$generation/legs" "$generation/legs/web"
+  : >"$generation/legs/web/pane"
+  : >"$events"
+  printf '0\n' >"$count_file"
+
+  # A decisive revalidation that never recovers must exhaust the caller's
+  # bound and still fail closed: no termination, generation retained.
+  fwdports_tmux_verify_pane() { return 0; }
+  _fwdports_verify_owned_group() {
+    local count
+    count=$(<"$FWDPORTS_TEST_VERIFY_COUNT")
+    printf '%s\n' "$((count + 1))" >"$FWDPORTS_TEST_VERIFY_COUNT"
+    if [[ $count -ge 1 ]]; then
+      printf 'fwdports: test persistent decisive observation\n' >&2
+      return 2
+    fi
+    printf '1\n'
+  }
+  _fwdports_cleanup_generation_drivers() {
+    printf 'cleanup\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    FWDPORTS_TEST_VERIFY_COUNT=$count_file \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" "$root" \
+    pending "$generation" "$digest" fwdports 3 0 >/dev/null 2>"$error"
+  status=$?
+  set -e
+
+  _assert_exit "decisive revalidation persistent: stop fails closed" 74 \
+    "$status"
+  _assert_eq "decisive revalidation persistent: sends no termination" \
+    cleanup "$(<"$events")"
+  _assert_eq "decisive revalidation persistent: exhausts the bound" 4 \
+    "$(<"$count_file")"
+  _assert_contains "decisive revalidation persistent: keeps diagnostic" \
+    "test persistent decisive observation" "$(<"$error")"
+  _assert_file "decisive revalidation persistent: preserves generation" \
+    "$generation/manifest"
+  _assert_file "decisive revalidation persistent: preserves pointer" \
+    "$root/pending"
+}
+
 darwin_dead_ettun_scope_case() {
   local tmp fixture root generation digest evidence rewritten output scope_arg
   local status
@@ -960,4 +1079,7 @@ run_case precleanup-stops-pane precleanup_stops_pane_case
 run_case precleanup-revalidation-ambiguity \
   precleanup_revalidation_ambiguity_case
 run_case precleanup-transient-gate-retry precleanup_transient_gate_retry_case
+run_case decisive-revalidation-transient-retry \
+  decisive_revalidation_transient_retry_case
+run_case decisive-revalidation-persistent decisive_revalidation_persistent_case
 _test_summary

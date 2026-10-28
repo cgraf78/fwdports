@@ -954,6 +954,94 @@ ettun_revoked_poll_case() {
   ettun_indeterminate_poll_case 2
 }
 
+ettun_transient_session_verify_case() {
+  local tmp output error status persistent=${1:-0} count
+  tmp=$(_tmpdir) || return 1
+  termination_fixture "$tmp" ettun-interrupt-force || return 1
+  output=$tmp/output
+  error=$tmp/error
+  count=$tmp/verify-count
+  printf '0\n' >"$count"
+
+  set +e
+  (
+    local definition
+    definition=$(declare -f _fwdports_verify_owned_session)
+    eval "${definition/_fwdports_verify_owned_session/_test_verify_session}"
+
+    # Session authentication at the signal boundary is a single process
+    # snapshot: one indeterminate scan (scheduled run 40656774988) failed
+    # it even though the pane was healthy. The bounded authentication
+    # absorbs one stale scan — at the first authentication (mode 0) or at
+    # the re-authentication before the second interrupt (mode 2); a
+    # persistent failure (mode 1) still fails closed before any interrupt
+    # is delivered. The counter is file-backed because authentication
+    # runs in a subshell.
+    _fwdports_verify_owned_session() {
+      local current
+      current=$(<"$count")
+      printf '%s\n' "$((current + 1))" >"$count"
+      if [[ $persistent -eq 1 ]] ||
+        [[ $persistent -eq 0 && $current -eq 0 ]] ||
+        [[ $persistent -eq 2 && $current -eq 1 ]]; then
+        printf 'fwdports: cannot inspect the recorded process session\n' \
+          >&2
+        return 2
+      fi
+      _test_verify_session "$@"
+    }
+    fwdports_tmux_terminate_pane "$TMUX_BIN" "$PROC_SOCKET" "$PROC_ROOT" \
+      active "$PROC_GENERATION" "$PROC_DIGEST" "$PROC_EVIDENCE" \
+      20 0.02 ettun-session >"$output" 2>"$error"
+  )
+  status=$?
+  set -e
+  if [[ $persistent -eq 1 ]]; then
+    _assert_exit \
+      "ettun session verify: persistent inspection fails closed" 74 \
+      "$status"
+    _assert_not_exists \
+      "ettun session verify: failed authentication sends no interrupt" \
+      "$PROC_CHILD_MARKER"
+    _assert_contains \
+      "ettun session verify: persistent failure keeps the diagnostic" \
+      "cannot inspect the recorded process session" "$(<"$error")"
+    _assert_eq "ettun session verify: exhausts the caller's bound" 20 \
+      "$(<"$count")"
+    _assert_file "ettun session verify: preserves the generation" \
+      "$PROC_GENERATION/manifest"
+    if kill -0 "$PROC_LEADER" 2>/dev/null; then
+      _pass "ettun session verify: failed authentication spares the leader"
+    else
+      _fail "ettun session verify: failed authentication spares the leader"
+    fi
+  else
+    _assert_exit \
+      "ettun session verify: transient inspection still cleans up" 0 \
+      "$status"
+    _assert_eq "ettun session verify: delivers both interrupts" 2 \
+      "$(<"$PROC_CHILD_MARKER")"
+    _assert_eq "ettun session verify: reports completed cleanup" term \
+      "$(<"$output")"
+    _assert_eq "ettun session verify: keeps the absorbed diagnostic" \
+      "fwdports: cannot inspect the recorded process session" \
+      "$(<"$error")"
+    _assert_eq "ettun session verify: retries exactly one stale scan" 3 \
+      "$(<"$count")"
+  fi
+
+  kill -KILL -- "-$PROC_CHILD" 2>/dev/null || true
+  kill_test_server "$PROC_SOCKET"
+}
+
+ettun_persistent_session_verify_case() {
+  ettun_transient_session_verify_case 1
+}
+
+ettun_second_session_verify_case() {
+  ettun_transient_session_verify_case 2
+}
+
 ettun_terminal_interrupt_case() {
   local tmp output error status worker_alive=0
   tmp=$(_tmpdir) || return 1
@@ -1896,6 +1984,10 @@ run_case ettun-session-force-stop ettun_session_force_stop_case
 run_case ettun-indeterminate-poll ettun_indeterminate_poll_case
 run_case ettun-persistent-poll ettun_persistent_poll_case
 run_case ettun-revoked-poll ettun_revoked_poll_case
+run_case ettun-transient-session-verify ettun_transient_session_verify_case
+run_case ettun-persistent-session-verify \
+  ettun_persistent_session_verify_case
+run_case ettun-second-session-verify ettun_second_session_verify_case
 run_case ettun-terminal-interrupt ettun_terminal_interrupt_case
 run_case ettun-session-signal-target ettun_session_signal_target_case
 run_case ettun-session-getsid-scope ettun_session_getsid_scope_case

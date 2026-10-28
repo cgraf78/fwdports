@@ -522,8 +522,24 @@ _fwdports_stop_generation_locked() {
   index=0
   for evidence in ${pane_evidence[@]+"${pane_evidence[@]}"}; do
     strategy=${pane_strategies[index]}
-    pane_state=$(_fwdports_stop_pane_state "$tmux_path" "$socket" \
-      "$generation" "$digest" "$evidence" "$strategy") || return 74
+    # The gate above retries a stale observation within the caller's bound,
+    # but this decisive revalidation ran exactly once, so a single
+    # indeterminate snapshot after the cleanup hooks — the ettun stop in
+    # scheduled run 40656774988 — aborted a healthy stop. Give the
+    # revalidation the same bounded retry; a persistent mismatch still
+    # fails closed with its diagnostic.
+    gate_attempt=0
+    while true; do
+      if pane_state=$(_fwdports_stop_pane_state "$tmux_path" "$socket" \
+        "$generation" "$digest" "$evidence" "$strategy"); then
+        break
+      fi
+      gate_attempt=$((gate_attempt + 1))
+      if [[ $gate_attempt -ge $attempts ]]; then
+        return 74
+      fi
+      sleep "$delay"
+    done
     case "$pane_state" in
       live)
         fwdports_tmux_terminate_pane "$tmux_path" "$socket" "$root" \

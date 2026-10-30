@@ -86,8 +86,7 @@ fwdports: forwards
 ```
 
 The same compact summary is printed when a matching start is a no-churn
-success, so it still describes the active generation. `fwdports status`
-remains a single machine-friendly state token. A profile with no standard
+success, so it still describes the active generation. A profile with no standard
 forward records says so explicitly; an executable driver may still implement
 additional behavior through its own manifest keys.
 
@@ -115,8 +114,19 @@ The private server overrides only lifecycle-critical tmux settings:
 disconnects, while `exit-empty` retires the server after its last owned session
 ends.
 
-`fwdports status` intentionally remains a single machine-readable state token.
-For interactive diagnosis, `fwdports inspect` authenticates the active
+`fwdports status` prints the overall state token on its first line. While a
+generation is active, one line per leg follows in declaration order, so a
+partial outage shows which legs are still healthy:
+
+```text
+down
+  web [ssh]: healthy
+  api [ettun]: down (pane exited)
+  db [ssh]: degraded (failing: db-listener)
+```
+
+Scripts that only need the overall state can read the first line. For deeper
+diagnosis, `fwdports inspect` authenticates the active
 generation and reports the overall state, controller and transport pane/window
 identities, per-leg supervisor or driver liveness, declared standard forwards,
 and a bounded point-in-time result for each configured check. Checks are

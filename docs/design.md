@@ -227,10 +227,26 @@ retry loop.
 
 Process or monitor liveness is never reported as endpoint health.
 
-`status` prints exactly one vocabulary token for scripts when it can determine
+`status` prints one vocabulary token on its first line when it can determine
 state: it exits 0, or 1 for `unowned-session`. When state cannot be
 authenticated or a dependency is missing, it prints no token and exits nonzero,
 for example 74 for unauthenticated state or 69 when tmux is unavailable.
+
+For an active running generation (`healthy`, `live/unverified`, `degraded`,
+`down`, or `controller-down`), one `  LEG [DRIVER]: STATE` line per leg
+follows in manifest order, and is printed only if the generation stayed active
+while it was observed. A leg's state uses the same vocabulary, scoped to that
+leg:
+
+- `healthy`: the leg is live and each of its checks passes.
+- `live/unverified`: the leg is live and has no configured check.
+- `degraded (failing: LABEL, ...)`: the leg is live but the named checks fail.
+- `down (pane exited)`, `down (driver-reported)`, or `down (no pane)`: the
+  leg's pane is dead, its external driver reports it not live, or no pane was
+  published.
+
+Leg checks are point-in-time local TCP connects like `inspect`'s, so a leg can
+briefly disagree with the controller-published overall token.
 
 `inspect` is the human-readable companion: it authenticates the active pointer
 and manifest before emitting a report, then shows controller and leg tmux

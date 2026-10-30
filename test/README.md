@@ -59,8 +59,8 @@ worker that survives pane-leader exit and loses its tty remains observable.
 `cli-integration-test` uses a real isolated tmux server and a harmless fake SSH
 transport to exercise the installed command path from start through status and
 authenticated stop. It also verifies labeled, evenly sized transport panes and
-the separate controller window, plus the authenticated human inspection report
-without weakening status's one-token contract. `tmux-integration-test`
+the separate controller window, the authenticated human inspection report, and
+status's per-leg lines during a partial outage. `tmux-integration-test`
 supplies a temporary normal tmux configuration to prove that mouse and
 copy-mode preferences reach the isolated server. `driver-api-test` keeps
 external consumers on the fixed argv/file boundary. `examples-test` reads

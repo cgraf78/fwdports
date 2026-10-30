@@ -105,12 +105,14 @@ configured_health_case() {
     PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
       FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
       FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" status
-    observed=$COMMAND_OUTPUT
+    observed=${COMMAND_OUTPUT%%$'\n'*}
     [[ $observed == healthy ]] && break
     sleep 0.01
     index=$((index + 1))
   done
   _assert_eq "CLI health: service success becomes healthy" healthy "$observed"
+  _assert_eq "CLI health: status reports the leg's health" \
+    $'healthy\n  shell [ssh]: healthy' "$COMMAND_OUTPUT"
   PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
   _assert_command_ok "CLI health: checked profile stops"
 }
@@ -230,7 +232,7 @@ inspect_observability_case() {
     PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
       FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
       FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" status
-    observed=$COMMAND_OUTPUT
+    observed=${COMMAND_OUTPUT%%$'\n'*}
     [[ $observed == degraded ]] && break
     sleep 0.01
     index=$((index + 1))
@@ -286,8 +288,9 @@ inspect_observability_case() {
   PATH="$tmp/bin:$PATH" run_fwdports "$output" status
   _assert_exit "inspect active: machine status still succeeds" \
     0 "$COMMAND_STATUS"
-  _assert_eq "inspect active: machine status remains one token" \
-    degraded "$COMMAND_OUTPUT"
+  _assert_eq "inspect active: status separates healthy and degraded legs" \
+    $'degraded\n  web [ssh]: healthy\n  api [ssh]: degraded (failing: api-listener)' \
+    "$COMMAND_OUTPUT"
   generation_after=$(basename "$CASE_STATE/fwdports/generations"/*)
   _assert_eq "inspect active: report does not churn generation" \
     "$generation_before" "$generation_after"
@@ -462,7 +465,8 @@ shared_external_driver_case() {
   run_fwdports "$output" status
   _assert_exit "external driver reuse: status succeeds" 0 "$COMMAND_STATUS"
   _assert_eq "external driver reuse: both panes remain live" \
-    live/unverified "$COMMAND_OUTPUT"
+    $'live/unverified\n  first [example]: live/unverified\n  second [example]: live/unverified' \
+    "$COMMAND_OUTPUT"
   run_fwdports "$output" inspect
   _assert_exit "external driver inspect: human report succeeds" \
     0 "$COMMAND_STATUS"
@@ -519,6 +523,76 @@ setup_case_root() {
     'trap "exit 0" INT TERM HUP' \
     'while :; do sleep 1; done' >"$CASE_SSH"
   chmod 0700 "$CASE_SSH"
+}
+
+status_per_leg_case() {
+  local tmp config output driver generation exited_pid index=0
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  driver=$CASE_CONFIG/fwdports/drivers.d/probe
+  mkdir -p "${driver%/*}"
+  chmod 0700 "${driver%/*}"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "${1:-}" in' \
+    '  api-version) printf "1\n" ;;' \
+    '  validate | prepare | cleanup) : ;;' \
+    '  run)' \
+    '    trap "exit 0" HUP INT TERM' \
+    '    printf "%s\n" "$$" >"$4/run.pid"' \
+    '    while :; do sleep 0.1; done' \
+    '    ;;' \
+    '  is-live) [[ -e $4/report-down ]] && exit 1; exit 0 ;;' \
+    '  *) exit 64 ;;' \
+    'esac' \
+    >"$driver"
+  chmod 0700 "$driver"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$tmp/bin/nc"
+  chmod 0700 "$tmp/bin/nc"
+  printf '%s\n' \
+    'profile default' \
+    'leg alive probe' \
+    'check alive loopback 18080 alive-listener' \
+    'leg reported probe' \
+    'leg exited probe' >"$config"
+  chmod 0600 "$config"
+
+  PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
+    FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
+    FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" start
+  _assert_command_ok "status per leg: three-leg profile starts"
+  generation=$(printf '%s\n' "$CASE_STATE/fwdports/generations"/*)
+  while [[ $index -lt 200 ]]; do
+    PATH="$tmp/bin:$PATH" run_fwdports "$output" status
+    [[ ${COMMAND_OUTPUT%%$'\n'*} == healthy &&
+      -s $generation/legs/exited/run.pid ]] && break
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_eq "status per leg: every live leg is reported" \
+    $'healthy\n  alive [probe]: healthy\n  reported [probe]: live/unverified\n  exited [probe]: live/unverified' \
+    "$COMMAND_OUTPUT"
+
+  : >"$generation/legs/reported/report-down"
+  exited_pid=$(<"$generation/legs/exited/run.pid")
+  kill -TERM "$exited_pid"
+  index=0
+  while [[ $index -lt 200 ]]; do
+    PATH="$tmp/bin:$PATH" run_fwdports "$output" status
+    [[ $COMMAND_OUTPUT == *'exited [probe]: down'* ]] && break
+    sleep 0.01
+    index=$((index + 1))
+  done
+  _assert_exit "status per leg: partial outage status succeeds" \
+    0 "$COMMAND_STATUS"
+  _assert_eq "status per leg: healthy leg stays visible beside down legs" \
+    $'down\n  alive [probe]: healthy\n  reported [probe]: down (driver-reported)\n  exited [probe]: down (pane exited)' \
+    "$COMMAND_OUTPUT"
+
+  PATH="$tmp/bin:$PATH" run_fwdports "$output" stop
+  _assert_command_ok "status per leg: partially down profile stops"
 }
 
 later_builtin_dependency_failure_case() {
@@ -705,7 +779,7 @@ force_dependency_preflight_preserves_active_case() {
       "$CASE_STATE/fwdports/pending"
 
     run_fwdports "$output" status
-    observed=$COMMAND_OUTPUT
+    observed=${COMMAND_OUTPUT%%$'\n'*}
     _assert_exit "forced $driver preflight: old generation remains observable" \
       0 "$COMMAND_STATUS"
     _assert_eq "forced $driver preflight: old transport remains live" \
@@ -842,7 +916,7 @@ stock_et_lifecycle_case() {
   run_fwdports "$output" status
   _assert_exit "stock ET lifecycle: status succeeds" 0 "$COMMAND_STATUS"
   _assert_eq "stock ET lifecycle: live pane is observable" live/unverified \
-    "$COMMAND_OUTPUT"
+    "${COMMAND_OUTPUT%%$'\n'*}"
   run_fwdports "$output" stop
   _assert_command_ok "stock ET lifecycle: authenticated stop succeeds"
 }
@@ -921,7 +995,7 @@ ettun_lifecycle_case() {
     PATH="$tmp/bin:$PATH" FWDPORTS_CONTROLLER_TICK_SECONDS=0.01 \
       FWDPORTS_HEALTH_STARTUP_GRACE_TICKS=1 \
       FWDPORTS_HEALTH_INTERVAL_TICKS=1 run_fwdports "$output" status
-    observed=$COMMAND_OUTPUT
+    observed=${COMMAND_OUTPUT%%$'\n'*}
     [[ $observed == healthy ]] && break
     sleep 0.01
     index=$((index + 1))
@@ -1073,7 +1147,7 @@ default_ssh_lifecycle_case() {
   fi
 
   run_fwdports "$output" status
-  status_output=$COMMAND_OUTPUT
+  status_output=${COMMAND_OUTPUT%%$'\n'*}
   _assert_exit "CLI lifecycle: status succeeds" 0 "$COMMAND_STATUS"
   _assert_eq "CLI lifecycle: unchecked live tunnel is not called healthy" \
     "live/unverified" "$status_output"
@@ -1343,6 +1417,7 @@ run_case force-dependency-preflight-preserves-active \
 run_case stopping-recovery-precedes-dependency-preflight \
   stopping_recovery_precedes_dependency_preflight_case
 run_case shared-external-driver shared_external_driver_case
+run_case status-per-leg status_per_leg_case
 run_case symlink-config-target-override symlink_config_target_override_case
 run_case later-pane-failure-reaps-autossh \
   later_pane_failure_reaps_autossh_case

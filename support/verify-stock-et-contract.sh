@@ -22,7 +22,7 @@ version=$(LC_ALL=C "$et_path" --version 2>&1) ||
   fail 'publisher artifact is not ET 7.0.0'
 help=$(LC_ALL=C "$et_path" --help 2>&1) || fail 'help query failed'
 for option in --port --tunnel --reversetunnel --jumphost --no-terminal --logdir \
-  --logtostdout --telemetry; do
+  --logtostdout --telemetry --keepalive --terminal-path --command; do
   [[ $help == *"$option"* ]] || fail "missing required option: $option"
 done
 
@@ -30,6 +30,7 @@ tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/fwdports-stock-et.XXXXXXXX") ||
   fail 'cannot create temporary root'
 et_pid=
 listener_pid=
+listener_count=0
 cleanup() {
   [[ -z ${et_pid:-} ]] || kill -KILL "$et_pid" 2>/dev/null || true
   [[ -z ${et_pid:-} ]] || wait "$et_pid" 2>/dev/null || true
@@ -87,71 +88,104 @@ with open(sys.argv[2], "w", encoding="ascii") as output:
 time.sleep(30)
 connection.close()
 PY
-python3 "$tmp_root/listener.py" "$tmp_root/port" "$tmp_root/accepted" &
-listener_pid=$!
-for ((_attempt = 0; _attempt < 200; _attempt++)); do
-  [[ ! -s $tmp_root/port ]] || break
-  kill -0 "$listener_pid" 2>/dev/null || fail 'loopback peer exited early'
-  sleep 0.05
-done
-[[ -s $tmp_root/port ]] || fail 'loopback peer did not publish its port'
-read -r port local_port remote_port <"$tmp_root/port" ||
-  fail 'loopback peer published invalid ports'
-[[ -n $port && -n $local_port && -n $remote_port ]] ||
-  fail 'loopback peer did not publish three ports'
+# Run the real client once against a fresh silent peer, with both tunnel
+# option forms. case_prefix and case_suffix hold the options under test around
+# the tunnels; expected_terminal is the terminal path the SSH bootstrap must
+# run, or empty for ET's default.
+run_stock_et() {
+  local label=$1 case_root
+  listener_count=$((listener_count + 1))
+  case_root=$tmp_root/case-$listener_count
+  mkdir -p "$case_root" || fail "$label: cannot create case root"
+  python3 "$tmp_root/listener.py" "$case_root/port" "$case_root/accepted" &
+  listener_pid=$!
+  for ((_attempt = 0; _attempt < 200; _attempt++)); do
+    [[ ! -s $case_root/port ]] || break
+    kill -0 "$listener_pid" 2>/dev/null || fail "$label: loopback peer exited early"
+    sleep 0.05
+  done
+  [[ -s $case_root/port ]] || fail "$label: loopback peer did not publish its port"
+  read -r port local_port remote_port <"$case_root/port" ||
+    fail "$label: loopback peer published invalid ports"
+  [[ -n $port && -n $local_port && -n $remote_port ]] ||
+    fail "$label: loopback peer did not publish three ports"
 
-HOME=$tmp_root/home PATH=$tmp_root/bin:/usr/bin:/bin \
-  TERM=xterm-256color TMPDIR=$tmp_root/tmp \
-  FWDPORTS_STOCK_ET_SSH_LOG=$tmp_root/ssh-argv \
-  "$et_path" --no-terminal --logdir "$tmp_root/log" --logtostdout \
-  --telemetry=false --port "$port" \
-  --tunnel "127.0.0.1:$local_port:127.0.0.1:80" \
-  --reversetunnel "127.0.0.1:$remote_port:127.0.0.1:81" \
-  127.0.0.1 >"$tmp_root/et-output" 2>&1 &
-et_pid=$!
+  HOME=$tmp_root/home PATH=$tmp_root/bin:/usr/bin:/bin \
+    TERM=xterm-256color TMPDIR=$tmp_root/tmp \
+    FWDPORTS_STOCK_ET_SSH_LOG=$case_root/ssh-argv \
+    "$et_path" --logdir "$tmp_root/log" --logtostdout \
+    --telemetry=false --port "$port" \
+    ${case_prefix[@]+"${case_prefix[@]}"} \
+    --tunnel "127.0.0.1:$local_port:127.0.0.1:80" \
+    --reversetunnel "127.0.0.1:$remote_port:127.0.0.1:81" \
+    ${case_suffix[@]+"${case_suffix[@]}"} \
+    127.0.0.1 >"$case_root/et-output" 2>&1 &
+  et_pid=$!
 
-for ((_attempt = 0; _attempt < 200; _attempt++)); do
-  [[ ! -s $tmp_root/ssh-argv || ! -s $tmp_root/accepted ]] || break
-  kill -0 "$et_pid" 2>/dev/null || break
-  sleep 0.05
-done
-[[ -s $tmp_root/ssh-argv ]] || {
-  sed -n '1,120p' "$tmp_root/et-output" >&2
-  fail 'real ET did not invoke the PATH ssh shim'
-}
-[[ -s $tmp_root/accepted ]] || fail 'real ET did not reach its configured port'
-
-line_count=$(wc -l <"$tmp_root/ssh-argv")
-line_count=${line_count//[[:space:]]/}
-[[ $line_count == 3 && $(sed -n '1p' "$tmp_root/ssh-argv") == CALL ]] ||
-  fail 'real ET did not make exactly one two-argument SSH bootstrap'
-destination=$(sed -n '2s/^ARG=//p' "$tmp_root/ssh-argv")
-remote_command=$(sed -n '3s/^ARG=//p' "$tmp_root/ssh-argv")
-[[ $destination == *@127.0.0.1 ]] ||
-  fail 'real ET SSH destination shape changed'
-[[ $remote_command == *etterminal* &&
-  $remote_command == *xterm-256color* ]] ||
-  fail 'real ET remote bootstrap shape changed'
-
-# The silent peer should hold the client in its foreground reconnect lifetime.
-# Observe a short stable interval before TERM so an already-exited client can
-# never satisfy the shutdown assertion below.
-for ((_attempt = 0; _attempt < 5; _attempt++)); do
-  kill -0 "$et_pid" 2>/dev/null || {
-    sed -n '1,120p' "$tmp_root/et-output" >&2
-    fail 'real ET exited before the TERM check'
+  for ((_attempt = 0; _attempt < 200; _attempt++)); do
+    [[ ! -s $case_root/ssh-argv || ! -s $case_root/accepted ]] || break
+    kill -0 "$et_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  [[ -s $case_root/ssh-argv ]] || {
+    sed -n '1,120p' "$case_root/et-output" >&2
+    fail "$label: real ET did not invoke the PATH ssh shim"
   }
-  sleep 0.05
-done
-kill -TERM "$et_pid" 2>/dev/null || true
-for ((_attempt = 0; _attempt < 100; _attempt++)); do
-  kill -0 "$et_pid" 2>/dev/null || break
-  sleep 0.05
-done
-if kill -0 "$et_pid" 2>/dev/null; then
-  fail 'real ET did not stop within five seconds of TERM'
-fi
-wait "$et_pid" 2>/dev/null || true
-et_pid=
+  [[ -s $case_root/accepted ]] || fail "$label: real ET did not reach its configured port"
+
+  line_count=$(wc -l <"$case_root/ssh-argv")
+  line_count=${line_count//[[:space:]]/}
+  [[ $line_count == 3 && $(sed -n '1p' "$case_root/ssh-argv") == CALL ]] ||
+    fail "$label: real ET did not make exactly one two-argument SSH bootstrap"
+  destination=$(sed -n '2s/^ARG=//p' "$case_root/ssh-argv")
+  remote_command=$(sed -n '3s/^ARG=//p' "$case_root/ssh-argv")
+  [[ $destination == *@127.0.0.1 ]] ||
+    fail "$label: real ET SSH destination shape changed"
+  [[ $remote_command == *etterminal* &&
+    $remote_command == *xterm-256color* ]] ||
+    fail "$label: real ET remote bootstrap shape changed"
+  [[ -z $expected_terminal || $remote_command == *"' | $expected_terminal --verbose="* ]] ||
+    fail "$label: real ET did not launch the remote terminal through: $expected_terminal"
+
+  # The silent peer should hold the client in its foreground reconnect lifetime.
+  # Observe a short stable interval before TERM so an already-exited client can
+  # never satisfy the shutdown assertion below.
+  for ((_attempt = 0; _attempt < 5; _attempt++)); do
+    kill -0 "$et_pid" 2>/dev/null || {
+      sed -n '1,120p' "$case_root/et-output" >&2
+      fail "$label: real ET exited before the TERM check"
+    }
+    sleep 0.05
+  done
+  kill -TERM "$et_pid" 2>/dev/null || true
+  for ((_attempt = 0; _attempt < 100; _attempt++)); do
+    kill -0 "$et_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$et_pid" 2>/dev/null; then
+    fail "$label: real ET did not stop within five seconds of TERM"
+  fi
+  wait "$et_pid" 2>/dev/null || true
+  et_pid=
+  kill -KILL "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+  listener_pid=
+}
+
+# fwdports' own et driver.
+case_prefix=(--no-terminal)
+case_suffix=()
+expected_terminal=
+run_stock_et 'et driver'
+
+# ettun's stock argv, exactly as ettun-et-gate.sh pins it. --no-persist is an
+# ET 7.1 option that 7.0 must ignore without consuming the next argument, and
+# the terminal path must reach the remote bootstrap verbatim so the login
+# shell starts with NO_TMUX=1.
+case_prefix=(--no-terminal --no-persist --keepalive 5
+  --terminal-path 'env NO_TMUX=1 etterminal')
+case_suffix=(--command 'true')
+expected_terminal='env NO_TMUX=1 etterminal'
+run_stock_et 'ettun stock argv'
 
 printf 'stock ET contract: ET 7.0.0 publisher artifact passed\n'

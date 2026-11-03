@@ -65,7 +65,7 @@ write_fake_ettun_passthrough() {
     '  jump_argv=(--jumphost "$2")' \
     '  shift 2' \
     'fi' \
-    '"$ETTUN_ET" "${jump_argv[@]}" -N --keepalive 5 -t "18080:49152,18081:49153" --command "echo safe-bootstrap" "$via"' \
+    '"$ETTUN_ET" "${jump_argv[@]}" --no-terminal --no-persist --keepalive 5 --terminal-path "env NO_TMUX=1 etterminal" --tunnel "18080:49152,18081:49153" --command "echo safe-bootstrap" "$via"' \
     >"$path"
   chmod 0700 "$path"
 }
@@ -1322,24 +1322,88 @@ default_et_hardening_case() {
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=24 \
-    "$runtime/ettun-et-gate" -N --keepalive 5 \
-    -t '18080:49152,18081:49153' \
-    -r '127.0.0.1:49154:127.0.0.1:22' \
+    "$runtime/ettun-et-gate" --no-terminal --no-persist --keepalive 5 \
+    --terminal-path 'env NO_TMUX=1 etterminal' \
+    --tunnel '18080:49152,18081:49153' \
+    --reversetunnel '127.0.0.1:49154:127.0.0.1:22' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
   set -e
   _assert_exit "ettun nested ET gate: reviewed reverse shape is accepted" \
     24 "$status"
   _assert_contains "ettun nested ET gate: reverse mapping reaches ET" \
+    $'ARG=--reversetunnel\nARG=127.0.0.1:49154:127.0.0.1:22' "$(<"$et_log")"
+
+  # An installed ettun from before the long-option argv still produces the
+  # short-option shapes; both stay accepted while installations update.
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=25 \
+    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: earlier local shape is accepted" 25 \
+    "$status"
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=26 \
+    "$runtime/ettun-et-gate" -N --keepalive 5 \
+    -t '18080:49152,18081:49153' \
+    -r '127.0.0.1:49154:127.0.0.1:22' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: earlier reverse shape is accepted" 26 \
+    "$status"
+  _assert_contains "ettun nested ET gate: earlier reverse mapping reaches ET" \
     $'ARG=-r\nARG=127.0.0.1:49154:127.0.0.1:22' "$(<"$et_log")"
+
+  # The terminal path runs as remote shell text, so any other value, and any
+  # mix of the two option styles, fails closed before ET starts.
+  for drift_case in other-terminal-path no-persist-missing mixed-styles; do
+    case $drift_case in
+      other-terminal-path)
+        drift_argv=(--no-terminal --no-persist --keepalive 5
+          --terminal-path 'env NO_TMUX=1 etterminal; true'
+          --tunnel '18080:49152,18081:49153')
+        ;;
+      no-persist-missing)
+        drift_argv=(--no-terminal --keepalive 5
+          --terminal-path 'env NO_TMUX=1 etterminal'
+          --tunnel '18080:49152,18081:49153' --no-terminal)
+        ;;
+      mixed-styles)
+        drift_argv=(-N --no-persist --keepalive 5
+          --terminal-path 'env NO_TMUX=1 etterminal'
+          -t '18080:49152,18081:49153')
+        ;;
+    esac
+    before_et=$(<"$et_log")
+    set +e
+    PATH="$fake_bin:/usr/bin:/bin" \
+      FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+      FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+      "$runtime/ettun-et-gate" "${drift_argv[@]}" \
+      --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+    status=$?
+    set -e
+    _assert_exit "ettun nested ET gate: $drift_case fails closed" 78 "$status"
+    _assert_eq "ettun nested ET gate: $drift_case launches no ET" \
+      "$before_et" "$(<"$et_log")"
+  done
 
   before_et=$(<"$et_log")
   set +e
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
-    -t '18080:49152,18081:49153' \
+    "$runtime/ettun-et-gate" --jumphost jump --no-terminal --no-persist --keepalive 5 \
+    --terminal-path 'env NO_TMUX=1 etterminal' \
+    --tunnel '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
   set -e
@@ -1368,8 +1432,9 @@ default_et_hardening_case() {
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-    "$runtime/ettun-et-gate" -N --keepalive 5 \
-    -t '18080:49152,18081:49153' \
+    "$runtime/ettun-et-gate" --no-terminal --no-persist --keepalive 5 \
+    --terminal-path 'env NO_TMUX=1 etterminal' \
+    --tunnel '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
   set -e
@@ -1383,8 +1448,9 @@ default_et_hardening_case() {
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=24 \
-    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
-    -t '18080:49152,18081:49153' \
+    "$runtime/ettun-et-gate" --jumphost jump --no-terminal --no-persist --keepalive 5 \
+    --terminal-path 'env NO_TMUX=1 etterminal' \
+    --tunnel '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
   set -e
@@ -1402,8 +1468,9 @@ default_et_hardening_case() {
     FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
     FWDPORTS_TEST_JUMP_GATE_STATUS=78 \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
-    -t '18080:49152,18081:49153' \
+    "$runtime/ettun-et-gate" --jumphost jump --no-terminal --no-persist --keepalive 5 \
+    --terminal-path 'env NO_TMUX=1 etterminal' \
+    --tunnel '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
   set -e
@@ -1419,8 +1486,9 @@ default_et_hardening_case() {
   PATH="$fake_bin:/usr/bin:/bin" \
     FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
     FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-    "$runtime/ettun-et-gate" --jumphost jump -N --keepalive 5 \
-    -t '18080:49152,18081:49153' \
+    "$runtime/ettun-et-gate" --jumphost jump --no-terminal --no-persist --keepalive 5 \
+    --terminal-path 'env NO_TMUX=1 etterminal' \
+    --tunnel '18080:49152,18081:49153' \
     --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
   status=$?
   set -e

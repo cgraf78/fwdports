@@ -8,7 +8,10 @@ bash test/install-test delegate-direct
 ```
 
 An unknown case fails. This makes each red/green step observable and prevents a
-misspelled filter from reporting an empty success.
+misspelled filter from reporting an empty success. A suite that exits without
+printing its summary fails too, because Bash 3.2 can report a nounset abort as
+success; a probe that sources the harness only to read its settings sets
+`_FWDPORTS_TEST_SUMMARIZED=1`.
 
 The shared harness creates one validated temporary root per suite and deletes
 only that root. Runtime suites additionally provide isolated HOME/XDG paths,
@@ -44,9 +47,11 @@ backward compatible and still undergo runtime option checks, executable
 identity binding, and digest validation. The baseline gate proves the required
 CLI flags, PATH-based direct SSH bootstrap, both tunnel option forms,
 configured ET port, and bounded TERM behavior rather than letting the hermetic
-fakes define the upstream contract. Single-hop ProxyJump public and nested call
-shapes are covered hermetically; live validation must use an installed SSH
-configuration because ET resolves it from the invoking user's passwd home.
+fakes define the upstream contract. It also runs ettun's exact stock option
+prefix and checks that its terminal path reaches the SSH bootstrap verbatim.
+Single-hop ProxyJump public and nested call shapes are covered hermetically;
+live validation must use an installed SSH configuration because ET resolves it
+from the invoking user's passwd home.
 
 Runtime tests deliberately force atomic-replacement races and crash seams.
 They distinguish a complete old/new control record—which readers may retry—

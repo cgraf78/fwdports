@@ -34,7 +34,8 @@ canonical_tmpdir_case() {
   ln -s "$physical" "$logical"
 
   output=$(TMPDIR="$logical/" FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
-    bash -c 'source "$FWDPORTS_TEST_HARNESS"; printf "%s\n" "$_FWDPORTS_TEST_TMP_BASE"')
+    bash -c 'source "$FWDPORTS_TEST_HARNESS"; _FWDPORTS_TEST_SUMMARIZED=1
+      printf "%s\n" "$_FWDPORTS_TEST_TMP_BASE"')
 
   _assert_eq "temporary base: resolves symlinks and trailing separators" \
     "$physical" "$output"
@@ -43,7 +44,8 @@ canonical_tmpdir_case() {
 private_umask_case() {
   local output
   output=$(FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" bash -c \
-    'umask 002; source "$FWDPORTS_TEST_HARNESS"; umask')
+    'umask 002; source "$FWDPORTS_TEST_HARNESS"; _FWDPORTS_TEST_SUMMARIZED=1
+    umask')
 
   _assert_eq "test harness: protects all fixture creation by default" \
     "0077" "$output"
@@ -123,6 +125,80 @@ signal_status_case() {
   # Inside a trap `$?` belongs to the interrupted command, so a signal that
   # arrives after passing work could otherwise report success.
   _assert_exit "signal status: a TERMed suite exits 143" 143 "$status"
+}
+
+missing_summary_case() {
+  local tmp child output status
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/missing-summary
+  output=$tmp/output
+  # Stands in for an abort that Bash 3.2 reports as status 0, such as an
+  # unbound variable under nounset: a suite must not pass without a summary.
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'passes() { _pass "before abort"; }' \
+    'run_case passes passes' \
+    'exit 0' \
+    >"$child"
+  chmod 0700 "$child"
+
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+  _assert_exit "missing summary: a suite that skips its summary fails" 1 \
+    "$status"
+  _assert_contains "missing summary: names the missing summary" \
+    "suite exited before its summary" "$(<"$output")"
+}
+
+nounset_abort_case() {
+  local tmp child output status
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/nounset-abort
+  output=$tmp/output
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'aborts() {' \
+    '  set -e' \
+    '  local -a empty=()' \
+    '  _pass "before abort"' \
+    '  if ((BASH_VERSINFO[0] < 4)); then' \
+    '    _assert_eq "empty array" "" "${empty[*]}"' \
+    '  else' \
+    '    : "$fwdports_test_unset_variable"' \
+    '  fi' \
+    '}' \
+    'run_case aborts aborts' \
+    '_test_summary' \
+    >"$child"
+  chmod 0700 "$child"
+
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+  # Under Bash 3.2 this mirrors the abort that once passed the stock macOS job,
+  # an empty array expanded under nounset and errexit, which that Bash reports
+  # as success, so there the guard must be what fails it. Newer Bash allows an
+  # empty array, so the child aborts on an unset scalar, which fails by itself.
+  if [[ $status -ne 0 ]]; then
+    _pass "nounset abort: a suite that aborts mid-case fails"
+  else
+    _fail "nounset abort: a suite that aborts mid-case fails"
+  fi
+  _assert_not_contains "nounset abort: never reaches its summary" \
+    "Results:" "$(<"$output")"
+  if ((BASH_VERSINFO[0] < 4)); then
+    _assert_contains "nounset abort: Bash 3.2 fails it through the guard" \
+      "suite exited before its summary" "$(<"$output")"
+  fi
 }
 
 zombie_liveness_case() {
@@ -365,6 +441,8 @@ run_case canonical-tmpdir canonical_tmpdir_case
 run_case private-umask private_umask_case
 run_case nonzero-callback nonzero_callback_case
 run_case signal-status signal_status_case
+run_case missing-summary missing_summary_case
+run_case nounset-abort nounset_abort_case
 run_case zombie-liveness zombie_liveness_case
 run_case leaked-tmux leaked_tmux_case
 run_case aborted-tmux aborted_tmux_case

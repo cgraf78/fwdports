@@ -153,16 +153,20 @@ its selected transport before any tmux session or earlier leg starts. With no
 bootstrap and requires a direct-host-safe `host`. When that host resolves to a
 validated single-hop `ProxyJump`, fwdports records `--jump-host` in the public
 ettun argv rather than hiding route selection inside the nested ET executable.
-The nested gate still verifies that ettun's resulting `--jumphost` argument
-and both SSH configurations match the prepared route. It also checks ettun's
-non-core local commands (base64, gzip, mkfifo, od, and tee) during dependency
-preflight. On macOS it additionally resolves the exact Python 3.9-or-newer
-backend reported by an isolated interpreter, runs the installed session
-enumerator's bounded `os.getsid` capability probe in isolated mode, and
-snapshots the helper plus backend identity and digest into the generation.
-Standard `admin`-group-writable macOS application and package-manager ancestry
-is accepted only when the current user belongs to that root-capable group;
-other shared groups and non-sticky world-writable ancestry remain invalid. The
+The nested gate still verifies that ettun's resulting `--jumphost` argument and
+both SSH configurations match the prepared route. It accepts only ettun's
+reviewed ET argv shapes: the long-option form, whose
+`--terminal-path 'env NO_TMUX=1 etterminal'` is pinned literally because it
+runs as remote shell text, and, while installed ettun versions catch up, the
+earlier short-option form. It also checks ettun's non-core local commands
+(base64, gzip, mkfifo, od, and tee) during dependency preflight. On macOS it
+additionally resolves the exact Python 3.9-or-newer backend reported by an
+isolated interpreter, runs the installed session enumerator's bounded
+`os.getsid` capability probe in isolated mode, and snapshots the helper plus
+backend identity and digest into the generation. Standard
+`admin`-group-writable macOS application and package-manager ancestry is
+accepted only when the current user belongs to that root-capable group; other
+shared groups and non-sticky world-writable ancestry remain invalid. The
 ordinary trusted-owner sticky-directory exception is unchanged. A declared
 adapter must be one executable token, must remain in the foreground when called
 by ettun, must not call `setsid`, daemonize, change real user identity, or

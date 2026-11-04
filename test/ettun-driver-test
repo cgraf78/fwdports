@@ -1259,7 +1259,8 @@ generation_gate_case() {
 }
 
 # Runs the prepared nested ET gate with one argv and succeeds only if it fails
-# closed as an unreviewed shape: status 78, no ET launch, and the named drift.
+# closed as an unreviewed shape: status 78, no ET launch, and the shape-drift
+# message.
 # Reads runtime, fake_bin, ssh_config, et_log, and error from the caller.
 et_gate_rejects_shape() {
   local before status
@@ -1448,8 +1449,9 @@ default_et_hardening_case() {
     fi
   done
 
-  # Every element of every reviewed shape is pinned: replacing it with an
+  # Every element of every reviewed shape is checked: replacing it with an
   # option-like or empty word, deleting it, or appending a word fails closed.
+  # Collect escapes in a string: Bash 3.2 rejects an empty array under nounset.
   for shape in long long-reverse short short-reverse; do
     case $shape in
       long)
@@ -1468,7 +1470,7 @@ default_et_hardening_case() {
         ;;
     esac
     shape_argv+=(--command 'echo safe-bootstrap' gateway.example.net)
-    escaped=()
+    escaped=
     for ((position = 0; position < ${#shape_argv[@]}; position++)); do
       for mutation in option empty delete; do
         drift_argv=("${shape_argv[@]}")
@@ -1478,12 +1480,12 @@ default_et_hardening_case() {
           delete) unset 'drift_argv[position]' ;;
         esac
         et_gate_rejects_shape "${drift_argv[@]}" ||
-          escaped+=("$mutation@$((position + 1))")
+          escaped+=" $mutation@$((position + 1))"
       done
     done
-    et_gate_rejects_shape "${shape_argv[@]}" extra || escaped+=(append)
-    _assert_eq "ettun nested ET gate: every $shape element is pinned" "" \
-      "${escaped[*]}"
+    et_gate_rejects_shape "${shape_argv[@]}" extra || escaped+=" append"
+    _assert_eq "ettun nested ET gate: every $shape element is checked" "" \
+      "$escaped"
   done
 
   before_et=$(<"$et_log")
@@ -1579,6 +1581,22 @@ default_et_hardening_case() {
   _assert_exit "ettun nested ET gate: another public jump fails closed" 78 \
     "$status"
   _assert_eq "ettun nested ET gate: another public jump launches no ET" \
+    "$before_et" "$(<"$et_log")"
+
+  before_et=$(<"$et_log")
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" -x jump "${long_prefix[@]}" \
+    --tunnel '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: another jump flag fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: another jump flag launches no ET" \
     "$before_et" "$(<"$et_log")"
 
   before_et=$(<"$et_log")

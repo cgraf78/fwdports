@@ -125,6 +125,34 @@ signal_status_case() {
   _assert_exit "signal status: a TERMed suite exits 143" 143 "$status"
 }
 
+missing_summary_case() {
+  local tmp child output status
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/missing-summary
+  output=$tmp/output
+  # Stands in for an abort that Bash 3.2 reports as status 0, such as an
+  # unbound variable under nounset: a suite must not pass without a summary.
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'passes() { _pass "before abort"; }' \
+    'run_case passes passes' \
+    'exit 0' \
+    >"$child"
+  chmod 0700 "$child"
+
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+  _assert_exit "missing summary: a suite that skips its summary fails" 1 \
+    "$status"
+  _assert_contains "missing summary: names the missing summary" \
+    "suite exited before its summary" "$(<"$output")"
+}
+
 zombie_liveness_case() {
   local tmp holder zombie_pid='' index=0 stopped=0
   if ! command -v python3 >/dev/null 2>&1; then
@@ -365,6 +393,7 @@ run_case canonical-tmpdir canonical_tmpdir_case
 run_case private-umask private_umask_case
 run_case nonzero-callback nonzero_callback_case
 run_case signal-status signal_status_case
+run_case missing-summary missing_summary_case
 run_case zombie-liveness zombie_liveness_case
 run_case leaked-tmux leaked_tmux_case
 run_case aborted-tmux aborted_tmux_case

@@ -13,6 +13,7 @@ umask 077
 PASS=0
 FAIL=0
 RUN=0
+_FWDPORTS_TEST_SUMMARIZED=
 CURRENT_TEST_CASE=
 
 _pass() {
@@ -262,6 +263,14 @@ _stop_test_tmux_servers() {
 _cleanup_test_root() {
   local status=$? socket
   [[ -z "${1:-}" ]] || status=$1
+  # Bash 3.2 can reach this trap with status 0 after a nounset abort inside a
+  # case, which would pass a suite that never reached its summary. Probes that
+  # source the harness without running a case are not suites.
+  if [[ $status -eq 0 && -z "${1:-}" && $RUN -gt 0 &&
+    -z $_FWDPORTS_TEST_SUMMARIZED ]]; then
+    printf 'fwdports test: suite exited before its summary\n' >&2
+    status=1
+  fi
   # Finish teardown even if another signal arrives: an abandoned teardown
   # recreates the orphaned-server leak it prevents. Ignoring (rather than
   # catching) the signals also shields `find` and `rm`, which would otherwise
@@ -329,6 +338,7 @@ run_case() {
 }
 
 _test_summary() {
+  _FWDPORTS_TEST_SUMMARIZED=1
   if [[ -n "${TEST_CASE:-}" && "$RUN" -eq 0 ]]; then
     _fail "unknown test case: ${TEST_CASE}"
   fi

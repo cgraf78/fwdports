@@ -75,6 +75,11 @@ jobs:
           # to be installed in this explicit stock-interpreter job.
           /bin/bash test/controller-test no-pane-stop
 
+          # Bash 3.2 can report a nounset abort as success; the harness must
+          # still fail a suite that never reaches its summary.
+          /bin/bash test/harness-test nounset-abort
+          /bin/bash test/harness-test missing-summary
+
   stock-et-contract:
     name: Stock ET 7.0.0 contract
     runs-on: ubuntu-24.04-arm

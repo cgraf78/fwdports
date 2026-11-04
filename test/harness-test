@@ -34,7 +34,8 @@ canonical_tmpdir_case() {
   ln -s "$physical" "$logical"
 
   output=$(TMPDIR="$logical/" FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
-    bash -c 'source "$FWDPORTS_TEST_HARNESS"; printf "%s\n" "$_FWDPORTS_TEST_TMP_BASE"')
+    bash -c 'source "$FWDPORTS_TEST_HARNESS"; _FWDPORTS_TEST_SUMMARIZED=1
+      printf "%s\n" "$_FWDPORTS_TEST_TMP_BASE"')
 
   _assert_eq "temporary base: resolves symlinks and trailing separators" \
     "$physical" "$output"
@@ -43,7 +44,8 @@ canonical_tmpdir_case() {
 private_umask_case() {
   local output
   output=$(FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" bash -c \
-    'umask 002; source "$FWDPORTS_TEST_HARNESS"; umask')
+    'umask 002; source "$FWDPORTS_TEST_HARNESS"; _FWDPORTS_TEST_SUMMARIZED=1
+    umask')
 
   _assert_eq "test harness: protects all fixture creation by default" \
     "0077" "$output"
@@ -151,6 +153,37 @@ missing_summary_case() {
     "$status"
   _assert_contains "missing summary: names the missing summary" \
     "suite exited before its summary" "$(<"$output")"
+}
+
+nounset_abort_case() {
+  local tmp child output status
+  tmp=$(_tmpdir) || return 1
+  child=$tmp/nounset-abort
+  output=$tmp/output
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'source "$FWDPORTS_TEST_HARNESS"' \
+    'aborts() { _pass "before abort"; : "$fwdports_test_unset_variable"; }' \
+    'run_case aborts aborts' \
+    '_test_summary' \
+    >"$child"
+  chmod 0700 "$child"
+
+  set +e
+  FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    bash "$child" >"$output" 2>&1
+  status=$?
+  set -e
+  # The stock macOS Bash 3.2 job runs this case: that Bash otherwise reports
+  # the abort as success.
+  if [[ $status -ne 0 ]]; then
+    _pass "nounset abort: a suite that aborts mid-case fails"
+  else
+    _fail "nounset abort: a suite that aborts mid-case fails"
+  fi
+  _assert_not_contains "nounset abort: never reaches its summary" \
+    "Results:" "$(<"$output")"
 }
 
 zombie_liveness_case() {
@@ -394,6 +427,7 @@ run_case private-umask private_umask_case
 run_case nonzero-callback nonzero_callback_case
 run_case signal-status signal_status_case
 run_case missing-summary missing_summary_case
+run_case nounset-abort nounset_abort_case
 run_case zombie-liveness zombie_liveness_case
 run_case leaked-tmux leaked_tmux_case
 run_case aborted-tmux aborted_tmux_case

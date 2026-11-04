@@ -263,11 +263,10 @@ _stop_test_tmux_servers() {
 _cleanup_test_root() {
   local status=$? socket
   [[ -z "${1:-}" ]] || status=$1
-  # Bash 3.2 can reach this trap with status 0 after a nounset abort inside a
-  # case, which would pass a suite that never reached its summary. Probes that
-  # source the harness without running a case are not suites.
-  if [[ $status -eq 0 && -z "${1:-}" && $RUN -gt 0 &&
-    -z $_FWDPORTS_TEST_SUMMARIZED ]]; then
+  # Bash 3.2 can reach this trap with status 0 after a nounset abort, which
+  # would pass a suite that never reached its summary. A probe that sources
+  # the harness only to read its settings marks itself summarized.
+  if [[ $status -eq 0 && -z "${1:-}" && -z $_FWDPORTS_TEST_SUMMARIZED ]]; then
     printf 'fwdports test: suite exited before its summary\n' >&2
     status=1
   fi

@@ -8,7 +8,9 @@ bash test/install-test delegate-direct
 ```
 
 An unknown case fails. This makes each red/green step observable and prevents a
-misspelled filter from reporting an empty success.
+misspelled filter from reporting an empty success. A suite that exits without
+printing its summary fails too, because Bash 3.2 can report a nounset abort as
+success.
 
 The shared harness creates one validated temporary root per suite and deletes
 only that root. Runtime suites additionally provide isolated HOME/XDG paths,

@@ -91,7 +91,7 @@ PY
 # Run the real client once against a fresh silent peer, with both tunnel
 # option forms. case_prefix and case_suffix hold the options under test around
 # the tunnels; expected_terminal is the terminal path the SSH bootstrap must
-# run, or empty for ET's default.
+# run.
 run_stock_et() {
   local label=$1 case_root
   listener_count=$((listener_count + 1))
@@ -144,7 +144,7 @@ run_stock_et() {
   [[ $remote_command == *etterminal* &&
     $remote_command == *xterm-256color* ]] ||
     fail "$label: real ET remote bootstrap shape changed"
-  [[ -z $expected_terminal || $remote_command == *"' | $expected_terminal --verbose="* ]] ||
+  [[ $remote_command == *"' | $expected_terminal --verbose="* ]] ||
     fail "$label: real ET did not launch the remote terminal through: $expected_terminal"
 
   # The silent peer should hold the client in its foreground reconnect lifetime.
@@ -172,13 +172,14 @@ run_stock_et() {
   listener_pid=
 }
 
-# fwdports' own et driver.
+# fwdports' own et driver, with ET's default terminal path.
 case_prefix=(--no-terminal)
 case_suffix=()
-expected_terminal=
+expected_terminal=etterminal
 run_stock_et 'et driver'
 
-# ettun's stock argv, exactly as ettun-et-gate.sh pins it. --no-persist is an
+# ettun's stock option prefix as ettun-et-gate.sh pins it, among the harness's
+# own logging, telemetry, and port options. --no-persist is an
 # ET 7.1 option that 7.0 must ignore without consuming the next argument, and
 # the terminal path must reach the remote bootstrap verbatim so the login
 # shell starts with NO_TMUX=1.

@@ -130,28 +130,32 @@ fi
 # installed, so the earlier short-option shapes (from ettun before
 # cgraf78/ettun#34) stay accepted until every installation runs an ettun that
 # builds the long form; then delete them. ET 7.1 reads -t as a pty request
-# rather than a tunnel, so their mapping values must not look like options.
+# rather than a tunnel, so a value there could become an option; no reviewed
+# ettun builds an option-like value, so none is accepted in any shape.
 ETTUN_TERMINAL_PATH='env NO_TMUX=1 etterminal'
 et_shape_valid=0
 if [[ $# -eq 11 && ${1:-} == --no-terminal && ${2:-} == --no-persist &&
   ${3:-} == --keepalive && ${4:-} == 5 && ${5:-} == --terminal-path &&
-  ${6:-} == "$ETTUN_TERMINAL_PATH" && ${7:-} == --tunnel && -n ${8:-} &&
-  ${9:-} == --command && -n ${10:-} && ${11:-} == "$target" ]]; then
+  ${6:-} == "$ETTUN_TERMINAL_PATH" && ${7:-} == --tunnel &&
+  -n ${8:-} && ${8:-} != -* && ${9:-} == --command &&
+  -n ${10:-} && ${10:-} != -* && ${11:-} == "$target" ]]; then
   et_shape_valid=1
 elif [[ $# -eq 13 && ${1:-} == --no-terminal && ${2:-} == --no-persist &&
   ${3:-} == --keepalive && ${4:-} == 5 && ${5:-} == --terminal-path &&
-  ${6:-} == "$ETTUN_TERMINAL_PATH" && ${7:-} == --tunnel && -n ${8:-} &&
-  ${9:-} == --reversetunnel && -n ${10:-} && ${11:-} == --command &&
-  -n ${12:-} && ${13:-} == "$target" ]]; then
+  ${6:-} == "$ETTUN_TERMINAL_PATH" && ${7:-} == --tunnel &&
+  -n ${8:-} && ${8:-} != -* && ${9:-} == --reversetunnel &&
+  -n ${10:-} && ${10:-} != -* && ${11:-} == --command &&
+  -n ${12:-} && ${12:-} != -* && ${13:-} == "$target" ]]; then
   et_shape_valid=1
 elif [[ $# -eq 8 && ${1:-} == -N && ${2:-} == --keepalive &&
   ${3:-} == 5 && ${4:-} == -t && -n ${5:-} && ${5:-} != -* &&
-  ${6:-} == --command && -n ${7:-} && ${8:-} == "$target" ]]; then
+  ${6:-} == --command && -n ${7:-} && ${7:-} != -* &&
+  ${8:-} == "$target" ]]; then
   et_shape_valid=1
 elif [[ $# -eq 10 && ${1:-} == -N && ${2:-} == --keepalive &&
   ${3:-} == 5 && ${4:-} == -t && -n ${5:-} && ${5:-} != -* &&
   ${6:-} == -r && -n ${7:-} && ${7:-} != -* && ${8:-} == --command &&
-  -n ${9:-} && ${10:-} == "$target" ]]; then
+  -n ${9:-} && ${9:-} != -* && ${10:-} == "$target" ]]; then
   et_shape_valid=1
 fi
 if [[ $et_shape_valid -ne 1 ]]; then

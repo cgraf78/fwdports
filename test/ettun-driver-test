@@ -1258,11 +1258,28 @@ generation_gate_case() {
     "$after"
 }
 
+# Runs the prepared nested ET gate with one argv and succeeds only if it fails
+# closed as an unreviewed shape: status 78, no ET launch, and the named drift.
+# Reads runtime, fake_bin, ssh_config, et_log, and error from the caller.
+et_gate_rejects_shape() {
+  local before status
+  before=$(<"$et_log")
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" "$@" 2>"$error"
+  status=$?
+  set -e
+  [[ $status -eq 78 && $(<"$et_log") == "$before" &&
+  $(<"$error") == *"unreviewed ET argv shape"* ]]
+}
+
 default_et_hardening_case() {
   local tmp manifest runtime fake_bin fake_ettun fake_et fake_ssh
   local ssh_config et_log ssh_log jump_gate_log error status before_et before_ssh
-  local drift_case
-  local -a drift_argv long_prefix
+  local drift_case shape position mutation escaped
+  local -a drift_argv long_prefix shape_argv
   tmp=$(_tmpdir) || return 1
   manifest=$tmp/manifest
   runtime=$tmp/runtime
@@ -1368,8 +1385,7 @@ default_et_hardening_case() {
     $'ARG=-r\nARG=127.0.0.1:49154:127.0.0.1:22' "$(<"$et_log")"
 
   # The terminal path runs as remote shell text, so any other value fails
-  # closed before ET starts, as does any single-token drift from a reviewed
-  # shape. Each case changes exactly one element.
+  # closed before ET starts, as do these named drifts from a reviewed shape.
   long_prefix=(--no-terminal --no-persist --keepalive 5
     --terminal-path 'env NO_TMUX=1 etterminal')
   for drift_case in other-terminal-path reverse-other-terminal-path \
@@ -1424,20 +1440,50 @@ default_et_hardening_case() {
         drift_argv=(-N --keepalive 5 -t '--terminal-path=sh')
         ;;
     esac
-    before_et=$(<"$et_log")
-    set +e
-    PATH="$fake_bin:/usr/bin:/bin" \
-      FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
-      FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
-      "$runtime/ettun-et-gate" "${drift_argv[@]}" \
-      --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
-    status=$?
-    set -e
-    _assert_exit "ettun nested ET gate: $drift_case fails closed" 78 "$status"
-    _assert_eq "ettun nested ET gate: $drift_case launches no ET" \
-      "$before_et" "$(<"$et_log")"
-    _assert_contains "ettun nested ET gate: $drift_case names the shape drift" \
-      "unreviewed ET argv shape" "$(<"$error")"
+    if et_gate_rejects_shape "${drift_argv[@]}" \
+      --command 'echo safe-bootstrap' gateway.example.net; then
+      _pass "ettun nested ET gate: $drift_case fails closed"
+    else
+      _fail "ettun nested ET gate: $drift_case fails closed"
+    fi
+  done
+
+  # Every element of every reviewed shape is pinned: replacing it with an
+  # option-like or empty word, deleting it, or appending a word fails closed.
+  for shape in long long-reverse short short-reverse; do
+    case $shape in
+      long)
+        shape_argv=("${long_prefix[@]}" --tunnel '18080:49152,18081:49153')
+        ;;
+      long-reverse)
+        shape_argv=("${long_prefix[@]}" --tunnel '18080:49152,18081:49153'
+          --reversetunnel '127.0.0.1:49154:127.0.0.1:22')
+        ;;
+      short)
+        shape_argv=(-N --keepalive 5 -t '18080:49152,18081:49153')
+        ;;
+      short-reverse)
+        shape_argv=(-N --keepalive 5 -t '18080:49152,18081:49153'
+          -r '127.0.0.1:49154:127.0.0.1:22')
+        ;;
+    esac
+    shape_argv+=(--command 'echo safe-bootstrap' gateway.example.net)
+    escaped=()
+    for ((position = 0; position < ${#shape_argv[@]}; position++)); do
+      for mutation in option empty delete; do
+        drift_argv=("${shape_argv[@]}")
+        case $mutation in
+          option) drift_argv[position]=-x ;;
+          empty) drift_argv[position]= ;;
+          delete) unset 'drift_argv[position]' ;;
+        esac
+        et_gate_rejects_shape "${drift_argv[@]}" ||
+          escaped+=("$mutation@$((position + 1))")
+      done
+    done
+    et_gate_rejects_shape "${shape_argv[@]}" extra || escaped+=(append)
+    _assert_eq "ettun nested ET gate: every $shape element is pinned" "" \
+      "${escaped[*]}"
   done
 
   before_et=$(<"$et_log")
@@ -1518,6 +1564,22 @@ default_et_hardening_case() {
   set -e
   _assert_exit "ettun nested ET gate: ProxyJump reverse long shape is accepted" \
     27 "$status"
+
+  before_et=$(<"$et_log")
+  set +e
+  PATH="$fake_bin:/usr/bin:/bin" \
+    FWDPORTS_TEST_SSH_CONFIG=$ssh_config \
+    FWDPORTS_TEST_JUMP_GATE_LOG=$jump_gate_log \
+    FWDPORTS_TEST_ET_LOG=$et_log FWDPORTS_TEST_ET_STATUS=0 \
+    "$runtime/ettun-et-gate" --jumphost other "${long_prefix[@]}" \
+    --tunnel '18080:49152,18081:49153' \
+    --command 'echo safe-bootstrap' gateway.example.net 2>"$error"
+  status=$?
+  set -e
+  _assert_exit "ettun nested ET gate: another public jump fails closed" 78 \
+    "$status"
+  _assert_eq "ettun nested ET gate: another public jump launches no ET" \
+    "$before_et" "$(<"$et_log")"
 
   before_et=$(<"$et_log")
   set +e

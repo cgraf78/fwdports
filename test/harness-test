@@ -164,7 +164,16 @@ nounset_abort_case() {
     '#!/usr/bin/env bash' \
     'set -u' \
     'source "$FWDPORTS_TEST_HARNESS"' \
-    'aborts() { _pass "before abort"; : "$fwdports_test_unset_variable"; }' \
+    'aborts() {' \
+    '  set -e' \
+    '  local -a empty=()' \
+    '  _pass "before abort"' \
+    '  if ((BASH_VERSINFO[0] < 4)); then' \
+    '    _assert_eq "empty array" "" "${empty[*]}"' \
+    '  else' \
+    '    : "$fwdports_test_unset_variable"' \
+    '  fi' \
+    '}' \
     'run_case aborts aborts' \
     '_test_summary' \
     >"$child"
@@ -175,8 +184,10 @@ nounset_abort_case() {
     bash "$child" >"$output" 2>&1
   status=$?
   set -e
-  # The stock macOS Bash 3.2 job runs this case: that Bash otherwise reports
-  # the abort as success.
+  # Under Bash 3.2 this mirrors the abort that once passed the stock macOS job,
+  # an empty array expanded under nounset and errexit, which that Bash reports
+  # as success, so there the guard must be what fails it. Newer Bash allows an
+  # empty array, so the child aborts on an unset scalar, which fails by itself.
   if [[ $status -ne 0 ]]; then
     _pass "nounset abort: a suite that aborts mid-case fails"
   else
@@ -184,6 +195,10 @@ nounset_abort_case() {
   fi
   _assert_not_contains "nounset abort: never reaches its summary" \
     "Results:" "$(<"$output")"
+  if ((BASH_VERSINFO[0] < 4)); then
+    _assert_contains "nounset abort: Bash 3.2 fails it through the guard" \
+      "suite exited before its summary" "$(<"$output")"
+  fi
 }
 
 zombie_liveness_case() {

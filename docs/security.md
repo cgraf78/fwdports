@@ -139,13 +139,13 @@ loopback-bound local and reverse forwards are accepted by this built-in.
 
 The default stock-ET route never exposes the raw ET executable to ettun. It
 exports a generation-owned wrapper that accepts only ettun's reviewed local and
-reverse argv shapes, checked against the ET 7.0.0 contract and with no
-option-like values, including one literally pinned remote `--terminal-path`
-that starts the remote login shell with `NO_TMUX=1`, fixes `TERM`, disables
-telemetry, uses private temporary state, and places the same authenticated SSH
-shim used by the direct ET driver first on `PATH`. Ambient SSH forwarding,
-remote commands, agents, environment, and proxy routing are rejected before ET
-starts and rechecked at its bootstrap.
+reverse argv shapes, with no option-like values. Those shapes pin one remote
+`--terminal-path` literally, which starts the remote login shell with
+`NO_TMUX=1`. The wrapper fixes `TERM`, disables telemetry, uses private
+temporary state, and places the same authenticated SSH shim used by the direct
+ET driver first on `PATH`. Ambient SSH forwarding, remote commands, agents,
+environment, and proxy routing are rejected before ET starts and rechecked at
+its bootstrap.
 
 ## Crash behavior
 

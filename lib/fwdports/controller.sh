@@ -457,8 +457,9 @@ _fwdports_stop_generation_locked() {
   local digest=$6 session_name=$7 attempts=$8 delay=$9
   local control_record phase desired controller_pid controller_start
   local probe evidence pane_state runtime leg driver strategy index
-  local gate_attempt
+  local gate_attempt result status=0
   local -a pane_evidence=() pane_strategies=()
+  local -a interrupted_evidence=() interrupted_sids=()
 
   control_record=$(fwdports_control_read "$generation" "$digest") || return 74
   IFS=$'\t' read -r phase desired controller_pid controller_start probe \
@@ -536,21 +537,66 @@ _fwdports_stop_generation_locked() {
       fi
       gate_attempt=$((gate_attempt + 1))
       if [[ $gate_attempt -ge $attempts ]]; then
-        return 74
+        status=74
+        break
       fi
       sleep "$delay"
     done
-    case "$pane_state" in
-      live)
+    [[ $status -eq 0 ]] || break
+    case "$pane_state:$strategy" in
+      live:ettun-session)
+        # Only interrupt here; the loop below waits. ettun's graceful stop
+        # retires remote relay state over the network, so waiting for each
+        # leg before interrupting the next made stop take the sum of every
+        # leg's cleanup rather than the slowest one. Each interrupt still
+        # gets the full per-pane authentication at its own signal boundary.
+        if ! result=$(fwdports_tmux_interrupt_ettun_pane "$tmux_path" \
+          "$socket" "$root" "$pointer_kind" "$generation" "$digest" \
+          "$evidence" "$attempts" "$delay"); then
+          status=74
+          break
+        fi
+        case "$result" in
+          interrupted$'\t'*)
+            interrupted_evidence+=("$evidence")
+            interrupted_sids+=("${result#*$'\t'}")
+            ;;
+          gone | term) ;;
+          *)
+            status=74
+            break
+            ;;
+        esac
+        ;;
+      live:*)
         fwdports_tmux_terminate_pane "$tmux_path" "$socket" "$root" \
           "$pointer_kind" "$generation" "$digest" "$evidence" \
-          "$attempts" "$delay" "$strategy" >/dev/null || return 74
+          "$attempts" "$delay" "$strategy" >/dev/null || {
+          status=74
+          break
+        }
         ;;
-      dead) ;;
-      *) return 74 ;;
+      dead:*) ;;
+      *)
+        status=74
+        break
+        ;;
     esac
     index=$((index + 1))
   done
+  # Drive every interrupted leg to completion, including ettun's second
+  # Ctrl-C escalation, even when a later pane failed closed above: the old
+  # serial loop had fully stopped every earlier leg before such a failure,
+  # and an interrupted leg must not be abandoned mid-stop. Each finish
+  # reauthenticates its own pane and session before any further signal.
+  index=0
+  for evidence in ${interrupted_evidence[@]+"${interrupted_evidence[@]}"}; do
+    fwdports_tmux_finish_ettun_pane "$tmux_path" "$socket" "$root" \
+      "$pointer_kind" "$generation" "$digest" "$evidence" "$attempts" \
+      "$delay" "${interrupted_sids[index]}" >/dev/null || status=74
+    index=$((index + 1))
+  done
+  [[ $status -eq 0 ]] || return 74
   _fwdports_cleanup_generation_drivers "$generation" "$digest"
   fwdports_tmux_remove_generation_session "$tmux_path" "$socket" \
     "$generation" "$digest" "$session_name" || return 74

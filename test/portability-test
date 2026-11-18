@@ -11,6 +11,8 @@ TEST_CASE=${1:-}
 
 # shellcheck source=lib/test.sh
 source "$TEST_DIR/lib/test.sh"
+# shellcheck source=../lib/fwdports/runtime.sh
+source "$ROOT/lib/fwdports/runtime.sh"
 # shellcheck source=../lib/fwdports/drivers.sh
 source "$ROOT/lib/fwdports/drivers.sh"
 # shellcheck source=../lib/fwdports/tmux.sh
@@ -183,7 +185,147 @@ bsd_ps_session_keyword_case() {
     'sid=' "$(<"$log")"
 }
 
+# A stat that accepts both flavors and logs each call, so the order of
+# attempts is observable. Real BSD stat rejects `-c`, which made the old
+# GNU-first order spend a guaranteed-failing fork per trust check on macOS.
+# drivers.sh and runtime.sh each own a copy of the order (drivers.sh is
+# sourced without runtime.sh elsewhere), so both are held to it here.
+native_stat_order_case() {
+  local tmp fake_bin log output helper
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  log=$tmp/stat.log
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$1" >>"$FWDPORTS_TEST_STAT_LOG"' \
+    '[[ ${1:-} != "${FWDPORTS_TEST_STAT_REJECT:-}" ]] || exit 1' \
+    'if [[ ${1:-} == "${FWDPORTS_TEST_STAT_MULTILINE:-}" ]]; then' \
+    '  printf "  File: \"/tmp/example\"\n    ID: 1\n"; exit 0' \
+    'fi' \
+    'printf "1000 755 1 2 3 4\n"' >"$fake_bin/stat"
+  chmod 0700 "$fake_bin/stat"
+
+  for helper in _fwdports_stat_identity _fwdports_runtime_identity; do
+    : >"$log"
+    output=$(OSTYPE=darwin23 PATH="$fake_bin:/usr/bin:/bin" \
+      FWDPORTS_TEST_STAT_LOG=$log "$helper" /tmp/example) || true
+    _assert_eq "portability: $helper parses Darwin stat" \
+      "1000 755 1 2 3 4" "$output"
+    _assert_eq "portability: $helper tries only Darwin's BSD flavor" \
+      "-f" "$(<"$log")"
+
+    : >"$log"
+    output=$(OSTYPE=linux-gnu PATH="$fake_bin:/usr/bin:/bin" \
+      FWDPORTS_TEST_STAT_LOG=$log "$helper" /tmp/example) || true
+    _assert_eq "portability: $helper tries only the GNU flavor on Linux" \
+      "-c" "$(<"$log")"
+
+    # GNU coreutils can precede the system stat on a macOS PATH; the other
+    # flavor remains the fallback, so the order never changes the result.
+    : >"$log"
+    output=$(OSTYPE=darwin23 PATH="$fake_bin:/usr/bin:/bin" \
+      FWDPORTS_TEST_STAT_LOG=$log FWDPORTS_TEST_STAT_REJECT=-f \
+      "$helper" /tmp/example) || true
+    _assert_eq "portability: $helper falls back to GNU stat on Darwin" \
+      "1000 755 1 2 3 4" "$output"
+    _assert_eq "portability: $helper falls back after the native attempt" \
+      $'-f\n-c' "$(<"$log")"
+
+    # GNU reads `-f FORMAT` as --file-system plus a file operand; with a
+    # file named like the format in the working directory it succeeds with
+    # multi-line output, which must count as a failed attempt.
+    : >"$log"
+    output=$(OSTYPE=darwin23 PATH="$fake_bin:/usr/bin:/bin" \
+      FWDPORTS_TEST_STAT_LOG=$log FWDPORTS_TEST_STAT_MULTILINE=-f \
+      "$helper" /tmp/example) || true
+    _assert_eq "portability: $helper rejects multi-line native output" \
+      "1000 755 1 2 3 4" "$output"
+  done
+}
+
+# Each executable resolution checks every ancestor; a fork per directory
+# (plus `id -u` per walk) dominated start time. One stat process must cover
+# the whole chain, and a failed batch must fall back to per-directory stat.
+# The kernel UID is read once when the modules are sourced, so the walk
+# itself must fork no `id -u`.
+chain_walk_batch_stat_case() {
+  local tmp fake_bin stat_log id_log real_stat executable status depth anchor
+  tmp=$(_tmpdir) || return 1
+  fake_bin=$tmp/bin
+  stat_log=$tmp/stat.log
+  id_log=$tmp/id.log
+  real_stat=$(command -v stat) || return 1
+  mkdir -p "$fake_bin" "$tmp/a/b/c"
+  executable=$tmp/a/b/c/tool
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$executable"
+  chmod 0700 "$executable"
+  # The fake counts path operands after the format so a batch is visible;
+  # FWDPORTS_TEST_STAT_SINGLE rejects multi-path calls like a stat that
+  # cannot batch.
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'operands=$(($# - 2)); [[ ${3:-} != -- ]] || operands=$((operands - 1))' \
+    'printf "%s\n" "$operands" >>"$FWDPORTS_TEST_STAT_LOG"' \
+    'if [[ -n ${FWDPORTS_TEST_STAT_SINGLE:-} && $operands -gt 1 ]]; then exit 1; fi' \
+    'exec "$FWDPORTS_TEST_REAL_STAT" "$@"' >"$fake_bin/stat"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >>"$FWDPORTS_TEST_ID_LOG"' \
+    'exec /usr/bin/id "$@"' >"$fake_bin/id"
+  chmod 0700 "$fake_bin/stat" "$fake_bin/id"
+  # The walk covers every ancestor up to /, or up to Termux's PREFIX trust
+  # anchor when the suite runs inside Termux (its CI puts TMPDIR there).
+  depth=$(printf '%s\n' "${executable%/*}" | awk -F/ '{ print NF }')
+  if _fwdports_termux_prefix_anchor; then
+    # The helper succeeds only in Termux, where PREFIX is an ambient contract.
+    # shellcheck disable=SC2153
+    anchor=$(cd -P -- "$PREFIX" && pwd -P) || return 1
+    case "$executable" in
+      "$anchor"/*)
+        depth=$((depth - $(printf '%s\n' "$anchor" | awk -F/ '{ print NF }') + 1))
+        ;;
+    esac
+  fi
+
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_STAT_LOG=$stat_log \
+    FWDPORTS_TEST_ID_LOG=$id_log FWDPORTS_TEST_REAL_STAT=$real_stat \
+    _fwdports_executable_parent_chain_trusted "$executable"
+  status=$?
+  _assert_exit "portability: batched ancestor walk accepts a trusted chain" \
+    0 "$status"
+  _assert_eq "portability: one stat process covers every ancestor" \
+    "$depth" "$(<"$stat_log")"
+  _assert_not_contains "portability: ancestor walk forks no id -u" \
+    "-u" "$(cat "$id_log" 2>/dev/null)"
+
+  : >"$stat_log"
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_STAT_LOG=$stat_log \
+    FWDPORTS_TEST_ID_LOG=$id_log FWDPORTS_TEST_REAL_STAT=$real_stat \
+    FWDPORTS_TEST_STAT_SINGLE=1 \
+    _fwdports_executable_parent_chain_trusted "$executable"
+  status=$?
+  _assert_exit "portability: ancestor walk falls back to per-directory stat" \
+    0 "$status"
+  _assert_contains "portability: fallback stats one ancestor at a time" \
+    $'\n1\n1\n' "$(<"$stat_log")"
+
+  chmod 0777 "$tmp/a"
+  PATH="$fake_bin:/usr/bin:/bin" FWDPORTS_TEST_STAT_LOG=$stat_log \
+    FWDPORTS_TEST_ID_LOG=$id_log FWDPORTS_TEST_REAL_STAT=$real_stat \
+    _fwdports_executable_parent_chain_trusted "$executable" \
+    2>"$tmp/error"
+  status=$?
+  chmod 0700 "$tmp/a"
+  _assert_exit "portability: batched walk still rejects a writable ancestor" \
+    1 "$status"
+  _assert_contains "portability: batched walk names the writable ancestor" \
+    "$tmp/a (mode 777)" "$(<"$tmp/error")"
+}
+
 run_case bsd-stat bsd_stat_case
+run_case native-stat-order native_stat_order_case
+run_case chain-walk-batch-stat chain_walk_batch_stat_case
 run_case canonicalization canonicalization_case
 run_case stock-ssh-default stock_ssh_default_case
 run_case termux-prefix-anchor termux_prefix_anchor_case

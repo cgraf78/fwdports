@@ -689,6 +689,13 @@ ettun_stop_strategy_case() {
   fwdports_tmux_terminate_pane() {
     printf 'terminate=%s\n' "${10:-missing}" >>"$FWDPORTS_TEST_EVENTS"
   }
+  fwdports_tmux_interrupt_ettun_pane() {
+    printf 'interrupt\n' >>"$FWDPORTS_TEST_EVENTS"
+    printf 'interrupted\t101\n'
+  }
+  fwdports_tmux_finish_ettun_pane() {
+    printf 'finish=%s\n' "${10:-missing}" >>"$FWDPORTS_TEST_EVENTS"
+  }
   fwdports_tmux_remove_generation_session() {
     printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
   }
@@ -702,10 +709,143 @@ ettun_stop_strategy_case() {
 
   _assert_exit "ettun stop strategy: generation stop succeeds" 0 "$status"
   _assert_eq "ettun stop strategy: authenticates and passes session scope" \
-    $'session-verify\nsession-verify\nterminate=ettun-session\nremove-session' \
+    $'session-verify\nsession-verify\ninterrupt\nfinish=101\nremove-session' \
     "$(<"$events")"
   _assert_not_exists "ettun stop strategy: removes completed generation" \
     "$generation"
+}
+
+# Stop the two-leg ettun fixture with stubbed per-pane stop halves, logging
+# each call to EVENTS. FWDPORTS_TEST_FAIL_INTERRUPT, _FAIL_REVALIDATE and
+# _FAIL_FINISH name a leg whose interrupt, post-interrupt revalidation, or
+# finish fails closed; FWDPORTS_TEST_DONE_LEG names one already gone.
+ettun_two_leg_stop() {
+  local tmp=$1 events=$2 fixture leg
+  fixture=$(controller_fixture "$tmp" ettun zeta) || return 1
+  IFS=$'\t' read -r STOP_ROOT STOP_GENERATION STOP_DIGEST <<<"$fixture"
+  for leg in web zeta; do
+    mkdir -p "$STOP_GENERATION/legs/$leg"
+    chmod 0700 "$STOP_GENERATION/legs" "$STOP_GENERATION/legs/$leg"
+    : >"$STOP_GENERATION/legs/$leg/pane"
+  done
+  : >"$events"
+
+  fwdports_tmux_verify_pane() { return 0; }
+  _fwdports_verify_owned_session() {
+    local leg=${3%/pane}
+    leg=${leg##*/}
+    # Fail the decisive revalidation of the named leg once an earlier leg
+    # has been interrupted, as a session that turns ambiguous mid-stop would.
+    if [[ $leg == "${FWDPORTS_TEST_FAIL_REVALIDATE:-}" ]] &&
+      grep -q '^interrupt=' "$FWDPORTS_TEST_EVENTS"; then
+      return 2
+    fi
+    printf '101\t101\t101\n'
+  }
+  _fwdports_cleanup_generation_drivers() { return 0; }
+  fwdports_tmux_terminate_pane() {
+    printf 'terminate\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+  fwdports_tmux_interrupt_ettun_pane() {
+    local leg=${7%/pane}
+    leg=${leg##*/}
+    printf 'interrupt=%s\n' "$leg" >>"$FWDPORTS_TEST_EVENTS"
+    [[ $leg != "${FWDPORTS_TEST_FAIL_INTERRUPT:-}" ]] || return 74
+    if [[ $leg == "${FWDPORTS_TEST_DONE_LEG:-}" ]]; then
+      printf 'gone\n'
+    elif [[ $leg == web ]]; then
+      printf 'interrupted\t201\n'
+    else
+      printf 'interrupted\t202\n'
+    fi
+  }
+  fwdports_tmux_finish_ettun_pane() {
+    local leg=${7%/pane}
+    leg=${leg##*/}
+    printf 'finish=%s:%s\n' "$leg" "${10}" >>"$FWDPORTS_TEST_EVENTS"
+    [[ $leg != "${FWDPORTS_TEST_FAIL_FINISH:-}" ]] || return 74
+  }
+  fwdports_tmux_remove_generation_session() {
+    printf 'remove-session\n' >>"$FWDPORTS_TEST_EVENTS"
+  }
+
+  set +e
+  FWDPORTS_TEST_EVENTS=$events \
+    _fwdports_stop_generation_locked /fake/tmux "$tmp/socket" \
+    "$STOP_ROOT" pending "$STOP_GENERATION" "$STOP_DIGEST" fwdports 1 0 \
+    >/dev/null 2>&1
+  STOP_STATUS=$?
+  set -e
+}
+
+ettun_stop_overlaps_legs_case() {
+  local tmp events
+  tmp=$(_tmpdir) || return 1
+  events=$tmp/events
+
+  ettun_two_leg_stop "$tmp" "$events" || return 1
+  _assert_exit "ettun stop overlap: generation stop succeeds" 0 "$STOP_STATUS"
+  # Every leg is interrupted before any wait, so remote cleanup overlaps;
+  # each finish keeps its own leg's session from the interrupt.
+  _assert_eq "ettun stop overlap: interrupts every leg before waiting" \
+    $'interrupt=web\ninterrupt=zeta\nfinish=web:201\nfinish=zeta:202\nremove-session' \
+    "$(<"$events")"
+  _assert_not_exists "ettun stop overlap: removes completed generation" \
+    "$STOP_GENERATION"
+
+  tmp=$(_tmpdir) || return 1
+  events=$tmp/events
+  FWDPORTS_TEST_DONE_LEG=web ettun_two_leg_stop "$tmp" "$events" || return 1
+  _assert_exit "ettun stop overlap: an already-gone leg needs no wait" 0 \
+    "$STOP_STATUS"
+  _assert_eq "ettun stop overlap: waits only for interrupted legs" \
+    $'interrupt=web\ninterrupt=zeta\nfinish=zeta:202\nremove-session' \
+    "$(<"$events")"
+}
+
+ettun_stop_interrupt_failure_case() {
+  local tmp events
+  tmp=$(_tmpdir) || return 1
+  events=$tmp/events
+
+  FWDPORTS_TEST_FAIL_INTERRUPT=zeta ettun_two_leg_stop "$tmp" "$events" ||
+    return 1
+  _assert_exit "ettun stop interrupt failure: stop fails closed" 74 \
+    "$STOP_STATUS"
+  # The earlier leg is already interrupted, so it is still driven through
+  # its finish (and escalation) instead of being abandoned mid-stop, while
+  # the failed leg receives nothing further.
+  _assert_eq "ettun stop interrupt failure: finishes interrupted legs only" \
+    $'interrupt=web\ninterrupt=zeta\nfinish=web:201' "$(<"$events")"
+  _assert_file "ettun stop interrupt failure: preserves generation" \
+    "$STOP_GENERATION/manifest"
+  _assert_file "ettun stop interrupt failure: preserves pointer" \
+    "$STOP_ROOT/pending"
+
+  tmp=$(_tmpdir) || return 1
+  events=$tmp/events
+  FWDPORTS_TEST_FAIL_REVALIDATE=zeta ettun_two_leg_stop "$tmp" "$events" ||
+    return 1
+  _assert_exit "ettun stop revalidation failure: stop fails closed" 74 \
+    "$STOP_STATUS"
+  _assert_eq "ettun stop revalidation failure: finishes the earlier leg" \
+    $'interrupt=web\nfinish=web:201' "$(<"$events")"
+  _assert_file "ettun stop revalidation failure: preserves generation" \
+    "$STOP_GENERATION/manifest"
+
+  # Every leg already has its first Ctrl-C by the finish loop, so one leg's
+  # failed finish must not abandon the next leg mid-stop.
+  tmp=$(_tmpdir) || return 1
+  events=$tmp/events
+  FWDPORTS_TEST_FAIL_FINISH=web ettun_two_leg_stop "$tmp" "$events" ||
+    return 1
+  _assert_exit "ettun stop finish failure: stop fails closed" 74 \
+    "$STOP_STATUS"
+  _assert_eq "ettun stop finish failure: still finishes later legs" \
+    $'interrupt=web\ninterrupt=zeta\nfinish=web:201\nfinish=zeta:202' \
+    "$(<"$events")"
+  _assert_file "ettun stop finish failure: preserves generation" \
+    "$STOP_GENERATION/manifest"
 }
 
 precleanup_all_panes_validated_case() {
@@ -1074,6 +1214,8 @@ run_case dead-pane-process-inspection-failure \
   dead_pane_process_inspection_failure_case
 run_case external-cleanup-order external_cleanup_order_case
 run_case ettun-stop-strategy ettun_stop_strategy_case
+run_case ettun-stop-overlaps-legs ettun_stop_overlaps_legs_case
+run_case ettun-stop-interrupt-failure ettun_stop_interrupt_failure_case
 run_case precleanup-all-panes-validated precleanup_all_panes_validated_case
 run_case precleanup-stops-pane precleanup_stops_pane_case
 run_case precleanup-revalidation-ambiguity \

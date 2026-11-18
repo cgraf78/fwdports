@@ -58,7 +58,10 @@ platform requires two complete scans with no live member. Zombie and dead rows
 remain ownership evidence but are inert for cleanup because they cannot execute,
 fork, receive another signal, or retain a forwarding socket. Its first terminal
 Ctrl-C gets a bounded graceful wait, and a still-authenticated pane receives
-ettun's second-Ctrl-C force request. Active copy mode is cancelled in the same
+ettun's second-Ctrl-C force request. A generation stop interrupts every ettun
+leg before waiting on any of them; overlapping the waits grants no extra
+authority, because each interrupt and escalation reauthenticates its own pane
+and session at the signal boundary. Active copy mode is cancelled in the same
 tmux command sequence so it cannot swallow either interrupt. fwdports reports
 success only after two complete scans find no live session member and never
 substitutes KILL for ettun's cleanup contract. A missing leader, changed session scope,

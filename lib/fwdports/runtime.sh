@@ -3,9 +3,18 @@
 # module is rooted beneath a validated per-user directory and requires an
 # independently rechecked generation identity before it acts.
 
+# The effective UID for every ownership check, read from the kernel once when
+# the module is sourced. Trust checks run hundreds of times per lifecycle
+# command, and forking `id -u` for each one was a measurable share of start
+# and stop time. Bash's EUID is not a substitute: an EUID variable imported
+# from the environment replaces Bash's read-only geteuid(2) value. Assigned
+# unconditionally so the environment cannot supply it either; if `id` fails,
+# the empty value matches no owner except root and checks fail closed.
+_FWDPORTS_EUID=$(id -u 2>/dev/null) || _FWDPORTS_EUID=
+
 _fwdports_runtime_trust_record() {
   local owner=$1 mode=$2 effective_uid
-  effective_uid=$(id -u) || return 1
+  effective_uid=$_FWDPORTS_EUID
   if [[ $owner != 0 && $owner != "$effective_uid" ]]; then
     printf 'fwdports: path has an untrusted owner\n' >&2
     return 1
@@ -20,32 +29,49 @@ _fwdports_runtime_trust_record() {
   fi
 }
 
+# Print one stat record for PATH using GNU_FORMAT (`stat -c`) or BSD_FORMAT
+# (`stat -f`). The platform's native flavor goes first: BSD stat rejects
+# `-c`, so the old GNU-first order spent a fork that always failed on macOS
+# for each of the hundreds of trust checks in one start or stop. The other
+# flavor stays as the fallback (for example, GNU coreutils ahead of the
+# system stat on a macOS PATH). An attempt counts only if it succeeds with
+# exactly one line: GNU reads `-f FORMAT` as --file-system plus a file
+# operand, which can succeed with multi-line file-system output if a file
+# named like the format exists in the working directory.
+_fwdports_runtime_stat() {
+  local gnu_format=$1 bsd_format=$2 path=$3 output
+
+  case ${OSTYPE:-} in
+    darwin* | *bsd*)
+      if output=$(LC_ALL=C stat -f "$bsd_format" "$path" 2>/dev/null) &&
+        [[ $output != *$'\n'* ]]; then
+        :
+      else
+        output=$(LC_ALL=C stat -c "$gnu_format" -- "$path" 2>/dev/null) ||
+          return 1
+      fi
+      ;;
+    *)
+      # BSD stat treats `--` as a pathname rather than an option terminator.
+      if output=$(LC_ALL=C stat -c "$gnu_format" -- "$path" 2>/dev/null) &&
+        [[ $output != *$'\n'* ]]; then
+        :
+      else
+        output=$(LC_ALL=C stat -f "$bsd_format" "$path" 2>/dev/null) ||
+          return 1
+      fi
+      ;;
+  esac
+  [[ $output != *$'\n'* ]] || return 1
+  printf '%s\n' "$output"
+}
+
 _fwdports_runtime_owner_mode() {
-  local path=$1 output
-  if output=$(LC_ALL=C stat -c '%u %a' -- "$path" 2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  if output=$(LC_ALL=C stat -f '%u %Lp' "$path" 2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  return 1
+  _fwdports_runtime_stat '%u %a' '%u %Lp' "$1"
 }
 
 _fwdports_runtime_identity() {
-  local path=$1 output
-  if output=$(LC_ALL=C stat -c '%u:%a:%d:%i:%s:%Y' -- "$path" \
-    2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  if output=$(LC_ALL=C stat -f '%u:%Lp:%d:%i:%z:%m' "$path" \
-    2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  return 1
+  _fwdports_runtime_stat '%u:%a:%d:%i:%s:%Y' '%u:%Lp:%d:%i:%z:%m' "$1"
 }
 
 _fwdports_runtime_validate_node() {
@@ -133,7 +159,7 @@ fwdports_validate_trusted_path() {
     }
     # Symlink mode bits are not portable and are commonly reported as 0777;
     # link ownership and the separately validated target carry the trust.
-    if [[ $owner != 0 && $owner != "$(id -u)" ]]; then
+    if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]]; then
       printf 'fwdports: symbolic link has an untrusted owner\n' >&2
       return 1
     fi
@@ -316,7 +342,7 @@ _fwdports_lock_owner_state() {
 
   record=$(_fwdports_lock_read_owner "$file") || return 2
   IFS=$'\t' read -r nonce uid pid recorded_start target <<<"$record"
-  [[ $uid == "$(id -u)" ]] || return 2
+  [[ $uid == "$_FWDPORTS_EUID" ]] || return 2
   if kill -0 "$pid" 2>/dev/null; then
     current_start=$(_fwdports_process_start_identity "$pid") || return 2
     [[ $current_start == "$recorded_start" ]] && return 0
@@ -330,7 +356,7 @@ _fwdports_lock_write_owner() {
   if ! {
     printf 'version\t1\n'
     printf 'nonce\t%s\n' "$nonce"
-    printf 'uid\t%s\n' "$(id -u)"
+    printf 'uid\t%s\n' "$_FWDPORTS_EUID"
     printf 'pid\t%s\n' "$$"
     printf 'start\t%s\n' "$start"
     [[ -z $target ]] || printf 'target\t%s\n' "$target"

@@ -7,6 +7,10 @@
 FWDPORTS_TMUX_TRANSPORT_WINDOW=forwards
 FWDPORTS_TMUX_CONTROL_WINDOW=control
 
+# Kernel effective UID, read once per process; see runtime.sh for why this
+# is neither `id -u` per check nor Bash's environment-overridable EUID.
+_FWDPORTS_EUID=$(id -u 2>/dev/null) || _FWDPORTS_EUID=
+
 _fwdports_tmux_call() {
   local tmux_path=$1 socket=$2
   shift 2
@@ -724,19 +728,9 @@ _fwdports_tmux_platform_is_darwin() {
 }
 
 _fwdports_tmux_stat_identity() {
-  local path=$1 output
-
-  if output=$(LC_ALL=C stat -c '%u %a %d %i %s %Y' -- "$path" \
-    2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  if output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' "$path" \
-    2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  return 1
+  # Every Darwin session scan runs this twice, so it shares runtime.sh's
+  # native-flavor-first stat order (this module already relies on runtime.sh).
+  _fwdports_runtime_stat '%u %a %d %i %s %Y' '%u %Lp %d %i %z %m' "$1"
 }
 
 _fwdports_tmux_trusted_file_identity() {
@@ -744,7 +738,7 @@ _fwdports_tmux_trusted_file_identity() {
 
   record=$(_fwdports_tmux_stat_identity "$path") || return 2
   read -r owner mode device inode size mtime extra <<<"$record"
-  uid=$(id -u) || return 2
+  uid=$_FWDPORTS_EUID
   [[ -z $extra && $owner =~ ^[0-9]+$ && $mode =~ ^[0-7]{3,4}$ &&
     $device =~ ^[0-9]+$ && $inode =~ ^[0-9]+$ &&
     $size =~ ^[0-9]+$ && $mtime =~ ^[0-9]+$ &&
@@ -1247,7 +1241,14 @@ _fwdports_tmux_interrupt_recorded_pane() {
     >/dev/null 2>&1
 }
 
-_fwdports_tmux_terminate_ettun_session() {
+# First half of ettun's stop contract for one pane: authenticate it and
+# deliver the first Ctrl-C without waiting for the session to drain. Prints
+# `gone` or `term` when nothing remains to do, or `interrupted<TAB>SID` when
+# `_fwdports_tmux_finish_ettun_session` must wait for SID to empty. Splitting
+# the halves lets a generation interrupt every ettun leg before waiting on
+# any of them, so each leg's graceful remote cleanup overlaps the others
+# instead of the stop taking the sum of all of them.
+_fwdports_tmux_interrupt_ettun_session() {
   local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
   local digest=$6 evidence=$7 attempts=$8 delay=$9 verify_status scope leader
   local sid session_status
@@ -1305,6 +1306,17 @@ _fwdports_tmux_terminate_ettun_session() {
       >&2
     return 74
   }
+  printf 'interrupted\t%s\n' "$sid"
+}
+
+# Second half of ettun's stop contract: wait for the session interrupted by
+# `_fwdports_tmux_interrupt_ettun_session` to empty, escalating to ettun's
+# second Ctrl-C only after the pane and session are authenticated afresh.
+_fwdports_tmux_finish_ettun_session() {
+  local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
+  local digest=$6 evidence=$7 attempts=$8 delay=$9 sid=${10} verify_status
+  local scope leader session_status
+
   if _fwdports_wait_session_empty "$sid" "$evidence" "$attempts" "$delay"; then
     printf 'term\n'
     return 0
@@ -1383,16 +1395,54 @@ _fwdports_tmux_terminate_ettun_session() {
   return 74
 }
 
-fwdports_tmux_terminate_pane() {
-  local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
-  local digest=$6 evidence=$7 attempts=$8 delay=$9 verify_status pgid
-  local group_status strategy=${10:-group}
+_fwdports_tmux_terminate_ettun_session() {
+  local result
+
+  result=$(_fwdports_tmux_interrupt_ettun_session "$@") || return $?
+  case "$result" in
+    interrupted$'\t'*)
+      _fwdports_tmux_finish_ettun_session "$@" "${result#*$'\t'}"
+      ;;
+    *) printf '%s\n' "$result" ;;
+  esac
+}
+
+_fwdports_tmux_termination_bound_valid() {
+  local attempts=$1 delay=$2
 
   [[ $attempts =~ ^[1-9][0-9]*$ &&
     $delay =~ ^(0|0\.[0-9]+|[1-9][0-9]*(\.[0-9]+)?)$ ]] || {
     printf 'fwdports: invalid process termination bound\n' >&2
     return 1
   }
+}
+
+# Deliver ettun's first Ctrl-C to one authenticated pane without waiting.
+# Takes fwdports_tmux_terminate_pane's first nine arguments. Prints `gone`
+# or `term` when the pane needs nothing more, otherwise `interrupted<TAB>SID`
+# for fwdports_tmux_finish_ettun_pane.
+fwdports_tmux_interrupt_ettun_pane() {
+  _fwdports_tmux_termination_bound_valid "$8" "$9" || return 1
+  _fwdports_tmux_interrupt_ettun_session "$@"
+}
+
+# Complete the stop begun by fwdports_tmux_interrupt_ettun_pane. Takes the
+# same nine arguments plus the SID it printed.
+fwdports_tmux_finish_ettun_pane() {
+  _fwdports_tmux_termination_bound_valid "$8" "$9" || return 1
+  [[ ${10:-} =~ ^[1-9][0-9]*$ ]] || {
+    printf 'fwdports: invalid interrupted process session\n' >&2
+    return 1
+  }
+  _fwdports_tmux_finish_ettun_session "$@"
+}
+
+fwdports_tmux_terminate_pane() {
+  local tmux_path=$1 socket=$2 root=$3 pointer_kind=$4 generation=$5
+  local digest=$6 evidence=$7 attempts=$8 delay=$9 verify_status pgid
+  local group_status strategy=${10:-group}
+
+  _fwdports_tmux_termination_bound_valid "$attempts" "$delay" || return 1
   case "$strategy" in
     group) ;;
     ettun-session)

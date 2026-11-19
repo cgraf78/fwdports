@@ -3,33 +3,67 @@
 # launch a shell command string: every option remains a separately validated
 # argv element all the way to exec.
 
-_fwdports_stat_identity() {
-  local path=$1 output
+# Kernel effective UID, read once per process; see runtime.sh for why this
+# is neither `id -u` per check nor Bash's environment-overridable EUID.
+_FWDPORTS_EUID=$(id -u 2>/dev/null) || _FWDPORTS_EUID=
 
-  if output=$(LC_ALL=C stat -c '%u %a %d %i %s %Y' -- "$path" 2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  # BSD stat treats `--` as a pathname rather than an option terminator.
-  if output=$(LC_ALL=C stat -f '%u %Lp %d %i %z %m' "$path" 2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  return 1
+# Succeed when OUTPUT (command-substitution text) holds exactly COUNT lines.
+_fwdports_stat_line_count_is() {
+  local rest=$1 count=1
+
+  while [[ $rest == *$'\n'* ]]; do
+    rest=${rest#*$'\n'}
+    count=$((count + 1))
+  done
+  [[ $count -eq $2 ]]
+}
+
+# Print stat records for one or more PATHs, one line per path in argument
+# order, using GNU_FORMAT (`stat -c`) or BSD_FORMAT (`stat -f`). The native
+# flavor goes first: BSD stat rejects `-c`, so trying GNU first spent a fork
+# that always failed on macOS for every one of the hundreds of trust checks
+# in a single start. The other flavor stays as the fallback (for example GNU
+# coreutils first on a macOS PATH). An attempt counts only if it succeeds
+# with exactly one line per path: GNU reads `-f FORMAT` as --file-system plus
+# a file operand, which can succeed with multi-line file-system output if a
+# file named like the format exists in the working directory. This module is
+# sourced without runtime.sh by some callers, so it keeps its own copy of
+# runtime.sh's `_fwdports_runtime_stat` order.
+_fwdports_stat_format() {
+  local gnu_format=$1 bsd_format=$2 output
+  shift 2
+
+  case ${OSTYPE:-} in
+    darwin* | *bsd*)
+      if output=$(LC_ALL=C stat -f "$bsd_format" "$@" 2>/dev/null) &&
+        _fwdports_stat_line_count_is "$output" "$#"; then
+        :
+      else
+        output=$(LC_ALL=C stat -c "$gnu_format" -- "$@" 2>/dev/null) ||
+          return 1
+      fi
+      ;;
+    *)
+      # BSD stat treats `--` as a pathname rather than an option terminator.
+      if output=$(LC_ALL=C stat -c "$gnu_format" -- "$@" 2>/dev/null) &&
+        _fwdports_stat_line_count_is "$output" "$#"; then
+        :
+      else
+        output=$(LC_ALL=C stat -f "$bsd_format" "$@" 2>/dev/null) ||
+          return 1
+      fi
+      ;;
+  esac
+  _fwdports_stat_line_count_is "$output" "$#" || return 1
+  printf '%s\n' "$output"
+}
+
+_fwdports_stat_identity() {
+  _fwdports_stat_format '%u %a %d %i %s %Y' '%u %Lp %d %i %z %m' "$1"
 }
 
 _fwdports_stat_group() {
-  local path=$1 output
-
-  if output=$(LC_ALL=C stat -c '%g' -- "$path" 2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  if output=$(LC_ALL=C stat -f '%g' "$path" 2>/dev/null); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  return 1
+  _fwdports_stat_format '%g' '%g' "$1"
 }
 
 _fwdports_platform_is_darwin() {
@@ -113,10 +147,12 @@ fwdports_ssh_command() {
 
 _fwdports_executable_parent_chain_trusted() {
   local path=$1 directory record owner mode _rest mode_bits uid parent
-  local trust_anchor='' canonical_candidate
+  local trust_anchor='' canonical_candidate batch index count=0
+  local record_count=0
+  local -a directories=() records=()
 
   directory=${path%/*}
-  uid=$(id -u) || return 1
+  uid=$_FWDPORTS_EUID
 
   # Android's app sandbox is not expressible through traditional owner/mode
   # bits above Termux's PREFIX. Only the real Termux environment gets that
@@ -133,17 +169,45 @@ _fwdports_executable_parent_chain_trusted() {
         ;;
     esac
   fi
+  # Collect the whole chain first so one stat process can cover it. Each
+  # executable resolution walks about ten ancestors and one start resolves
+  # dozens of executables, so a stat fork per directory dominated start time.
   while :; do
+    directories+=("$directory")
+    count=$((count + 1))
+    [[ -z $trust_anchor || $directory != "$trust_anchor" ]] || break
+    [[ $directory != / ]] || break
+    parent=${directory%/*}
+    [[ -n $parent ]] || parent=/
+    directory=$parent
+  done
+  # One snapshot of every ancestor is at least as coherent as the former
+  # per-directory reads. If it fails or is incomplete (a missing ancestor, a
+  # non-directory), fall back to per-directory stat so the first failing
+  # ancestor still gets its exact diagnostic below.
+  if batch=$(_fwdports_stat_format '%u %a' '%u %Lp' "${directories[@]}"); then
+    while IFS= read -r record || [[ -n $record ]]; do
+      records+=("$record")
+      record_count=$((record_count + 1))
+    done <<<"$batch"
+    [[ $record_count -eq $count ]] || record_count=0
+  fi
+  for ((index = 0; index < count; index++)); do
+    directory=${directories[index]}
     [[ -d $directory && ! -L $directory ]] || {
       printf 'fwdports: executable path has an untrusted parent: %s\n' \
         "$directory" >&2
       return 1
     }
-    record=$(_fwdports_stat_identity "$directory") || {
-      printf 'fwdports: executable path has an untrusted parent: %s\n' \
-        "$directory" >&2
-      return 1
-    }
+    if [[ $record_count -gt 0 ]]; then
+      record=${records[index]}
+    else
+      record=$(_fwdports_stat_identity "$directory") || {
+        printf 'fwdports: executable path has an untrusted parent: %s\n' \
+          "$directory" >&2
+        return 1
+      }
+    fi
     read -r owner mode _rest <<<"$record"
     [[ $owner =~ ^[0-9]+$ && $mode =~ ^[0-7]{3,4}$ ]] || {
       printf 'fwdports: executable path has an untrusted parent: %s\n' \
@@ -170,11 +234,6 @@ _fwdports_executable_parent_chain_trusted() {
         return 1
       fi
     fi
-    [[ -z $trust_anchor || $directory != "$trust_anchor" ]] || break
-    [[ $directory != / ]] || break
-    parent=${directory%/*}
-    [[ -n $parent ]] || parent=/
-    directory=$parent
   done
 }
 
@@ -1373,7 +1432,7 @@ fwdports_ssh_resolve() {
     return 1
   }
   read -r owner mode device inode size mtime <<<"$stat_record"
-  if [[ $owner != 0 && $owner != "$(id -u)" ]]; then
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]]; then
     printf 'fwdports: OpenSSH executable has an untrusted owner: %s\n' \
       "$path" >&2
     return 1
@@ -1489,7 +1548,7 @@ _fwdports_ettun_session_python_file_record() {
     return 1
   }
   read -r owner mode device inode size mtime extra <<<"$stat_record"
-  uid=$(id -u) || return 1
+  uid=$_FWDPORTS_EUID
   if [[ -n $extra || ! $owner =~ ^[0-9]+$ ||
     ! $mode =~ ^[0-7]{3,4}$ || ! $device =~ ^[0-9]+$ ||
     ! $inode =~ ^[0-9]+$ || ! $size =~ ^[0-9]+$ ||
@@ -1631,7 +1690,7 @@ fwdports_ettun_resolve() {
     return 1
   }
   read -r owner mode device inode size mtime <<<"$stat_record"
-  if [[ $owner != 0 && $owner != "$(id -u)" ]]; then
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]]; then
     printf 'fwdports: ettun executable has an untrusted owner\n' >&2
     return 1
   fi
@@ -1796,7 +1855,7 @@ fwdports_ettun_transport_resolve() {
     return 1
   }
   read -r owner mode device inode size mtime <<<"$stat_record"
-  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]] ||
     (((8#$mode & 022) != 0)); then
     printf 'fwdports: ettun transport adapter has untrusted metadata\n' >&2
     return 1
@@ -1874,7 +1933,7 @@ fwdports_ettun_snapshot_executable() {
   stat_record=$(_fwdports_stat_identity "$path") || return 1
   read -r owner mode device inode size mtime <<<"$stat_record"
   identity=$device:$inode:$mode:$size:$mtime
-  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]] ||
     (((8#$mode & 022) != 0)) || [[ $identity != "$expected_identity" ]]; then
     printf 'fwdports: %s changed before snapshot\n' "$description" >&2
     return 1
@@ -1894,7 +1953,7 @@ fwdports_ettun_snapshot_executable() {
   }
   stat_record=$(_fwdports_stat_identity "$destination_parent") || return 1
   read -r owner mode device inode size mtime <<<"$stat_record"
-  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]] ||
     (((8#$mode & 022) != 0)); then
     printf 'fwdports: %s snapshot parent is untrusted\n' \
       "$description" >&2
@@ -1927,7 +1986,7 @@ fwdports_ettun_snapshot_executable() {
     return 1
   }
   if [[ ! -f $path || ! -x $path || -L $path ||
-    ($owner != 0 && $owner != "$(id -u)") ]] ||
+    ($owner != 0 && $owner != "$_FWDPORTS_EUID") ]] ||
     (((8#$mode & 022) != 0)) || [[ $identity != "$expected_identity" ||
     $digest != "$expected_digest" ||
     $snapshot_digest != "$expected_digest" ]]; then
@@ -1957,7 +2016,7 @@ fwdports_et_resolve() {
     return 1
   }
   read -r owner mode device inode size mtime <<<"$stat_record"
-  if [[ $owner != 0 && $owner != "$(id -u)" ]]; then
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]]; then
     printf 'fwdports: Eternal Terminal executable has an untrusted owner\n' >&2
     return 1
   fi
@@ -2699,7 +2758,7 @@ fwdports_autossh_resolve() {
   }
   stat_record=$(_fwdports_stat_identity "$path") || return 1
   read -r owner mode _rest <<<"$stat_record"
-  if [[ $owner != 0 && $owner != "$(id -u)" ]] ||
+  if [[ $owner != 0 && $owner != "$_FWDPORTS_EUID" ]] ||
     (((8#$mode & 022) != 0)); then
     printf 'fwdports: autossh executable has untrusted metadata\n' >&2
     return 1

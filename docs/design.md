@@ -310,7 +310,14 @@ are required before absence is accepted. Zombie and dead rows remain ownership
 evidence but are excluded from liveness because they cannot execute or retain a
 forwarding socket. Cleanup then uses ettun's bounded first- and second-Ctrl-C
 contract through the authenticated tmux pane. It exits copy mode before each
-interrupt so tmux cannot consume the stop request as a mode key. The generation
+interrupt so tmux cannot consume the stop request as a mode key. A generation
+stop delivers every ettun leg's first Ctrl-C, each after its own pane and
+session authentication, before waiting on any ettun leg, so their graceful
+remote cleanups overlap; legs of other drivers are still terminated in place.
+It then waits for and, if needed, escalates each interrupted leg, even after
+another leg fails closed. A stop interrupted after that first pass leaves
+every ettun leg draining, so a resumed stop's first Ctrl-C can reach ettun as
+its second, force-cleanup request. The generation
 is removable only after two complete scans find no live session member.
 Ambiguous evidence is retained for manual diagnosis rather than guessed away.
 

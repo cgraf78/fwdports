@@ -1006,6 +1006,96 @@ ettun_lifecycle_case() {
   _assert_command_ok "ettun lifecycle: authenticated stop succeeds"
 }
 
+# ettun's graceful stop retires remote relay state over the network, so stop
+# must interrupt every ettun leg before waiting on any of them. Each fake leg
+# records, on its first interrupt, whether its peer was interrupted while it
+# was still cleaning up. A serial stop interrupts the second leg only after
+# the first has exited, so the first leg would record `serial`. The peer wait
+# is generous because a passing run returns as soon as the peer marker
+# appears; only the old serial behavior waits it out.
+ettun_stop_overlaps_legs_case() {
+  local tmp config output markers index=0 leg
+  tmp=$(_tmpdir) || return 1
+  setup_case_root "$tmp"
+  config=$CASE_CONFIG/fwdports/tunnels.conf
+  output=$tmp/output
+  markers=$tmp/markers
+  mkdir -p "$markers"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'if [[ ${1:-} == --help ]]; then printf "Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT\nettun VIA [--jump-host JUMP_HOST]\nProvider contract: remote-port-slot-v1\n" >&2; exit 0; fi' \
+    'dir=$FWDPORTS_TEST_ETTUN_MARKERS port=$2 peer=18080' \
+    '[[ $port != 18080 ]] || peer=18081' \
+    'on_interrupt() {' \
+    '  local index=0' \
+    '  : >"$dir/$port.interrupted"' \
+    '  while [[ ! -e $dir/$peer.interrupted && $index -lt 3000 ]]; do' \
+    '    sleep 0.01; index=$((index + 1))' \
+    '  done' \
+    '  if [[ -e $dir/$peer.interrupted ]]; then' \
+    '    printf "overlapped\n" >"$dir/$port.result"' \
+    '  else' \
+    '    printf "serial\n" >"$dir/$port.result"' \
+    '  fi' \
+    '  exit 0' \
+    '}' \
+    'trap on_interrupt INT' \
+    'trap "exit 0" HUP TERM' \
+    ': >"$dir/$port.running"' \
+    'while :; do sleep 0.02; done' >"$CASE_ETTUN"
+  chmod 0700 "$CASE_ETTUN"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ ${1:-} == --version ]]; then printf "et version 7.0.0\n"; exit 0; fi' \
+    'if [[ ${1:-} == --help ]]; then' \
+    '  printf "%s\n" --port --tunnel --reversetunnel --jumphost --logdir --logtostdout --no-terminal --telemetry' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' >"$CASE_ET"
+  chmod 0700 "$CASE_ET"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$tmp/bin/lsof"
+  cp "$tmp/bin/lsof" "$tmp/bin/ss"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ " $* " != *" -w 1 "* ]]' >"$tmp/bin/nc"
+  chmod 0700 "$tmp/bin/lsof" "$tmp/bin/ss" "$tmp/bin/nc"
+  printf '%s\n' \
+    'profile default' \
+    'leg first ettun' \
+    'set first host gateway.example.net' \
+    'set first local-forward 127.0.0.1:18080:target.example.net:3389' \
+    'check first loopback 18080 first' \
+    'leg second ettun' \
+    'set second host gateway.example.net' \
+    'set second local-forward 127.0.0.1:18081:target.example.net:3389' \
+    'check second loopback 18081 second' >"$config"
+  chmod 0600 "$config"
+
+  PATH="$tmp/bin:$PATH" FWDPORTS_TEST_ETTUN_MARKERS=$markers \
+    run_fwdports "$output" start
+  _assert_command_ok "ettun stop overlap: two-leg profile starts"
+  # A leg interrupted before its trap is installed would just die and look
+  # like a serial-stop regression, so require both legs running first.
+  while [[ ! (-e $markers/18080.running && -e $markers/18081.running) &&
+    $index -lt 500 ]]; do
+    sleep 0.01
+    index=$((index + 1))
+  done
+  if [[ -e $markers/18080.running && -e $markers/18081.running ]]; then
+    _pass "ettun stop overlap: both legs are running before stop"
+  else
+    _fail "ettun stop overlap: both legs are running before stop ($(ls "$markers"))"
+  fi
+  PATH="$tmp/bin:$PATH" FWDPORTS_TEST_ETTUN_MARKERS=$markers \
+    run_fwdports "$output" stop
+  _assert_command_ok "ettun stop overlap: authenticated stop succeeds"
+  for leg in 18080 18081; do
+    _assert_eq "ettun stop overlap: leg $leg cleans up while its peer does" \
+      overlapped "$(cat "$markers/$leg.result" 2>/dev/null)"
+  done
+}
+
 symlink_config_target_override_case() {
   local tmp config source output generation manifest
   tmp=$(_tmpdir) || return 1
@@ -1405,6 +1495,7 @@ run_case default-ssh-lifecycle default_ssh_lifecycle_case
 run_case stock-et-lifecycle stock_et_lifecycle_case
 run_case delayed-stock-et-lifecycle delayed_stock_et_lifecycle_case
 run_case ettun-lifecycle ettun_lifecycle_case
+run_case ettun-stop-overlaps-legs ettun_stop_overlaps_legs_case
 run_case configured-health configured_health_case
 run_case tmux-observability tmux_observability_case
 run_case inspect-observability inspect_observability_case

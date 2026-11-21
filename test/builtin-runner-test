@@ -178,6 +178,18 @@ ettun_no_retry_case() {
 
 ettun_int_disposition_case() {
   local tmp runtime pid_file int_marker runner_pid gate_pid='' status index=0
+  # Bash can neither trap nor reset a signal that was ignored when it started,
+  # and the runner and gate inherit that disposition. A suite launched as an
+  # asynchronous command of a non-job-control shell (a parallel batch running
+  # `test/run &`, say) starts with INT ignored, so the gate's INT trap is a
+  # silent no-op and the case would blame the runner for a state production
+  # tmux panes, which start with default dispositions, never have. Probe a
+  # child Bash rather than parse `trap -p`, whose output Bash 3.2 differs on.
+  if ! "$BASH" -c 'trap "exit 0" INT; kill -INT $$; exit 1'; then
+    printf '  SKIP: %s\n' \
+      'built-in ettun INT disposition: suite started with SIGINT ignored'
+    return 0
+  fi
   tmp=$(_tmpdir) || return 1
   runtime=$tmp/runtime
   pid_file=$tmp/ettun.pid
@@ -199,7 +211,8 @@ ettun_int_disposition_case() {
   chmod 0700 "$runtime/ettun-gate"
 
   # Job control keeps Bash from imposing SIG_IGN on this asynchronous test
-  # launch. Production starts the pane command directly with the same default
+  # launch; it cannot undo an ignore inherited by the suite (see above).
+  # Production starts the pane command directly with the same default
   # disposition; the background form gives the test one exact, unreaped PID
   # for bounded cleanup if the assertion fails.
   set -m

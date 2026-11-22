@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@9010f3bb0aeb33740332bc230160a42d02dbc810
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
     with:
       # Process groups, tmux direct argv, and BSD command adapters materially
       # differ on macOS, Linux, and Termux, so every PR gets the full shared
@@ -51,7 +51,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned tmux for the stock Bash runner
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@9010f3bb0aeb33740332bc230160a42d02dbc810
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
         with:
           matrix-name: macOS
           profiles: tmux-pinned
@@ -171,4 +171,4 @@ jobs:
 
       # Workflow `uses:` refs must be literals. This gate proves those literals
       # still match the repository's one reviewed actions dependency lock.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@9010f3bb0aeb33740332bc230160a42d02dbc810
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450

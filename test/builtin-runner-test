@@ -295,8 +295,8 @@ ettun_interactive_stdin_case() {
     "$TMUX_BIN" -S "$socket" kill-session -t "$session" 2>/dev/null || true
     expected=tty:from-pane
   else
-    # The explicit stock macOS Bash job intentionally has no tmux. A pipe
-    # still exercises Bash's asynchronous-command stdin replacement rule.
+    # Without a local tmux, a pipe still exercises Bash's asynchronous-command
+    # stdin replacement rule.
     printf '%s\n' from-stdin |
       FWDPORTS_TEST_STDIN_RESULT=$result \
         FWDPORTS_TEST_STDIN_READY=$ready \

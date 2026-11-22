@@ -32,6 +32,9 @@ parsed as records and never evaluated as shell.
   sequentially; never parallelize them, because suites own tmux sockets,
   process groups, and timing. It silently skips a suite without the
   executable bit, so `chmod +x` a new suite or it never runs, locally or in CI.
+- Linux and macOS CI, including stock macOS Bash, use shared `tmux-pinned`
+  for real tmux cases. Termux uses its native tmux. Follow the
+  [managed tmux update procedure](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#updating-the-managed-tmux-build).
 - Single case: `bash test/<suite>-test <case>`. An unknown case fails.
 - `test/session-enumerator-test.py` runs from `test/process-tree-test`.
   `test/run` never runs ShellCheck; lint is CI-only (see below).

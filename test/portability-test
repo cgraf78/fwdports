@@ -120,13 +120,21 @@ termux_prefix_anchor_case() {
 }
 
 stock_macos_bash_ci_case() {
-  local workflow
+  local workflow stock_job
   workflow=$ROOT/.github/workflows/test.yml
+  stock_job=$(awk '/^  macos-bash32:/ { found=1; next }
+    found && /^  [a-z][a-z0-9-]*:/ { exit }
+    found { print }' "$workflow")
   _assert_contains "portability CI: uses the standard Tests display name" \
     "name: Tests" "$(<"$workflow")"
   _assert_contains "portability CI: retry controller watches Tests" \
     "workflows: [Tests]" \
     "$(<"$ROOT/.github/workflows/retry-infrastructure.yml")"
+  # shellcheck disable=SC2016 # Match the literal workflow command.
+  _assert_contains "portability CI: desktop suites require the pinned tmux executable" \
+    'test "$(command -v tmux)" = "$CI_TMUX_PINNED_BIN"' "$(<"$workflow")"
+  _assert_contains "portability CI: Termux runs the suite with native tmux" \
+    'termux-command: bash test/run' "$(<"$workflow")"
 
   # The shared matrix installs a current Homebrew Bash before running tests.
   # Keep a repository-owned gate for Apple's stock Bash so the documented
@@ -134,6 +142,13 @@ stock_macos_bash_ci_case() {
   # claim when the shared workflow evolves.
   _assert_contains "portability CI: has a stock macOS Bash job" \
     "macos-bash32:" "$(<"$workflow")"
+  _assert_contains "portability CI: stock job uses the shared installer" \
+    'uses: cgraf78/actions/.github/actions/shell-ci-prereqs@' "$stock_job"
+  _assert_contains "portability CI: stock job installs the pinned tmux" \
+    'profiles: tmux-pinned' "$stock_job"
+  # shellcheck disable=SC2016 # Match the literal workflow command.
+  _assert_contains "portability CI: stock job requires its pinned executable" \
+    'test "$(command -v tmux)" = "$CI_TMUX_PINNED_BIN"' "$stock_job"
   _assert_contains "portability CI: invokes stock /bin/bash" \
     'shell: /bin/bash {0}' "$(<"$workflow")"
   _assert_contains "portability CI: checks the Bash 3.2 version" \

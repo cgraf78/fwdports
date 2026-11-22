@@ -127,6 +127,11 @@ stock_macos_bash_ci_case() {
   _assert_contains "portability CI: retry controller watches Tests" \
     "workflows: [Tests]" \
     "$(<"$ROOT/.github/workflows/retry-infrastructure.yml")"
+  # shellcheck disable=SC2016 # Match the literal workflow command.
+  _assert_contains "portability CI: desktop suites require the pinned tmux executable" \
+    'test "$(command -v tmux)" = "$CI_TMUX_PINNED_BIN"' "$(<"$workflow")"
+  _assert_contains "portability CI: Termux runs the suite with native tmux" \
+    'termux-command: bash test/run' "$(<"$workflow")"
 
   # The shared matrix installs a current Homebrew Bash before running tests.
   # Keep a repository-owned gate for Apple's stock Bash so the documented

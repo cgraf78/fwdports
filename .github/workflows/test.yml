@@ -50,6 +50,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install pinned tmux for the stock Bash runner
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@9010f3bb0aeb33740332bc230160a42d02dbc810
+        with:
+          matrix-name: macOS
+          profiles: tmux-pinned
+
       - name: Exercise portable surfaces with stock macOS Bash
         shell: /bin/bash {0}
         run: |-
@@ -63,6 +69,10 @@ jobs:
           mkdir -p "$stock_bin"
           ln -s /bin/bash "$stock_bin/bash"
           export PATH="$stock_bin:$PATH"
+          # The interactive stdin case drives a real tmux pane when available.
+          # Exercise it with the shared binary, even on images that ship tmux.
+          test "$(command -v tmux)" = "$CI_TMUX_PINNED_BIN"
+          export FWDPORTS_TEST_TMUX_BIN="$CI_TMUX_PINNED_BIN"
 
           install_prefix="$RUNNER_TEMP/fwdports-bash32"
           PREFIX="$install_prefix" /bin/bash install.sh
@@ -75,8 +85,7 @@ jobs:
           done
 
           # Bash 3.2 treats the length of an empty nounset array as unbound.
-          # Exercise the controller's no-pane rollback without requiring tmux
-          # to be installed in this explicit stock-interpreter job.
+          # Exercise the controller's no-pane rollback under stock Bash.
           /bin/bash test/controller-test no-pane-stop
 
           # Bash 3.2 can report a nounset abort as success; the harness must

@@ -41,6 +41,19 @@ canonical_tmpdir_case() {
     "$physical" "$output"
 }
 
+colon_tmpdir_case() {
+  local tmp logical output status=0
+  tmp=$(_tmpdir) || return 1
+  mkdir "$tmp/has:colon"
+  logical=$tmp/logical
+  ln -s "$tmp/has:colon" "$logical"
+  output=$(TMPDIR="$logical" FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+    "$BASH" -c 'source "$FWDPORTS_TEST_HARNESS"; _FWDPORTS_TEST_SUMMARIZED=1' 2>&1) || status=$?
+  _assert_exit "temporary base: rejects a physical path that cannot be used in PATH" 1 "$status"
+  _assert_contains "temporary base: explains how to select a usable TMPDIR" \
+    'TMPDIR must resolve to a path without a colon' "$output"
+}
+
 private_umask_case() {
   local output
   output=$(FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" bash -c \
@@ -438,6 +451,7 @@ clean_tmux_case() {
 run_case case-filter case_filter_case
 run_case unselected unselected_case
 run_case canonical-tmpdir canonical_tmpdir_case
+run_case colon-tmpdir colon_tmpdir_case
 run_case private-umask private_umask_case
 run_case nonzero-callback nonzero_callback_case
 run_case signal-status signal_status_case

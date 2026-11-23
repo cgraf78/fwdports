@@ -102,6 +102,11 @@ _FWDPORTS_TEST_TMP_BASE=$(cd -P -- "$_FWDPORTS_TEST_TMP_BASE" && pwd -P) || {
   printf 'fwdports test: cannot resolve temporary base\n' >&2
   exit 1
 }
+# The physical directory holds mock commands that must be one PATH entry.
+if [[ $_FWDPORTS_TEST_TMP_BASE == *:* ]]; then
+  printf '%s\n' 'fwdports test: TMPDIR must resolve to a path without a colon' >&2
+  exit 1
+fi
 _FWDPORTS_TEST_TMP_ROOT=$(mktemp -d \
   "$_FWDPORTS_TEST_TMP_BASE/f.XXXXXX") || {
   printf 'fwdports test: cannot create temporary root\n' >&2

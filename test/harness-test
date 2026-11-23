@@ -25,6 +25,41 @@ unselected_case() {
   _pass "case filter: second case runs without a filter"
 }
 
+suite_executability_case() {
+  local tmp output status=0
+  tmp=$(_tmpdir) || return 1
+  cp "$TEST_DIR/run" "$tmp/run"
+  printf '%s\n' 'echo "started blocked suite"' 'exit 17' >"$tmp/blocked-test"
+  printf '%s\n' 'echo "started healthy suite"' >"$tmp/healthy-test"
+  chmod 0600 "$tmp/blocked-test"
+  chmod 0700 "$tmp/healthy-test"
+
+  output=$("$BASH" "$tmp/run" 2>&1) || status=$?
+  _assert_exit "suite runner: a nonexecutable suite fails the run" 1 "$status"
+  _assert_contains "suite runner: reports which suite needs its executable bit" \
+    "suite is not executable: $tmp/blocked-test" "$output"
+  _assert_not_contains "suite runner: never starts a nonexecutable suite" \
+    'started blocked suite' "$output"
+  _assert_contains "suite runner: still runs the next executable suite" \
+    'started healthy suite' "$output"
+
+  chmod 0700 "$tmp/blocked-test"
+  status=0
+  output=$("$BASH" "$tmp/run" 2>&1) || status=$?
+  _assert_exit "suite runner: preserves an executable suite's failure" 17 "$status"
+  _assert_contains "suite runner: starts the newly executable suite" \
+    'started blocked suite' "$output"
+
+  chmod 0600 "$tmp/blocked-test" "$tmp/healthy-test"
+  status=0
+  output=$("$BASH" "$tmp/run" 2>&1) || status=$?
+  _assert_exit "suite runner: fails when all suites lack the executable bit" 1 "$status"
+  _assert_contains "suite runner: identifies the second nonexecutable suite" \
+    "suite is not executable: $tmp/healthy-test" "$output"
+  _assert_not_contains "suite runner: distinguishes nonexecutable suites from no suites" \
+    'no executable test suites found' "$output"
+}
+
 canonical_tmpdir_case() {
   local tmp physical logical output
   tmp=$(_tmpdir) || return 1
@@ -450,6 +485,7 @@ clean_tmux_case() {
 
 run_case case-filter case_filter_case
 run_case unselected unselected_case
+run_case suite-executability suite_executability_case
 run_case canonical-tmpdir canonical_tmpdir_case
 run_case colon-tmpdir colon_tmpdir_case
 run_case private-umask private_umask_case

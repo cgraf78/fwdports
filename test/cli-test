@@ -4,7 +4,7 @@
 
 set -u
 
-TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+TEST_DIR=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
 FWDPORTS="$ROOT/bin/fwdports"
 TEST_CASE=${1:-}

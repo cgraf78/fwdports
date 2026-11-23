@@ -30,7 +30,8 @@ jobs:
       test-command: |-
         set -euo pipefail
         test "$(command -v tmux)" = "$CI_TMUX_PINNED_BIN"
-        bash test/run
+        # Exercise relative fixture entry points with a caller's CDPATH set.
+        CDPATH=. bash test/run
       # The repository-owned installer authenticates checkout files through
       # Git. Use the shared suite profile rather than a runtime-only image so
       # Termux exercises that same trust boundary instead of skipping it.

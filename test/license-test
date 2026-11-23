@@ -6,8 +6,9 @@
 
 set -u
 
-TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+TEST_DIR=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT=$(cd -P -- "$TEST_DIR/.." && pwd -P)
+# shellcheck disable=SC2034 # The sourced harness reads the selected case.
 TEST_CASE=${1:-}
 
 # shellcheck source=lib/test.sh

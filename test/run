@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-TEST_DIR=$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+TEST_DIR=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 status=0
 found=0
 

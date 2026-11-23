@@ -120,7 +120,7 @@ termux_prefix_anchor_case() {
 }
 
 stock_macos_bash_ci_case() {
-  local workflow stock_job
+  local workflow stock_job stock_et_job
   workflow=$ROOT/.github/workflows/test.yml
   stock_job=$(awk '/^  macos-bash32:/ { found=1; next }
     found && /^  [a-z][a-z0-9-]*:/ { exit }
@@ -160,6 +160,15 @@ stock_macos_bash_ci_case() {
     'needs: [shell, macos-bash32, stock-et-contract]' "$(<"$workflow")"
   _assert_contains "portability CI: required gate includes stock ET" \
     'test "$STOCK_ET_RESULT" = success' "$(<"$workflow")"
+  stock_et_job=$(awk '/^  stock-et-contract:/ { found=1; next }
+    found && /^  [a-z][a-z0-9-]*:/ { exit }
+    found { print }' "$workflow")
+  _assert_contains "portability CI: stock ET uses shared verified downloads" \
+    'uses: cgraf78/actions/.github/actions/download-release-asset@' "$stock_et_job"
+  _assert_contains "portability CI: stock ET pins the upstream ARM archive" \
+    $'repository: MisterTea/EternalTerminal\n          tag: et-v7.0.0\n          asset: et_7.0.0-stable1_arm64.deb' "$stock_et_job"
+  _assert_contains "portability CI: stock ET verifies the archive checksum" \
+    'sha256: db31e467c879d8aae24e83a69e9e168e374e6f15ce7e28f64f8b5f53dacab742' "$stock_et_job"
 }
 
 bsd_ps_session_keyword_case() {

@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@d4db2a438c15513589b57a1d77fb12aaae2a7789
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@2001f9830b4d5fa6fbc67d3445e2328022c97cac
     with:
       # Process groups, tmux direct argv, and BSD command adapters materially
       # differ on macOS, Linux, and Termux, so every PR gets the full shared
@@ -51,7 +51,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned tmux for the stock Bash runner
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@d4db2a438c15513589b57a1d77fb12aaae2a7789
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@2001f9830b4d5fa6fbc67d3445e2328022c97cac
         with:
           matrix-name: macOS
           profiles: tmux-pinned
@@ -107,17 +107,18 @@ jobs:
           persist-credentials: false
 
       - name: Download the publisher's pinned arm64 artifact
+        uses: cgraf78/actions/.github/actions/download-release-asset@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+        with:
+          repository: MisterTea/EternalTerminal
+          tag: et-v7.0.0
+          asset: et_7.0.0-stable1_arm64.deb
+          output: ${{ runner.temp }}/et_7.0.0-stable1_arm64.deb
+          sha256: db31e467c879d8aae24e83a69e9e168e374e6f15ce7e28f64f8b5f53dacab742
+          retries: "3"
+
+      - name: Extract the verified publisher artifact
         shell: bash
-        run: |-
-          set -euo pipefail
-          asset="$RUNNER_TEMP/et_7.0.0-stable1_arm64.deb"
-          curl -fL --retry 3 \
-            https://github.com/MisterTea/EternalTerminal/releases/download/et-v7.0.0/et_7.0.0-stable1_arm64.deb \
-            -o "$asset"
-          printf '%s  %s\n' \
-            db31e467c879d8aae24e83a69e9e168e374e6f15ce7e28f64f8b5f53dacab742 \
-            "$asset" | sha256sum -c -
-          dpkg-deb -x "$asset" "$RUNNER_TEMP/stock-et"
+        run: dpkg-deb -x "$RUNNER_TEMP/et_7.0.0-stable1_arm64.deb" "$RUNNER_TEMP/stock-et"
 
       - name: Install publisher artifact runtime libraries
         shell: bash
@@ -171,4 +172,4 @@ jobs:
 
       # Workflow `uses:` refs must be literals. This gate proves those literals
       # still match the repository's one reviewed actions dependency lock.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@d4db2a438c15513589b57a1d77fb12aaae2a7789
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@2001f9830b4d5fa6fbc67d3445e2328022c97cac

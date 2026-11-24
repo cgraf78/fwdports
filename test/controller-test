@@ -123,6 +123,7 @@ start_status_pane() {
     return 1
   IFS=$'\t' read -r STATUS_SESSION STATUS_PANE <<<"$record"
   wait_for_file "$pid_file" || return 1
+  record_test_tmux_worker "$STATUS_SOCKET" "$STATUS_PANE" || return 1
   fwdports_tmux_record_pane "$TMUX_BIN" "$STATUS_SOCKET" \
     "$STATUS_SESSION" "$STATUS_PANE" "$generation" "$digest" \
     "$generation/legs/web/pane"
@@ -354,6 +355,7 @@ unowned_session_case() {
   chmod 0700 "$fixture"
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" fwdports \
     generation.unowned01 "$tmp" "$fixture" "$release") || return 1
+  record_test_tmux_worker "$socket" "${record##*$'\t'}" || return 1
 
   set +e
   fwdports_status "$tmp/missing-state" "$TMUX_BIN" "$socket" fwdports \

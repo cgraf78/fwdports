@@ -154,6 +154,99 @@ _test_tmux() {
   TMUX='' TMUX_PANE='' "$_FWDPORTS_TEST_TMUX" -S "$socket" -f /dev/null "$@"
 }
 
+_FWDPORTS_TEST_PANE_FORMAT='#{pid}:#{start_time} #{pane_id} #{pane_dead} #{pane_pid}'
+
+# Compare the worker's group and process start time. Reuse the runtime's
+# procfs/BSD identity adapter without loading runtime state into every suite.
+_test_tmux_worker_identity() (
+  local worker=$1 group=$2 observed state extra
+  local test_lib
+  observed=$(LC_ALL=C ps -o pgid= -o stat= -p "$worker" 2>/dev/null) || return 1
+  read -r observed state extra <<<"$observed"
+  [[ $observed == "$group" && -n $state && $state != [ZX]* && -z $extra ]] || return 1
+  test_lib=${BASH_SOURCE[0]%/*}
+  # shellcheck source=../../lib/fwdports/runtime.sh
+  source "$test_lib/../../lib/fwdports/runtime.sh"
+  _fwdports_process_start_identity "$worker"
+)
+
+# A fixture that can outlive its pane must register a persistent worker
+# while tmux still identifies that pane's process group. The record lives
+# beside the socket so cleanup can read it even after a callback/subshell exits.
+record_test_tmux_worker() {
+  local socket=$1 pane=$2 worker=${3:-} snapshot server observed dead group identity
+  [[ $socket == "$_FWDPORTS_TEST_TMP_ROOT/"* && -S $socket && ! -L $socket &&
+    $pane =~ ^%[0-9]+$ ]] || return 1
+  snapshot=$(_test_tmux "$socket" display-message -p -t "$pane" \
+    "$_FWDPORTS_TEST_PANE_FORMAT") || return 1
+  read -r server observed dead group <<<"$snapshot"
+  [[ $server =~ ^[1-9][0-9]*:[1-9][0-9]*$ && $observed == "$pane" &&
+    $dead == 0 && $group =~ ^[1-9][0-9]*$ ]] || return 1
+  worker=${worker:-$group}
+  [[ $worker =~ ^[1-9][0-9]*$ ]] || return 1
+  identity=$(_test_tmux_worker_identity "$worker" "$group") || return 1
+  [[ $snapshot == "$(_test_tmux "$socket" display-message -p -t "$pane" \
+    "$_FWDPORTS_TEST_PANE_FORMAT")" ]] || return 1
+  (
+    set -C
+    printf '%s\t%s\t%s\t%s\n' "$server" "$group" "$worker" "$identity" \
+      >"$socket.pane.${pane#%}"
+  )
+}
+
+# Return 0 for a runnable group, 1 for confirmed absence, and 2 when the
+# process census could not establish either condition.
+_test_tmux_group_census() {
+  local group=$1 table live
+  table=$(LC_ALL=C ps -e -o pid= -o pgid= -o stat= 2>/dev/null) || return 2
+  [[ -n $table ]] || return 2
+  live=$(awk -v group="$group" '
+    NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ { invalid = 1 }
+    $2 == group && $3 !~ /^[ZX]/ { live = 1 }
+    END { if (invalid) exit 2; print live + 0 }
+  ' <<<"$table") || return 2
+  [[ $live == [01] ]] || return 2
+  [[ $live == 1 ]]
+}
+
+# Return 0 for a live authenticated group, 1 if no member can run, and 2
+# when ownership or liveness cannot be verified. A bare saved PGID is never
+# enough to signal after the pane dies because that group ID can be reused.
+_test_tmux_registered_group() {
+  local socket=$1 server=$2 pane=$3 record group worker start extra observed
+  local probes=1 attempt status
+  record=$socket.pane.${pane#%}
+  [[ -f $record && ! -L $record ]] || return 2
+  IFS=$'\t' read -r observed group worker start extra <"$record" || return 2
+  [[ $observed == "$server" && $group =~ ^[1-9][0-9]*$ &&
+    $worker =~ ^[1-9][0-9]*$ && -n $start && -z $extra ]] || return 2
+  _test_tmux_group_census "$group" || return $?
+  if observed=$(_test_tmux_worker_identity "$worker" "$group"); then
+    if [[ $observed == "$start" ]]; then
+      printf '%s\n' "$group"
+      return 0
+    fi
+  else
+    # A departing worker can leave its last short-lived child behind. Wait
+    # briefly for that group to empty without sending it any signal.
+    probes=10
+  fi
+  # The last member can exit after the first census but before its identity
+  # is read. Only a fresh, complete empty census proves that no signal is
+  # needed. A live mismatched group or a failed census still fails closed.
+  for ((attempt = 0; attempt < probes; attempt++)); do
+    status=0
+    _test_tmux_group_census "$group" || status=$?
+    case $status in
+      0) ;;
+      1) return 1 ;;
+      *) return 2 ;;
+    esac
+    ((attempt + 1 == probes)) || sleep 0.01
+  done
+  return 2
+}
+
 # Succeed while a process, or with a leading `-` a process group, still has a
 # member that can run. Zombies keep their IDs until a parent reaps them, and a
 # container whose PID 1 never reaps keeps orphaned zombies forever, so
@@ -192,6 +285,26 @@ _test_tmux_groups_gone() {
   return 1
 }
 
+# Refresh a pane's identity immediately before signalling. If tmux no longer
+# reports the original live PID, require the registered worker's identity.
+_signal_test_tmux_group() {
+  local socket=$1 signal=$2 owner=$3 server pane group snapshot now status=0
+  read -r server pane group <<<"$owner"
+  _test_process_live "-$group" || return 0
+  snapshot=$(_test_tmux "$socket" display-message -p -t "$pane" \
+    "$_FWDPORTS_TEST_PANE_FORMAT" 2>/dev/null) || snapshot=
+  if [[ $snapshot != "$server $pane 0 $group" ]]; then
+    now=$(_test_tmux_registered_group "$socket" "$server" "$pane") || status=$?
+    [[ $status -ne 1 ]] || return 0
+    if [[ $status -ne 0 || $now != "$group" ]]; then
+      # The last member can exit while the pane and its evidence are read.
+      _test_process_live "-$group" && return 2
+      return 0
+    fi
+  fi
+  kill -s "$signal" -- "-$group" 2>/dev/null || ! _test_process_live "-$group"
+}
+
 # Stop a test tmux server that still owns panes; fail when there is none.
 # A server whose last session is already gone is exiting on its own, so it is
 # not reported as a leak. kill-server alone only hangs up pane terminals, so
@@ -201,32 +314,42 @@ _test_tmux_groups_gone() {
 # and only then stop the server. Descendants that leave the pane's group are
 # the owning case's responsibility.
 _stop_test_tmux_server() {
-  local socket=$1 panes dead pid attempts=0
-  local -a pids=()
+  local socket=$1 panes server pane dead pid owner status attempts=0
+  local -a pids=() owners=()
   panes=$(_test_tmux "$socket" list-panes -a \
-    -F '#{pane_dead} #{pane_pid}' 2>/dev/null) || return 1
+    -F "$_FWDPORTS_TEST_PANE_FORMAT" 2>/dev/null) || return 1
   if [[ -z "$panes" ]]; then
     _test_tmux "$socket" kill-server >/dev/null 2>&1
     return 1
   fi
-  while read -r dead pid; do
-    [[ $dead == 0 && $pid =~ ^[0-9]+$ ]] || continue
+  while read -r server pane dead pid; do
+    [[ $server =~ ^[1-9][0-9]*:[1-9][0-9]*$ && $pane =~ ^%[0-9]+$ ]] || return 2
+    if [[ $dead == 1 ]]; then
+      status=0
+      pid=$(_test_tmux_registered_group "$socket" "$server" "$pane") || status=$?
+      [[ $status -ne 1 ]] || continue
+      [[ $status -eq 0 ]] || return 2
+    fi
+    [[ $dead == [01] && $pid =~ ^[1-9][0-9]*$ ]] || return 2
     pids+=("$pid")
-    kill -TERM -- "-$pid" 2>/dev/null
+    owners+=("$server $pane $pid")
   done <<<"$panes"
+  for owner in ${owners[@]+"${owners[@]}"}; do
+    _signal_test_tmux_group "$socket" TERM "$owner" || return 2
+  done
   # Teardown needs no long grace period, and several fixtures ignore TERM on
   # purpose. The cheap probe suffices here; only zombies can outlast KILL, so
   # the costlier zombie-aware scan runs only after escalation.
   if ! _test_tmux_groups_gone 50 _test_process_exists \
     ${pids[@]+"${pids[@]}"}; then
-    for pid in ${pids[@]+"${pids[@]}"}; do
-      kill -KILL -- "-$pid" 2>/dev/null
+    for owner in ${owners[@]+"${owners[@]}"}; do
+      _signal_test_tmux_group "$socket" KILL "$owner" || return 2
     done
-    _test_tmux_groups_gone 200 _test_process_live ${pids[@]+"${pids[@]}"}
+    _test_tmux_groups_gone 200 _test_process_live ${pids[@]+"${pids[@]}"} || return 2
   fi
   _test_tmux "$socket" kill-server >/dev/null 2>&1
-  while _test_tmux "$socket" list-sessions >/dev/null 2>&1 &&
-    [[ $attempts -lt 200 ]]; do
+  while _test_tmux "$socket" list-sessions >/dev/null 2>&1; do
+    [[ $attempts -lt 200 ]] || return 2
     sleep 0.01
     attempts=$((attempts + 1))
   done
@@ -239,8 +362,13 @@ _stop_test_tmux_server() {
 # stop sequence expects some signals and probes to fail, so invoke it from an
 # `||` list, where Bash suspends errexit for the whole function body.
 kill_test_server() {
+  local status=0
   [[ -n "$_FWDPORTS_TEST_TMUX" ]] || return 0
-  _stop_test_tmux_server "$1" || :
+  _stop_test_tmux_server "$1" || status=$?
+  if [[ $status -gt 1 ]]; then
+    _fail "could not verify tmux teardown: $1"
+    return "$status"
+  fi
 }
 
 # Stop every tmux server still listening under this suite's root and record
@@ -251,8 +379,9 @@ kill_test_server() {
 # command substitution because subshells reset caught signals to defaults,
 # which would let a second interrupt abandon the teardown sweep.
 _stop_test_tmux_servers() {
-  local socket socket_list scan_status=0
+  local socket socket_list scan_status=0 stop_status
   _FWDPORTS_TEST_LEAKED=()
+  _FWDPORTS_TEST_UNVERIFIED=()
   [[ -n "$_FWDPORTS_TEST_TMUX" && -d "$_FWDPORTS_TEST_TMP_ROOT" ]] || return 0
   # Keep find's status and process its NUL-delimited results even if part of
   # the tree was unreadable. Process substitution would discard that status.
@@ -260,9 +389,13 @@ _stop_test_tmux_servers() {
   find "$_FWDPORTS_TEST_TMP_ROOT" -type s -print0 >"$socket_list" || scan_status=$?
   while IFS= read -r -d '' socket; do
     [[ -n "$socket" ]] || continue
-    if _stop_test_tmux_server "$socket"; then
-      _FWDPORTS_TEST_LEAKED+=("$socket")
-    fi
+    stop_status=0
+    _stop_test_tmux_server "$socket" || stop_status=$?
+    case $stop_status in
+      0) _FWDPORTS_TEST_LEAKED+=("$socket") ;;
+      1) ;;
+      *) _FWDPORTS_TEST_UNVERIFIED+=("$socket") ;;
+    esac
   done <"$socket_list"
   rm -f -- "$socket_list" || return 1
   return "$scan_status"
@@ -299,6 +432,11 @@ _cleanup_test_root() {
   # A server outside a case, or one left by an interrupted case, is also a leak.
   for socket in ${_FWDPORTS_TEST_LEAKED[@]+"${_FWDPORTS_TEST_LEAKED[@]}"}; do
     printf 'fwdports test: stopped leaked tmux server: %s\n' "$socket" >&2
+    [[ $status -ne 0 ]] || status=1
+  done
+  for socket in ${_FWDPORTS_TEST_UNVERIFIED[@]+"${_FWDPORTS_TEST_UNVERIFIED[@]}"}; do
+    printf 'fwdports test: could not verify tmux teardown, retained socket: %s\n' "$socket" >&2
+    scan_failed=1
     [[ $status -ne 0 ]] || status=1
   done
   if [[ $scan_failed -eq 0 ]]; then
@@ -347,6 +485,9 @@ run_case() {
   fi
   for socket in ${_FWDPORTS_TEST_LEAKED[@]+"${_FWDPORTS_TEST_LEAKED[@]}"}; do
     _fail "case leaked tmux server: $name ($socket)"
+  done
+  for socket in ${_FWDPORTS_TEST_UNVERIFIED[@]+"${_FWDPORTS_TEST_UNVERIFIED[@]}"}; do
+    _fail "case could not verify tmux teardown: $name ($socket)"
   done
 }
 

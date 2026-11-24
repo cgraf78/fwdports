@@ -82,6 +82,7 @@ direct_argv_case() {
     fwdports generation.direct01 "$tmp" "$fixture" "$output" "$release" \
     'one value' 'semi;colon' '$literal')
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   # The fixture appends one line per argv (three below) before blocking on
   # the release gate, so a non-empty file is not yet a complete record:
   # wait for all three lines, then let the equality assertion below judge
@@ -123,6 +124,7 @@ session_nonce_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.nonce01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   wait_for_file "$output" || true
   environment=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
     show-environment -t "$session_id" FWDPORTS_GENERATION)
@@ -171,6 +173,7 @@ user_config_case() {
     fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.config01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   wait_for_marker "$output" || true
   mouse=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
     show-options -gqv mouse)
@@ -223,6 +226,7 @@ focus_transport_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.focus01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   wait_for_marker "$output" || true
   window_id=$(TMUX='' TMUX_PANE='' "$TMUX_BIN" -S "$socket" -f /dev/null \
     display-message -p -t "$pane_id" '#{window_id}')
@@ -278,6 +282,7 @@ layout_scaling_case() {
     fwdports generation.layout01 "$tmp" "$fixture" "$tmp/started-1" \
     "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   wait_for_marker "$tmp/started-1" || true
   fwdports_tmux_configure_transport_pane "$TMUX_BIN" "$socket" \
     "$session_id" generation.layout01 "$pane_id" \
@@ -287,6 +292,7 @@ layout_scaling_case() {
     pane_id=$(fwdports_tmux_split_pane "$TMUX_BIN" "$socket" "$session_id" \
       generation.layout01 "$tmp" "$fixture" "$tmp/started-$((index + 1))" \
       "$release")
+    record_test_tmux_worker "$socket" "$pane_id" || return 1
     fwdports_tmux_configure_transport_pane "$TMUX_BIN" "$socket" \
       "$session_id" generation.layout01 "$pane_id" \
       "${legs[index]}" "${drivers[index]}"
@@ -335,6 +341,7 @@ control_window_rollback_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.control01 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   wait_for_marker "$output" || true
 
   set +e
@@ -390,6 +397,7 @@ control_window_identity_failure_case() {
   record=$(fwdports_tmux_create_session "$TMUX_BIN" "$socket" \
     fwdports generation.control02 "$tmp" "$fixture" "$output" "$release")
   IFS=$'\t' read -r session_id pane_id <<<"$record"
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   wait_for_marker "$output" || true
 
   set +e

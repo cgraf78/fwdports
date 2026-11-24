@@ -451,6 +451,14 @@ PYTHON
     "$PROC_EVIDENCE") || return 1
   IFS=$'\t' read -r _ _ PROC_LEADER _ PROC_TTY PROC_SID PROC_PGID _ _ \
     <<<"$record"
+  case "$mode" in
+    term | stubborn | missing)
+      record_test_tmux_worker "$PROC_SOCKET" "$PROC_PANE" "$PROC_CHILD" || return 1
+      ;;
+    *)
+      record_test_tmux_worker "$PROC_SOCKET" "$PROC_PANE" || return 1
+      ;;
+  esac
   start=$(_fwdports_process_start_identity "$$")
   fwdports_control_write "$PROC_GENERATION" "$PROC_DIGEST" running running \
     "$$" "$start" none || return 1
@@ -499,6 +507,7 @@ pane_identity_case() {
   IFS=$'\t' read -r session_id pane_id <<<"$record"
   wait_for_file "$pid_file" || true
   leader_pid=$(<"$pid_file")
+  record_test_tmux_worker "$socket" "$pane_id" || return 1
   fwdports_tmux_record_pane "$TMUX_BIN" "$socket" "$session_id" \
     "$pane_id" "$generation" "$digest" "$evidence"
   content=$(<"$evidence")

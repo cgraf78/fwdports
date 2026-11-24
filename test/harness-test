@@ -483,6 +483,72 @@ clean_tmux_case() {
   _assert_eq "tmux clean: fixture processes are gone" 0 "$CHILD_ALIVE"
 }
 
+partial_socket_scan_case() {
+  local tmp output status=0 socket
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/$'line\nbreak with spaces.sock'
+  output=$(FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" FWDPORTS_TEST_TMUX_BIN=true \
+    "$BASH" -c '
+      source "$FWDPORTS_TEST_HARNESS"
+      find() {
+        # Fail only the case scan. The child trap still runs a complete scan.
+        [[ ! -e "$1/already-scanned" ]] || return 0
+        : >"$1/already-scanned"
+        case "$4" in
+          -print0) printf "%s\0" "$FWDPORTS_TEST_SOCKET" ;;
+          -print) printf "%s\n" "$FWDPORTS_TEST_SOCKET" ;;
+        esac
+        return 19
+      }
+      _stop_test_tmux_server() { printf "%s" "$1" >>"$FWDPORTS_TEST_STOPPED"; }
+      succeeds() { _pass "fixture ran"; }
+      FWDPORTS_TEST_SOCKET=$1 FWDPORTS_TEST_STOPPED=$2
+      run_case fixture succeeds
+      _test_summary
+    ' bash "$socket" "$tmp/stopped" 2>&1) || status=$?
+
+  _assert_exit "case socket scan: fails on partial discovery" 1 "$status"
+  _assert_contains "case socket scan: identifies the incomplete case" \
+    'case could not scan tmux sockets: fixture' "$output"
+  _assert_eq "case socket scan: still stops an exactly named discovered socket" \
+    "$socket" "$(<"$tmp/stopped")"
+}
+
+exit_socket_scan_case() {
+  local tmp outcome output status expected root
+  tmp=$(_tmpdir) || return 1
+  for outcome in success failure signal; do
+    case "$outcome" in
+      success) expected=1 ;;
+      failure) expected=17 ;;
+      signal) expected=143 ;;
+    esac
+    status=0
+    output=$(TMPDIR="$tmp" FWDPORTS_TEST_HARNESS="$TEST_DIR/lib/test.sh" \
+      FWDPORTS_TEST_TMUX_BIN=true "$BASH" -c '
+        source "$FWDPORTS_TEST_HARNESS"
+        find() { return 19; }
+        _FWDPORTS_TEST_SUMMARIZED=1
+        printf "%s\n" "$_FWDPORTS_TEST_TMP_ROOT" >"$2"
+        case "$1" in
+          success) exit 0 ;;
+          failure) exit 17 ;;
+          signal) kill -TERM "$$" ;;
+        esac
+      ' bash "$outcome" "$tmp/root" 2>&1) || status=$?
+    root=$(<"$tmp/root")
+    _assert_exit "exit socket scan: reports incomplete discovery after $outcome" \
+      "$expected" "$status"
+    _assert_contains "exit socket scan: identifies the retained root after $outcome" \
+      "could not scan tmux sockets during teardown: $root" "$output"
+    if [[ -d "$root" ]]; then
+      _pass "exit socket scan: leaves any undiscovered sockets reachable after $outcome"
+    else
+      _fail "exit socket scan: leaves any undiscovered sockets reachable after $outcome"
+    fi
+  done
+}
+
 run_case case-filter case_filter_case
 run_case unselected unselected_case
 run_case suite-executability suite_executability_case
@@ -498,6 +564,8 @@ run_case leaked-tmux leaked_tmux_case
 run_case aborted-tmux aborted_tmux_case
 run_case interrupted-tmux interrupted_tmux_case
 run_case clean-tmux clean_tmux_case
+run_case partial-socket-scan partial_socket_scan_case
+run_case exit-socket-scan exit_socket_scan_case
 if [[ "$TEST_CASE" == case-filter ]]; then
   _assert_eq "case filter: other cases are skipped" 0 "$UNSELECTED_RAN"
 fi

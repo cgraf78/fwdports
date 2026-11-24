@@ -151,6 +151,83 @@ et_signal_case() {
   fi
 }
 
+startup_signal_case() {
+  local tmp startup kind runtime worker pid_file injected runner_pid status child_pid group
+  tmp=$(_tmpdir) || return 1
+  startup=$tmp/interrupt-runner
+  cat >"$startup" <<'EOF'
+# This startup file belongs only to the runner, never its launcher child.
+unset BASH_ENV
+set -T
+interrupt_launch() {
+  [[ $BASH_COMMAND == 'child=$!' ]] || return 0
+  trap - DEBUG
+  local attempts=0
+  while [[ ! -s $FWDPORTS_TEST_CHILD_PID && $attempts -lt 200 ]]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -s $FWDPORTS_TEST_CHILD_PID ]] || return 1
+  # The command has started, but the runner has not stored its PID yet.
+  printf '%s\n' "$$" >"$FWDPORTS_TEST_INJECTED"
+  builtin kill -TERM "$$"
+}
+trap interrupt_launch DEBUG
+EOF
+
+  for kind in ssh autossh et; do
+    runtime=$tmp/$kind
+    pid_file=$runtime/child.pid
+    injected=$runtime/interrupted
+    mkdir -p "$runtime" || return 1
+    printf '%s\n' "$kind" >"$runtime/driver-kind"
+    printf '%s\n' shell.example.com >"$runtime/ssh-target"
+    printf '%s\n' -N >"$runtime/ssh-argv"
+    worker=$runtime/$kind-gate
+    printf 'path\t%s\n' "$worker" >"$runtime/autossh-source"
+    cat >"$worker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$FWDPORTS_TEST_CHILD_PID"
+exec sleep 30
+EOF
+    chmod 0700 "$worker" || return 1
+
+    # An owned group bounds cleanup even if the runner misses cancellation.
+    set -m
+    BASH_ENV=$startup FWDPORTS_TEST_CHILD_PID=$pid_file \
+      FWDPORTS_TEST_INJECTED=$injected "$RUNNER" "$runtime" &
+    runner_pid=$!
+    set +m
+    if wait_for_lines "$injected" 1; then
+      _assert_eq "built-in $kind startup: TERM targets the runner at PID handoff" \
+        "$runner_pid" "$(<"$injected")"
+    else
+      _fail "built-in $kind startup: TERM injection did not reach the PID handoff"
+    fi
+    if ! _test_tmux_groups_gone 200 _test_process_live "$runner_pid"; then
+      _fail "built-in $kind startup: runner stayed alive after early TERM"
+      kill -KILL -- "-$runner_pid" 2>/dev/null || true
+    fi
+    status=0
+    wait "$runner_pid" 2>/dev/null || status=$?
+    _assert_exit "built-in $kind startup: preserves TERM status" 143 "$status"
+    child_pid=
+    [[ ! -s $pid_file ]] || child_pid=$(<"$pid_file")
+    if [[ -n $child_pid ]] && ! _test_process_exists "$child_pid"; then
+      _pass "built-in $kind startup: owned child is reaped"
+    else
+      _fail "built-in $kind startup: owned child is reaped"
+      # The runner is already gone. A still-owned worker must anchor its group
+      # before failure cleanup can signal any remaining member.
+      if [[ -n $child_pid ]] &&
+        group=$(LC_ALL=C ps -o pgid= -p "$child_pid" 2>/dev/null) &&
+        [[ $group =~ ^[[:space:]]*${runner_pid}[[:space:]]*$ ]]; then
+        kill -KILL -- "-$runner_pid" 2>/dev/null || true
+      fi
+    fi
+  done
+}
+
 ettun_no_retry_case() {
   local tmp runtime calls status count
   tmp=$(_tmpdir) || return 1
@@ -319,6 +396,7 @@ run_case retry retry_case
 run_case drift drift_case
 run_case et-no-retry et_no_retry_case
 run_case et-signal et_signal_case
+run_case startup-signal startup_signal_case
 run_case ettun-no-retry ettun_no_retry_case
 run_case ettun-int-disposition ettun_int_disposition_case
 run_case ettun-interactive-stdin ettun_interactive_stdin_case

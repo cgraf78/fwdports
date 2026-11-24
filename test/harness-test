@@ -550,12 +550,16 @@ departing_tmux_worker_case() {
   printf '%s\n' $'42:10\t123\t124\tlinux:100' >"$socket.pane.1"
   output=$(
     _test_tmux() {
-      case $2 in
-        list-panes) printf '42:10 %%1 1 \n' ;;
-        kill-server) : >"$tmp/server-stopped" ;;
-        list-sessions) return 1 ;;
-        *) return 2 ;;
-      esac
+      # Bash 3.2 misparses this fixture's case patterns inside $().
+      if [[ $2 == list-panes ]]; then
+        printf '42:10 %%1 1 \n'
+      elif [[ $2 == kill-server ]]; then
+        : >"$tmp/server-stopped"
+      elif [[ $2 == list-sessions ]]; then
+        return 1
+      else
+        return 2
+      fi
     }
     ps() {
       if [[ ! -e $tmp/worker-exited ]]; then

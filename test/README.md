@@ -21,7 +21,14 @@ state.
 
 Cases stop the tmux servers they start, either through `fwdports stop` or the
 harness's `kill_test_server`, which stops pane process groups before the
-server so HUP-ignoring fixtures cannot outlive it. After every case the
+server so HUP-ignoring fixtures cannot outlive it. If a worker can outlive its
+pane, call `record_test_tmux_worker` with the private socket, pane ID, and
+worker PID while the pane is still live. For fixtures whose whole group
+exits with the pane, register the pane without a separate worker PID.
+The harness verifies the worker's
+group and start identity before signalling a dead pane's survivors. If it
+cannot verify ownership or that the group is gone, it fails the suite and
+leaves the socket reachable. After every case the
 harness looks for tmux servers that still own panes on a socket under its
 root, fails the case as a leak, and stops them the same way. Its exit trap
 repeats the sweep before deleting the root, so a failed assertion, early

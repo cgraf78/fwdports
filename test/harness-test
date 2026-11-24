@@ -483,6 +483,100 @@ clean_tmux_case() {
   _assert_eq "tmux clean: fixture processes are gone" 0 "$CHILD_ALIVE"
 }
 
+dead_tmux_case() {
+  local tmp socket pane worker group attempts status state scenario
+  if ! tmux_available; then
+    _pass "dead tmux pane: tmux is unavailable here"
+    return 0
+  fi
+  for scenario in surviving-worker departed-worker; do
+    tmp=$(_tmpdir) || return 1
+    socket=$tmp/tmux.sock
+    cat >"$tmp/worker" <<'EOF'
+#!/usr/bin/env bash
+trap '' HUP TERM
+printf '%s\n' "$$" >"$1"
+deadline=$((SECONDS + 10))
+until [[ -e $2 || $SECONDS -ge $deadline ]]; do sleep 0.01; done
+EOF
+    chmod 0700 "$tmp/worker"
+    pane=$(_test_tmux "$socket" new-session -d -P -F '#{pane_id}' -- sh -c '
+      "$1/worker" "$1/pid" "$1/stop-worker" </dev/null >/dev/null 2>&1 &
+      until [ -e "$1/stop-pane" ]; do sleep 0.01; done
+    ' sh "$tmp") || return 1
+    _test_tmux "$socket" set-option -w remain-on-exit on || return 1
+    group=$(_test_tmux "$socket" display-message -p -t "$pane" '#{pane_pid}') || return 1
+    attempts=0
+    until [[ -s $tmp/pid || $attempts -ge 200 ]]; do
+      sleep 0.01
+      attempts=$((attempts + 1))
+    done
+    [[ -s $tmp/pid && $group =~ ^[1-9][0-9]*$ ]] || return 1
+    worker=$(<"$tmp/pid")
+    [[ $worker =~ ^[1-9][0-9]*$ ]] || return 1
+    record_test_tmux_worker "$socket" "$pane" "$worker" || return 1
+    : >"$tmp/stop-pane"
+    attempts=0
+    state=
+    until [[ $state == 1/ || $attempts -ge 200 ]]; do
+      state=$(_test_tmux "$socket" display-message -p -t "$pane" '#{pane_dead}/#{pane_pid}')
+      sleep 0.01
+      attempts=$((attempts + 1))
+    done
+    _assert_eq "dead tmux pane: $scenario has no tmux pane PID" 1/ "$state"
+    if [[ $scenario == departed-worker ]]; then
+      : >"$tmp/stop-worker"
+      _test_tmux_groups_gone 200 _test_process_live "$group" || return 1
+    fi
+
+    status=0
+    kill_test_server "$socket" || status=$?
+    _assert_exit "dead tmux pane: $scenario teardown is verifiable" 0 "$status"
+    if _test_process_live "$worker"; then
+      _fail "dead tmux pane: $scenario leaves no runnable worker"
+      # Let a failing implementation clean up only the prepared fixture.
+      : >"$tmp/stop-worker"
+      _test_tmux_groups_gone 200 _test_process_live "$group" || return 1
+    else
+      _pass "dead tmux pane: $scenario leaves no runnable worker"
+    fi
+  done
+}
+
+unverifiable_tmux_case() {
+  local tmp socket scenario output status
+  tmp=$(_tmpdir) || return 1
+  socket=$tmp/tmux.sock
+  for scenario in unreadable-census changed-worker; do
+    printf '%s\n' $'42:10\t123\t124\tlinux:100' >"$socket.pane.1"
+    status=0
+    output=$(
+      _test_tmux() {
+        if [[ $2 == list-panes ]]; then
+          printf '42:10 %%1 1 \n'
+        else
+          : >"$tmp/$scenario.tmux"
+          return 1
+        fi
+      }
+      ps() {
+        [[ $scenario != unreadable-census ]] || return 19
+        printf '124 123 S\n'
+      }
+      _test_tmux_worker_identity() { printf 'linux:200\n'; }
+      kill() { : >"$tmp/$scenario.signal"; }
+      kill_test_server "$socket" 2>&1
+    ) || status=$?
+    _assert_exit "tmux teardown: rejects $scenario" 2 "$status"
+    _assert_contains "tmux teardown: diagnosis names $scenario socket" \
+      "could not verify tmux teardown: $socket" "$output"
+    _assert_not_exists "tmux teardown: $scenario sends no process signal" \
+      "$tmp/$scenario.signal"
+    _assert_not_exists "tmux teardown: $scenario preserves the tmux server" \
+      "$tmp/$scenario.tmux"
+  done
+}
+
 partial_socket_scan_case() {
   local tmp output status=0 socket
   tmp=$(_tmpdir) || return 1
@@ -564,6 +658,8 @@ run_case leaked-tmux leaked_tmux_case
 run_case aborted-tmux aborted_tmux_case
 run_case interrupted-tmux interrupted_tmux_case
 run_case clean-tmux clean_tmux_case
+run_case dead-tmux dead_tmux_case
+run_case unverifiable-tmux unverifiable_tmux_case
 run_case partial-socket-scan partial_socket_scan_case
 run_case exit-socket-scan exit_socket_scan_case
 if [[ "$TEST_CASE" == case-filter ]]; then

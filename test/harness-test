@@ -544,7 +544,7 @@ EOF
 }
 
 departing_tmux_worker_case() {
-  local tmp socket output status=0
+  local wire_dead=${1:-1} tmp socket output status=0
   tmp=$(_tmpdir) || return 1
   socket=$tmp/tmux.sock
   printf '%s\n' $'42:10\t123\t124\tlinux:100' >"$socket.pane.1"
@@ -552,7 +552,7 @@ departing_tmux_worker_case() {
     _test_tmux() {
       # Bash 3.2 misparses this fixture's case patterns inside $().
       if [[ $2 == list-panes ]]; then
-        printf '42:10 %%1 1 \n'
+        printf '42:10 %%1 %s \n' "$wire_dead"
       elif [[ $2 == kill-server ]]; then
         : >"$tmp/server-stopped"
       elif [[ $2 == list-sessions ]]; then
@@ -587,17 +587,33 @@ departing_tmux_worker_case() {
   _assert_not_exists "tmux teardown: verified departure sends no worker signal" "$tmp/signal-sent"
 }
 
+closing_tmux_pane_case() {
+  # tmux 3.8 clears the PID when the terminal closes, before marking the pane dead.
+  departing_tmux_worker_case 0
+}
+
 unverifiable_tmux_case() {
   local tmp socket scenario output status
   tmp=$(_tmpdir) || return 1
   socket=$tmp/tmux.sock
-  for scenario in unreadable-census unreadable-recensus changed-worker missing-worker; do
-    printf '%s\n' $'42:10\t123\t124\tlinux:100' >"$socket.pane.1"
+  for scenario in unreadable-census unreadable-recensus changed-worker \
+    missing-worker unregistered-closing-pane malformed-live-pid; do
+    if [[ $scenario == unregistered-closing-pane ]]; then
+      rm -f -- "$socket.pane.1"
+    else
+      printf '%s\n' $'42:10\t123\t124\tlinux:100' >"$socket.pane.1"
+    fi
     status=0
     output=$(
       _test_tmux() {
         if [[ $2 == list-panes ]]; then
-          printf '42:10 %%1 1 \n'
+          if [[ $scenario == unregistered-closing-pane ]]; then
+            printf '42:10 %%1 0 \n'
+          elif [[ $scenario == malformed-live-pid ]]; then
+            printf '42:10 %%1 0 invalid\n'
+          else
+            printf '42:10 %%1 1 \n'
+          fi
         else
           : >"$tmp/$scenario.tmux"
           return 1
@@ -713,6 +729,7 @@ run_case interrupted-tmux interrupted_tmux_case
 run_case clean-tmux clean_tmux_case
 run_case dead-tmux dead_tmux_case
 run_case departing-tmux-worker departing_tmux_worker_case
+run_case closing-tmux-pane closing_tmux_pane_case
 run_case unverifiable-tmux unverifiable_tmux_case
 run_case partial-socket-scan partial_socket_scan_case
 run_case exit-socket-scan exit_socket_scan_case

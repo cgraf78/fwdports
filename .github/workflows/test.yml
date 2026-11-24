@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5a9710d5c5fd986bfbddf8b2c594d035c5152807
     with:
       # Process groups, tmux direct argv, and BSD command adapters materially
       # differ on macOS, Linux, and Termux, so every PR gets the full shared
@@ -52,7 +52,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned tmux for the stock Bash runner
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@e9922d129ba6d9dc43793247409197b0b07b81c8
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@5a9710d5c5fd986bfbddf8b2c594d035c5152807
         with:
           matrix-name: macOS
           profiles: tmux-pinned
@@ -108,7 +108,7 @@ jobs:
           persist-credentials: false
 
       - name: Download the publisher's pinned arm64 artifact
-        uses: cgraf78/actions/.github/actions/download-release-asset@e9922d129ba6d9dc43793247409197b0b07b81c8
+        uses: cgraf78/actions/.github/actions/download-release-asset@5a9710d5c5fd986bfbddf8b2c594d035c5152807
         with:
           repository: MisterTea/EternalTerminal
           tag: et-v7.0.0
@@ -173,4 +173,4 @@ jobs:
 
       # Workflow `uses:` refs must be literals. This gate proves those literals
       # still match the repository's one reviewed actions dependency lock.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e9922d129ba6d9dc43793247409197b0b07b81c8
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@5a9710d5c5fd986bfbddf8b2c594d035c5152807

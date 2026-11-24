@@ -194,28 +194,57 @@ record_test_tmux_worker() {
   )
 }
 
+# Return 0 for a runnable group, 1 for confirmed absence, and 2 when the
+# process census could not establish either condition.
+_test_tmux_group_census() {
+  local group=$1 table live
+  table=$(LC_ALL=C ps -e -o pid= -o pgid= -o stat= 2>/dev/null) || return 2
+  [[ -n $table ]] || return 2
+  live=$(awk -v group="$group" '
+    NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ { invalid = 1 }
+    $2 == group && $3 !~ /^[ZX]/ { live = 1 }
+    END { if (invalid) exit 2; print live + 0 }
+  ' <<<"$table") || return 2
+  [[ $live == [01] ]] || return 2
+  [[ $live == 1 ]]
+}
+
 # Return 0 for a live authenticated group, 1 if no member can run, and 2
 # when ownership or liveness cannot be verified. A bare saved PGID is never
 # enough to signal after the pane dies because that group ID can be reused.
 _test_tmux_registered_group() {
-  local socket=$1 server=$2 pane=$3 record group worker start extra observed table status
+  local socket=$1 server=$2 pane=$3 record group worker start extra observed
+  local probes=1 attempt status
   record=$socket.pane.${pane#%}
   [[ -f $record && ! -L $record ]] || return 2
   IFS=$'\t' read -r observed group worker start extra <"$record" || return 2
   [[ $observed == "$server" && $group =~ ^[1-9][0-9]*$ &&
     $worker =~ ^[1-9][0-9]*$ && -n $start && -z $extra ]] || return 2
-  table=$(LC_ALL=C ps -e -o pid= -o pgid= -o stat= 2>/dev/null) || return 2
-  [[ -n $table ]] || return 2
-  status=0
-  awk -v group="$group" '
-    NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ { invalid = 1 }
-    $2 == group && $3 !~ /^[ZX]/ { live = 1 }
-    END { if (invalid) exit 2; exit !live }
-  ' <<<"$table" || status=$?
-  [[ $status -eq 0 ]] || return "$status"
-  observed=$(_test_tmux_worker_identity "$worker" "$group") || return 2
-  [[ $observed == "$start" ]] || return 2
-  printf '%s\n' "$group"
+  _test_tmux_group_census "$group" || return $?
+  if observed=$(_test_tmux_worker_identity "$worker" "$group"); then
+    if [[ $observed == "$start" ]]; then
+      printf '%s\n' "$group"
+      return 0
+    fi
+  else
+    # A departing worker can leave its last short-lived child behind. Wait
+    # briefly for that group to empty without sending it any signal.
+    probes=10
+  fi
+  # The last member can exit after the first census but before its identity
+  # is read. Only a fresh, complete empty census proves that no signal is
+  # needed. A live mismatched group or a failed census still fails closed.
+  for ((attempt = 0; attempt < probes; attempt++)); do
+    status=0
+    _test_tmux_group_census "$group" || status=$?
+    case $status in
+      0) ;;
+      1) return 1 ;;
+      *) return 2 ;;
+    esac
+    ((attempt + 1 == probes)) || sleep 0.01
+  done
+  return 2
 }
 
 # Succeed while a process, or with a leading `-` a process group, still has a

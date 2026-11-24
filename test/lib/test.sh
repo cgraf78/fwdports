@@ -244,29 +244,34 @@ kill_test_server() {
 }
 
 # Stop every tmux server still listening under this suite's root and record
-# each socket that had one, one per line, in _FWDPORTS_TEST_LEAKED. Suites own
+# each socket that had one in _FWDPORTS_TEST_LEAKED. Suites own
 # their servers, but a failed assertion, early return, or interrupt can skip a
 # suite's own teardown; deleting the root afterwards would orphan the server
 # with an unreachable socket. This runs in the calling shell rather than a
 # command substitution because subshells reset caught signals to defaults,
 # which would let a second interrupt abandon the teardown sweep.
 _stop_test_tmux_servers() {
-  local socket
-  _FWDPORTS_TEST_LEAKED=
+  local socket socket_list scan_status=0
+  _FWDPORTS_TEST_LEAKED=()
   [[ -n "$_FWDPORTS_TEST_TMUX" && -d "$_FWDPORTS_TEST_TMP_ROOT" ]] || return 0
-  while IFS= read -r socket; do
+  # Keep find's status and process its NUL-delimited results even if part of
+  # the tree was unreadable. Process substitution would discard that status.
+  socket_list=$(mktemp "$_FWDPORTS_TEST_TMP_ROOT/sockets.XXXXXX") || return 1
+  find "$_FWDPORTS_TEST_TMP_ROOT" -type s -print0 >"$socket_list" || scan_status=$?
+  while IFS= read -r -d '' socket; do
     [[ -n "$socket" ]] || continue
     if _stop_test_tmux_server "$socket"; then
-      _FWDPORTS_TEST_LEAKED=$_FWDPORTS_TEST_LEAKED$socket$'\n'
+      _FWDPORTS_TEST_LEAKED+=("$socket")
     fi
-  done < <(find "$_FWDPORTS_TEST_TMP_ROOT" -type s -print 2>/dev/null)
-  return 0
+  done <"$socket_list"
+  rm -f -- "$socket_list" || return 1
+  return "$scan_status"
 }
 
 # Signal traps pass the conventional 128+N status. Inside a trap, `$?` is the
 # status of the interrupted command, which would let a killed suite exit 0.
 _cleanup_test_root() {
-  local status=$? socket
+  local status=$? socket scan_failed=0
   [[ -z "${1:-}" ]] || status=$1
   # Bash 3.2 can reach this trap with status 0 after a nounset abort, which
   # would pass a suite that never reached its summary. A probe that sources
@@ -284,22 +289,25 @@ _cleanup_test_root() {
   trap - EXIT
   trap '' HUP INT TERM
   set +e
-  _stop_test_tmux_servers
-  if [[ -n "$_FWDPORTS_TEST_LEAKED" ]]; then
-    # A server outside any case, or one left by an interrupted case, is
-    # still a leak: report it and never let the suite pass because of it.
-    while IFS= read -r socket; do
-      [[ -n "$socket" ]] || continue
-      printf 'fwdports test: stopped leaked tmux server: %s\n' \
-        "$socket" >&2
-    done <<<"$_FWDPORTS_TEST_LEAKED"
+  if ! _stop_test_tmux_servers; then
+    # Leave any undiscovered sockets reachable for inspection and cleanup.
+    printf 'fwdports test: could not scan tmux sockets during teardown: %s\n' \
+      "$_FWDPORTS_TEST_TMP_ROOT" >&2
+    scan_failed=1
     [[ $status -ne 0 ]] || status=1
   fi
-  case "$_FWDPORTS_TEST_TMP_ROOT" in
-    "$_FWDPORTS_TEST_TMP_BASE"/f.*)
-      rm -rf -- "$_FWDPORTS_TEST_TMP_ROOT"
-      ;;
-  esac
+  # A server outside a case, or one left by an interrupted case, is also a leak.
+  for socket in ${_FWDPORTS_TEST_LEAKED[@]+"${_FWDPORTS_TEST_LEAKED[@]}"}; do
+    printf 'fwdports test: stopped leaked tmux server: %s\n' "$socket" >&2
+    [[ $status -ne 0 ]] || status=1
+  done
+  if [[ $scan_failed -eq 0 ]]; then
+    case "$_FWDPORTS_TEST_TMP_ROOT" in
+      "$_FWDPORTS_TEST_TMP_BASE"/f.*)
+        rm -rf -- "$_FWDPORTS_TEST_TMP_ROOT"
+        ;;
+    esac
+  fi
   exit "$status"
 }
 trap _cleanup_test_root EXIT
@@ -334,11 +342,12 @@ run_case() {
   fi
   # Attribute leaks to the case that made them. Stopping them here also keeps
   # a leaked fixture from perturbing timing or ownership in later cases.
-  _stop_test_tmux_servers
-  while IFS= read -r socket; do
-    [[ -n "$socket" ]] || continue
+  if ! _stop_test_tmux_servers; then
+    _fail "case could not scan tmux sockets: $name"
+  fi
+  for socket in ${_FWDPORTS_TEST_LEAKED[@]+"${_FWDPORTS_TEST_LEAKED[@]}"}; do
     _fail "case leaked tmux server: $name ($socket)"
-  done <<<"$_FWDPORTS_TEST_LEAKED"
+  done
 }
 
 _test_summary() {

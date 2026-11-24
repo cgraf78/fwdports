@@ -41,31 +41,45 @@ esac
 # TERM and their direct child reaped. ettun owns that cleanup itself.
 child=
 signal_status=0
+pending_stop=0
 
 stop_child() {
   [[ -n ${child:-} ]] || return 0
   kill -TERM "$child" 2>/dev/null || true
 }
-on_hup() {
-  signal_status=129
-  stop_child
-}
-on_int() {
-  signal_status=130
-  stop_child
-}
-on_term() {
-  signal_status=143
-  stop_child
+request_stop() {
+  signal_status=$1
+  if [[ -z $child ]]; then
+    pending_stop=1
+  else
+    pending_stop=0
+    stop_child
+  fi
 }
 cleanup_child() {
   stop_child
   [[ -z ${child:-} ]] || wait "$child" 2>/dev/null || true
 }
-trap on_hup HUP
-trap on_int INT
-trap on_term TERM
+trap 'request_stop 129' HUP
+trap 'request_stop 130' INT
+trap 'request_stop 143' TERM
 trap cleanup_child EXIT
+
+wait_child() {
+  local status=0
+  # Bash can run a signal trap after the fork and before the caller stores
+  # $!. Deliver that stop once the runner has the child's exact PID.
+  if ((pending_stop)); then
+    pending_stop=0
+    stop_child
+  fi
+  wait "$child" || status=$?
+  # A trap can interrupt wait before the child has actually been collected.
+  wait "$child" 2>/dev/null || true
+  child=
+  [[ $signal_status -eq 0 ]] || exit "$signal_status"
+  return "$status"
+}
 
 case "$kind" in
   ssh)
@@ -79,14 +93,8 @@ case "$kind" in
       started=$SECONDS
       "$runtime/ssh-gate" "${argv[@]}" "$target" &
       child=$!
-      wait "$child"
-      status=$?
-      # A signal trap may interrupt wait before the child has actually been
-      # collected.  The second wait is harmless if it was already reaped and
-      # prevents zombies on the cancellation path.
-      wait "$child" 2>/dev/null || true
-      child=
-      [[ $signal_status -eq 0 ]] || exit "$signal_status"
+      status=0
+      wait_child || status=$?
       # Exit 78 is the generation gate's explicit binary/config drift marker.
       # Retrying it would spin forever and could mask a changed trust input.
       [[ $status -ne 78 ]] || exit 78
@@ -118,14 +126,8 @@ case "$kind" in
     export AUTOSSH_GATETIME AUTOSSH_PORT AUTOSSH_PATH
     "$autossh_path" -M 0 "${argv[@]}" "$target" &
     child=$!
-    wait "$child"
-    status=$?
-    # A signal can interrupt wait before the child has finished handling TERM.
-    # Reap it before exposing the signal-derived wrapper status to tmux.
-    wait "$child" 2>/dev/null || true
-    child=
-    [[ $signal_status -eq 0 ]] || exit "$signal_status"
-    exit "$status"
+    wait_child
+    exit "$?"
     ;;
   et)
     # ET owns reconnect behavior inside one foreground process. Adding the
@@ -133,12 +135,8 @@ case "$kind" in
     gate=$runtime/et-gate
     "$gate" <&0 &
     child=$!
-    wait "$child"
-    status=$?
-    wait "$child" 2>/dev/null || true
-    child=
-    [[ $signal_status -eq 0 ]] || exit "$signal_status"
-    exit "$status"
+    wait_child
+    exit "$?"
     ;;
   ettun)
     # ettun owns reconnects, nested foreground process groups, and catchable

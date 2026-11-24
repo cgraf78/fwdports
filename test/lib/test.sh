@@ -324,7 +324,9 @@ _stop_test_tmux_server() {
   fi
   while read -r server pane dead pid; do
     [[ $server =~ ^[1-9][0-9]*:[1-9][0-9]*$ && $pane =~ ^%[0-9]+$ ]] || return 2
-    if [[ $dead == 1 ]]; then
+    # tmux 3.8 can clear pane_pid when the terminal closes before it sets
+    # pane_dead. Neither snapshot identifies a live group by itself.
+    if [[ $dead == 1 || ($dead == 0 && -z $pid) ]]; then
       status=0
       pid=$(_test_tmux_registered_group "$socket" "$server" "$pane") || status=$?
       [[ $status -ne 1 ]] || continue
